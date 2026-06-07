@@ -125,12 +125,14 @@ impl IGltfDocumentExtension for GltfGsplatDocumentExtension {
         _scene_parent: Option<Gd<Node>>,
     ) -> Option<Gd<Node3D>> {
         let gltf_node = gltf_node?;
+        let imported_transform = gltf_node.get_xform();
         let raw_metadata = gltf_node
             .get_additional_data(NODE_STATE_KEY)
             .try_to::<VarDictionary>()
             .ok();
 
         let mut node = GaussianSplatNode3D::new_alloc();
+        node.bind_mut().set_imported_transform(imported_transform);
 
         if let Some(raw_metadata) = raw_metadata {
             node.bind_mut().set_import_metadata(raw_metadata.clone());
