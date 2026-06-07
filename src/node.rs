@@ -2,6 +2,7 @@ use godot::classes::GltfState;
 use godot::prelude::*;
 
 use crate::asset::GaussianSplatAsset;
+use crate::backend::{GaussianSplatBackendSettings, BACKEND_PROFILE_DESKTOP};
 use crate::import_state::{ImportedSplatMetadata, NODE_STATE_KEY};
 
 #[derive(Clone, Debug, Default)]
@@ -39,6 +40,7 @@ pub struct GaussianSplatNode3D {
     base: Base<Node3D>,
 
     asset: Option<Gd<GaussianSplatAsset>>,
+    backend_settings: Option<Gd<GaussianSplatBackendSettings>>,
     metadata: ImportedSplatMetadata,
     is_bound: bool,
     transform_state: NodeTransformState,
@@ -59,6 +61,7 @@ impl GaussianSplatNode3D {
     #[func]
     pub fn bind_asset(&mut self, asset: Option<Gd<GaussianSplatAsset>>) {
         self.asset = asset;
+        self.ensure_backend_settings();
         self.refresh_from_asset();
     }
 
@@ -101,6 +104,22 @@ impl GaussianSplatNode3D {
     #[func]
     pub fn get_asset(&self) -> Option<Gd<GaussianSplatAsset>> {
         self.asset.clone()
+    }
+
+    #[func]
+    pub fn bind_backend_settings(
+        &mut self,
+        backend_settings: Option<Gd<GaussianSplatBackendSettings>>,
+    ) {
+        self.backend_settings = backend_settings;
+        self.ensure_backend_settings();
+        self.backend_state.profile_hint = self.resolve_backend_pipeline();
+        self.mark_backend_dirty("backend_settings");
+    }
+
+    #[func]
+    pub fn get_backend_settings(&self) -> Option<Gd<GaussianSplatBackendSettings>> {
+        self.backend_settings.clone()
     }
 
     #[func]
@@ -152,6 +171,32 @@ impl GaussianSplatNode3D {
     }
 
     #[func]
+    pub fn export_backend_model(&self) -> VarDictionary {
+        let mut dict = self.export_runtime_state();
+        let pipeline = self.resolve_backend_pipeline();
+        dict.set("pipeline", pipeline.as_str());
+        if let Some(backend_settings) = &self.backend_settings {
+            let settings_ref = backend_settings.bind();
+            dict.set(
+                "backend_settings",
+                &Variant::from(settings_ref.export_settings()),
+            );
+        }
+        if let Some(asset) = &self.asset {
+            let asset_ref = asset.bind();
+            dict.set(
+                "asset_payload_layout",
+                &Variant::from(asset_ref.get_payload_layout()),
+            );
+            dict.set(
+                "asset_fallback_mode",
+                &Variant::from(asset_ref.get_fallback_mode()),
+            );
+        }
+        dict
+    }
+
+    #[func]
     pub fn stash_on_state(&self, state: Option<Gd<GltfState>>) {
         if let Some(mut state) = state {
             let dict = self.metadata.to_dictionary();
@@ -160,6 +205,7 @@ impl GaussianSplatNode3D {
     }
 
     fn refresh_from_asset(&mut self) {
+        self.ensure_backend_settings();
         if let Some(asset) = &self.asset {
             let asset = asset.clone();
             let asset_ref = asset.bind();
@@ -168,11 +214,7 @@ impl GaussianSplatNode3D {
             self.is_bound = true;
             self.visibility_state.asset_ready = true;
             self.backend_state.asset_point_count = asset_ref.get_point_count();
-            self.backend_state.profile_hint = if self.metadata.point_count > 200_000 {
-                "clustered".to_string()
-            } else {
-                "direct".to_string()
-            };
+            self.backend_state.profile_hint = self.resolve_backend_pipeline();
         } else {
             self.metadata = ImportedSplatMetadata::default();
             self.is_bound = false;
@@ -197,6 +239,27 @@ impl GaussianSplatNode3D {
         if self.backend_state.profile_hint.is_empty() {
             self.backend_state.profile_hint = reason.to_string();
         }
+    }
+
+    fn ensure_backend_settings(&mut self) {
+        if self.backend_settings.is_none() {
+            let mut backend_settings = GaussianSplatBackendSettings::new_gd();
+            backend_settings
+                .bind_mut()
+                .set_target_hint(BACKEND_PROFILE_DESKTOP.into());
+            self.backend_settings = Some(backend_settings);
+        }
+    }
+
+    fn resolve_backend_pipeline(&self) -> String {
+        self.backend_settings
+            .as_ref()
+            .map(|backend_settings| {
+                backend_settings
+                    .bind()
+                    .resolve_pipeline_for_metadata(&self.metadata)
+            })
+            .unwrap_or_else(|| "unconfigured".to_string())
     }
 
     fn sync_node_name(&mut self) {

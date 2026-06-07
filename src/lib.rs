@@ -2,6 +2,7 @@ use godot::init::EditorRunBehavior;
 use godot::prelude::*;
 
 mod asset;
+mod backend;
 mod gltf_extension;
 mod import_state;
 mod node;
@@ -16,5 +17,6 @@ unsafe impl ExtensionLibrary for GodotGsplatExtension {
 }
 
 pub use asset::GaussianSplatAsset;
+pub use backend::GaussianSplatBackendSettings;
 pub use gltf_extension::GltfGsplatDocumentExtension;
 pub use node::GaussianSplatNode3D;
