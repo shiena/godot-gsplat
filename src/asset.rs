@@ -1,7 +1,9 @@
 use godot::classes::GltfState;
 use godot::prelude::*;
 
-use crate::import_state::{ImportedSplatMetadata, GLTF_STATE_KEY};
+use crate::import_state::{
+    ImportedSplatMetadata, FALLBACK_NONE, GLTF_STATE_KEY, PAYLOAD_LAYOUT_V1,
+};
 
 #[derive(GodotClass)]
 #[class(init, base=Resource)]
@@ -12,6 +14,8 @@ pub struct GaussianSplatAsset {
     metadata: ImportedSplatMetadata,
     point_count: i32,
     payload: PackedByteArray,
+    payload_layout: GString,
+    fallback_mode: GString,
     local_aabb: Aabb,
 }
 
@@ -22,6 +26,8 @@ impl GaussianSplatAsset {
         self.metadata = ImportedSplatMetadata::default();
         self.point_count = 0;
         self.payload.clear();
+        self.payload_layout = PAYLOAD_LAYOUT_V1.into();
+        self.fallback_mode = FALLBACK_NONE.into();
         self.local_aabb = Aabb::default();
         self.base_mut().emit_changed();
     }
@@ -29,6 +35,17 @@ impl GaussianSplatAsset {
     #[func]
     pub fn apply_import_metadata(&mut self, metadata: VarDictionary) {
         self.metadata = ImportedSplatMetadata::from_dictionary(metadata);
+        self.point_count = self.metadata.point_count.max(0);
+        self.payload_layout = PAYLOAD_LAYOUT_V1.into();
+        self.fallback_mode = self.metadata.fallback_mode.as_str().into();
+        self.base_mut().emit_changed();
+    }
+
+    #[func]
+    pub fn initialize_from_import(&mut self, metadata: VarDictionary) {
+        self.apply_import_metadata(metadata);
+        self.payload = build_placeholder_payload(&self.metadata);
+        self.local_aabb = Aabb::default();
         self.base_mut().emit_changed();
     }
 
@@ -65,6 +82,21 @@ impl GaussianSplatAsset {
     }
 
     #[func]
+    pub fn get_payload_layout(&self) -> GString {
+        self.payload_layout.clone()
+    }
+
+    #[func]
+    pub fn get_fallback_mode(&self) -> GString {
+        self.fallback_mode.clone()
+    }
+
+    #[func]
+    pub fn has_point_fallback(&self) -> bool {
+        self.fallback_mode != FALLBACK_NONE
+    }
+
+    #[func]
     pub fn set_local_aabb(&mut self, aabb: Aabb) {
         self.local_aabb = aabb;
         self.base_mut().emit_changed();
@@ -92,4 +124,12 @@ impl GaussianSplatAsset {
             state.set_additional_data(GLTF_STATE_KEY, &Variant::from(dict));
         }
     }
+}
+
+fn build_placeholder_payload(metadata: &ImportedSplatMetadata) -> PackedByteArray {
+    let summary = format!(
+        "layout={}; points={}; fallback={}",
+        PAYLOAD_LAYOUT_V1, metadata.point_count, metadata.fallback_mode
+    );
+    PackedByteArray::from(summary.as_bytes())
 }
