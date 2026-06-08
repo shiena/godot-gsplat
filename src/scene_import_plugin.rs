@@ -9,6 +9,9 @@ use godot::register::info::PropertyHint;
 const OPTION_PREVIEW_MAX_SPLATS: &str = "gsplat/preview_max_splats";
 const OPTION_PREVIEW_MAX_SPLAT_RADIUS: &str = "gsplat/preview_max_splat_radius";
 const OPTION_PREVIEW_SCALE_MULTIPLIER: &str = "gsplat/preview_scale_multiplier";
+const INTERNAL_OPTION_PREVIEW_MAX_SPLATS: &str = "gsplat_preview/preview_max_splats";
+const INTERNAL_OPTION_PREVIEW_MAX_SPLAT_RADIUS: &str = "gsplat_preview/preview_max_splat_radius";
+const INTERNAL_OPTION_PREVIEW_SCALE_MULTIPLIER: &str = "gsplat_preview/preview_scale_multiplier";
 
 #[derive(GodotClass)]
 #[class(tool, base=EditorScenePostImportPlugin)]
@@ -32,7 +35,7 @@ impl IEditorScenePostImportPlugin for GsplatScenePostImportPlugin {
             return;
         }
 
-        self.add_preview_options();
+        self.add_general_preview_options();
     }
 
     fn get_internal_import_options(&mut self, category: i32) {
@@ -40,7 +43,7 @@ impl IEditorScenePostImportPlugin for GsplatScenePostImportPlugin {
             return;
         }
 
-        self.add_preview_options();
+        self.add_internal_preview_options();
     }
 
     fn get_option_visibility(
@@ -54,9 +57,7 @@ impl IEditorScenePostImportPlugin for GsplatScenePostImportPlugin {
         }
 
         let option = option.to_string();
-        let is_gsplat_option = option == OPTION_PREVIEW_MAX_SPLATS
-            || option == OPTION_PREVIEW_MAX_SPLAT_RADIUS
-            || option == OPTION_PREVIEW_SCALE_MULTIPLIER;
+        let is_gsplat_option = is_general_preview_option(option.as_str());
         if is_gsplat_option {
             Variant::from(true)
         } else {
@@ -71,9 +72,7 @@ impl IEditorScenePostImportPlugin for GsplatScenePostImportPlugin {
         option: GString,
     ) -> Variant {
         let option = option.to_string();
-        let is_gsplat_option = option == OPTION_PREVIEW_MAX_SPLATS
-            || option == OPTION_PREVIEW_MAX_SPLAT_RADIUS
-            || option == OPTION_PREVIEW_SCALE_MULTIPLIER;
+        let is_gsplat_option = is_internal_preview_option(option.as_str());
         if is_gsplat_option {
             Variant::from(is_node_like_category(category))
         } else {
@@ -83,9 +82,7 @@ impl IEditorScenePostImportPlugin for GsplatScenePostImportPlugin {
 
     fn get_internal_option_update_view_required(&self, category: i32, option: GString) -> Variant {
         let option = option.to_string();
-        let is_gsplat_option = option == OPTION_PREVIEW_MAX_SPLATS
-            || option == OPTION_PREVIEW_MAX_SPLAT_RADIUS
-            || option == OPTION_PREVIEW_SCALE_MULTIPLIER;
+        let is_gsplat_option = is_internal_preview_option(option.as_str());
         Variant::from(is_node_like_category(category) && is_gsplat_option)
     }
 
@@ -137,10 +134,24 @@ impl GsplatScenePostImportPlugin {
         options
     }
 
-    fn add_preview_options(&mut self) {
+    fn add_general_preview_options(&mut self) {
         self.add_i32_option(OPTION_PREVIEW_MAX_SPLATS, 10_000, "0,5000000,1");
         self.add_f32_option(OPTION_PREVIEW_MAX_SPLAT_RADIUS, 0.02, "0.001,1.0,0.001");
         self.add_f32_option(OPTION_PREVIEW_SCALE_MULTIPLIER, 1.0, "0.01,64.0,0.01");
+    }
+
+    fn add_internal_preview_options(&mut self) {
+        self.add_i32_option(INTERNAL_OPTION_PREVIEW_MAX_SPLATS, 10_000, "0,5000000,1");
+        self.add_f32_option(
+            INTERNAL_OPTION_PREVIEW_MAX_SPLAT_RADIUS,
+            0.02,
+            "0.001,1.0,0.001",
+        );
+        self.add_f32_option(
+            INTERNAL_OPTION_PREVIEW_SCALE_MULTIPLIER,
+            1.0,
+            "0.01,64.0,0.01",
+        );
     }
 
     fn read_options_from_plugin(plugin: &EditorScenePostImportPlugin) -> PreviewImportOptions {
@@ -190,6 +201,18 @@ fn is_node_like_category(category: i32) -> bool {
         || category == InternalImportCategory::SKELETON_3D_NODE.ord()
 }
 
+fn is_general_preview_option(option: &str) -> bool {
+    option == OPTION_PREVIEW_MAX_SPLATS
+        || option == OPTION_PREVIEW_MAX_SPLAT_RADIUS
+        || option == OPTION_PREVIEW_SCALE_MULTIPLIER
+}
+
+fn is_internal_preview_option(option: &str) -> bool {
+    option == INTERNAL_OPTION_PREVIEW_MAX_SPLATS
+        || option == INTERNAL_OPTION_PREVIEW_MAX_SPLAT_RADIUS
+        || option == INTERNAL_OPTION_PREVIEW_SCALE_MULTIPLIER
+}
+
 fn option_i32(plugin: &EditorScenePostImportPlugin, name: &str, fallback: i32) -> i32 {
     plugin
         .get_option_value(name)
@@ -205,13 +228,21 @@ fn option_f32(plugin: &EditorScenePostImportPlugin, name: &str, fallback: f32) -
 }
 
 fn apply_options_from_subresources(options: &mut PreviewImportOptions, subresources: &Variant) {
-    if let Some(max_splats) = find_i32_option(subresources, OPTION_PREVIEW_MAX_SPLATS) {
+    if let Some(max_splats) = find_i32_option(subresources, INTERNAL_OPTION_PREVIEW_MAX_SPLATS)
+        .or_else(|| find_i32_option(subresources, OPTION_PREVIEW_MAX_SPLATS))
+    {
         options.max_splats = max_splats;
     }
-    if let Some(max_splat_radius) = find_f32_option(subresources, OPTION_PREVIEW_MAX_SPLAT_RADIUS) {
+    if let Some(max_splat_radius) =
+        find_f32_option(subresources, INTERNAL_OPTION_PREVIEW_MAX_SPLAT_RADIUS)
+            .or_else(|| find_f32_option(subresources, OPTION_PREVIEW_MAX_SPLAT_RADIUS))
+    {
         options.max_splat_radius = max_splat_radius;
     }
-    if let Some(scale_multiplier) = find_f32_option(subresources, OPTION_PREVIEW_SCALE_MULTIPLIER) {
+    if let Some(scale_multiplier) =
+        find_f32_option(subresources, INTERNAL_OPTION_PREVIEW_SCALE_MULTIPLIER)
+            .or_else(|| find_f32_option(subresources, OPTION_PREVIEW_SCALE_MULTIPLIER))
+    {
         options.scale_multiplier = scale_multiplier;
     }
 }
