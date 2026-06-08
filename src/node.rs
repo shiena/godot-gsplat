@@ -13,7 +13,8 @@ use godot::prelude::*;
 
 use crate::asset::GaussianSplatAsset;
 use crate::backend::{
-    GaussianSplatBackendSettings, BACKEND_PROFILE_DESKTOP, VR_VIEW_BASIS_PER_EYE,
+    GaussianSplatBackendSettings, BACKEND_PROFILE_DESKTOP, BACKEND_PROFILE_MOBILE,
+    BACKEND_PROFILE_VR_SAFE, VR_VIEW_BASIS_PER_EYE,
 };
 use crate::cloud_settings::GaussianSplatCloudSettings;
 use crate::import_state::{ImportedSplatMetadata, NODE_STATE_KEY, POINT_STRIDE_FLOATS};
@@ -420,6 +421,25 @@ struct NodeBackendState {
     profile_hint: String,
 }
 
+// Inspector render-quality preset. Low/Middle/High are fixed presets that map to a
+// backend platform target plus a splat budget; Custom leaves the individual fields
+// (backend settings, preview limits) under manual control.
+#[derive(GodotConvert, Var, Export, Clone, Copy, Eq, PartialEq, Debug, Default)]
+#[godot(via = i64)]
+#[repr(i64)]
+enum RenderProfile {
+    #[default]
+    Custom = 0,
+    Low = 1,
+    Middle = 2,
+    High = 3,
+}
+
+// Per-tier splat budgets (max rendered splats; clamped to the asset point count).
+const RENDER_PROFILE_LOW_SPLATS: i32 = 150_000;
+const RENDER_PROFILE_MIDDLE_SPLATS: i32 = 500_000;
+const RENDER_PROFILE_HIGH_SPLATS: i32 = i32::MAX;
+
 #[derive(GodotClass)]
 #[class(tool, init, base=Node3D)]
 pub struct GaussianSplatNode3D {
@@ -430,6 +450,9 @@ pub struct GaussianSplatNode3D {
     cloud_settings: Option<Gd<GaussianSplatCloudSettings>>,
     backend_settings: Option<Gd<GaussianSplatBackendSettings>>,
     render_packet: Option<Gd<GaussianSplatRenderPacket>>,
+    #[var(get, set)]
+    #[export]
+    render_profile: PhantomVar<RenderProfile>,
     #[var(get, set)]
     #[export]
     preview_max_splats: PhantomVar<i32>,
@@ -452,6 +475,8 @@ pub struct GaussianSplatNode3D {
     backend_state: NodeBackendState,
     debug_mesh_instance: Option<Gd<MeshInstance3D>>,
     sort: SortGpu,
+    // Backing storage for the `render_profile` export (PhantomVar holds no state).
+    render_profile_value: RenderProfile,
 }
 
 #[godot_api]
@@ -511,6 +536,38 @@ impl INode3D for GaussianSplatNode3D {
 
 #[godot_api]
 impl GaussianSplatNode3D {
+    #[func]
+    fn get_render_profile(&self) -> RenderProfile {
+        self.render_profile_value
+    }
+
+    #[func]
+    fn set_render_profile(&mut self, profile: RenderProfile) {
+        self.render_profile_value = profile;
+        self.apply_render_profile(profile);
+    }
+
+    // Apply a fixed Low/Middle/High preset: map to a backend platform target and a
+    // splat budget. Custom makes no change (individual fields stay manual).
+    fn apply_render_profile(&mut self, profile: RenderProfile) {
+        let (target_hint, budget) = match profile {
+            RenderProfile::Custom => return,
+            RenderProfile::Low => (BACKEND_PROFILE_VR_SAFE, RENDER_PROFILE_LOW_SPLATS),
+            RenderProfile::Middle => (BACKEND_PROFILE_MOBILE, RENDER_PROFILE_MIDDLE_SPLATS),
+            RenderProfile::High => (BACKEND_PROFILE_DESKTOP, RENDER_PROFILE_HIGH_SPLATS),
+        };
+        self.ensure_backend_settings();
+        if let Some(backend_settings) = &mut self.backend_settings {
+            backend_settings
+                .bind_mut()
+                .set_target_hint(target_hint.into());
+        }
+        self.backend_state.profile_hint = self.resolve_backend_pipeline();
+        self.mark_backend_dirty("render_profile");
+        // The budget caps the rendered splat count and rebuilds the render.
+        self.set_preview_max_splats(budget);
+    }
+
     #[func]
     pub fn bind_asset(&mut self, asset: Option<Gd<GaussianSplatAsset>>) {
         self.asset = asset;
