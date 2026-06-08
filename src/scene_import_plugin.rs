@@ -174,7 +174,11 @@ impl GsplatScenePostImportPlugin {
 
     fn read_options_from_plugin(plugin: &EditorScenePostImportPlugin) -> PreviewImportOptions {
         PreviewImportOptions {
-            max_splats: option_i32(plugin, OPTION_PREVIEW_MAX_SPLATS, PREVIEW_MAX_SPLATS_DEFAULT),
+            max_splats: option_i32(
+                plugin,
+                OPTION_PREVIEW_MAX_SPLATS,
+                PREVIEW_MAX_SPLATS_DEFAULT,
+            ),
             max_splat_radius: option_f32(plugin, OPTION_PREVIEW_MAX_SPLAT_RADIUS, 0.02),
             scale_multiplier: option_f32(plugin, OPTION_PREVIEW_SCALE_MULTIPLIER, 1.0),
         }
