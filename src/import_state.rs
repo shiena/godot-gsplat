@@ -649,6 +649,95 @@ fn decode_optional_color_accessor(
     Ok(colors)
 }
 
+// Vertex-attribute component encodings we can decode to f32. KHR_gaussian_splatting
+// exporters commonly quantize rotation/scale/opacity/color to normalized integers.
+#[derive(Clone, Copy)]
+enum ComponentKind {
+    F32,
+    U8,
+    I8,
+    U16,
+    I16,
+    U32,
+}
+
+impl ComponentKind {
+    fn from_gltf(component_type: GltfComponentType, attribute_name: &str) -> Result<Self, String> {
+        Ok(if component_type == GltfComponentType::SINGLE_FLOAT {
+            Self::F32
+        } else if component_type == GltfComponentType::UNSIGNED_BYTE {
+            Self::U8
+        } else if component_type == GltfComponentType::SIGNED_BYTE {
+            Self::I8
+        } else if component_type == GltfComponentType::UNSIGNED_SHORT {
+            Self::U16
+        } else if component_type == GltfComponentType::SIGNED_SHORT {
+            Self::I16
+        } else if component_type == GltfComponentType::UNSIGNED_INT {
+            Self::U32
+        } else {
+            return Err(format!(
+                "Attribute {attribute_name} uses unsupported component type {component_type:?}."
+            ));
+        })
+    }
+
+    fn byte_size(self) -> usize {
+        match self {
+            Self::F32 | Self::U32 => 4,
+            Self::U16 | Self::I16 => 2,
+            Self::U8 | Self::I8 => 1,
+        }
+    }
+
+    // Decode one component to f32, applying glTF normalization when requested.
+    fn read(self, bytes: &[u8], normalized: bool) -> f32 {
+        match self {
+            Self::F32 => f32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]),
+            Self::U8 => {
+                let v = bytes[0] as f32;
+                if normalized {
+                    v / 255.0
+                } else {
+                    v
+                }
+            }
+            Self::I8 => {
+                let v = (bytes[0] as i8) as f32;
+                if normalized {
+                    (v / 127.0).max(-1.0)
+                } else {
+                    v
+                }
+            }
+            Self::U16 => {
+                let v = u16::from_le_bytes([bytes[0], bytes[1]]) as f32;
+                if normalized {
+                    v / 65535.0
+                } else {
+                    v
+                }
+            }
+            Self::I16 => {
+                let v = i16::from_le_bytes([bytes[0], bytes[1]]) as f32;
+                if normalized {
+                    (v / 32767.0).max(-1.0)
+                } else {
+                    v
+                }
+            }
+            Self::U32 => {
+                let v = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) as f32;
+                if normalized {
+                    v / 4_294_967_295.0
+                } else {
+                    v
+                }
+            }
+        }
+    }
+}
+
 fn decode_float_accessor(
     state: &Gd<GltfState>,
     accessors: &Array<Gd<GltfAccessor>>,
@@ -675,18 +764,8 @@ fn decode_float_accessor(
         ));
     }
 
-    if accessor.get_component_type() != GltfComponentType::SINGLE_FLOAT {
-        return Err(format!(
-            "Attribute {attribute_name} uses unsupported component type {:?}. Only float accessors are supported right now.",
-            accessor.get_component_type()
-        ));
-    }
-
-    if accessor.get_normalized() {
-        return Err(format!(
-            "Attribute {attribute_name} is normalized. Normalized accessors are not supported yet."
-        ));
-    }
+    let component_kind = ComponentKind::from_gltf(accessor.get_component_type(), attribute_name)?;
+    let normalized = accessor.get_normalized();
 
     let buffer_view_index = accessor.get_buffer_view();
     if buffer_view_index < 0 {
@@ -706,7 +785,8 @@ fn decode_float_accessor(
     let bytes = raw.as_slice();
     let component_count = accessor_component_count(accessor_type, attribute_name)?;
     let value_count = accessor.get_count().max(0) as usize;
-    let element_size = component_count * std::mem::size_of::<f32>();
+    let component_size = component_kind.byte_size();
+    let element_size = component_count * component_size;
     let byte_stride = match buffer_view.get_byte_stride() {
         value if value <= 0 => element_size,
         value => usize::try_from(value)
@@ -739,12 +819,8 @@ fn decode_float_accessor(
     for value_index in 0..value_count {
         let element_offset = base_offset + value_index * byte_stride;
         for component_index in 0..component_count {
-            let start = element_offset + component_index * std::mem::size_of::<f32>();
-            let end = start + std::mem::size_of::<f32>();
-            let component_bytes: [u8; 4] = bytes[start..end]
-                .try_into()
-                .map_err(|_| format!("Attribute {attribute_name} failed to decode float bytes."))?;
-            values.push(f32::from_le_bytes(component_bytes));
+            let start = element_offset + component_index * component_size;
+            values.push(component_kind.read(&bytes[start..start + component_size], normalized));
         }
     }
 
