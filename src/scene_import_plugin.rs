@@ -28,7 +28,7 @@ impl IEditorScenePostImportPlugin for GsplatScenePostImportPlugin {
     }
 
     fn get_internal_import_options(&mut self, category: i32) {
-        if category != InternalImportCategory::NODE.ord() {
+        if !is_node_like_category(category) {
             return;
         }
 
@@ -67,7 +67,7 @@ impl IEditorScenePostImportPlugin for GsplatScenePostImportPlugin {
             || option == OPTION_PREVIEW_MAX_SPLAT_RADIUS
             || option == OPTION_PREVIEW_SCALE_MULTIPLIER;
         if is_gsplat_option {
-            Variant::from(category == InternalImportCategory::NODE.ord())
+            Variant::from(is_node_like_category(category))
         } else {
             Variant::nil()
         }
@@ -78,7 +78,7 @@ impl IEditorScenePostImportPlugin for GsplatScenePostImportPlugin {
         let is_gsplat_option = option == OPTION_PREVIEW_MAX_SPLATS
             || option == OPTION_PREVIEW_MAX_SPLAT_RADIUS
             || option == OPTION_PREVIEW_SCALE_MULTIPLIER;
-        Variant::from(category == InternalImportCategory::NODE.ord() && is_gsplat_option)
+        Variant::from(is_node_like_category(category) && is_gsplat_option)
     }
 
     fn internal_process(
@@ -88,7 +88,7 @@ impl IEditorScenePostImportPlugin for GsplatScenePostImportPlugin {
         node: Option<Gd<Node>>,
         _resource: Option<Gd<Resource>>,
     ) {
-        if category != InternalImportCategory::NODE.ord() {
+        if !is_node_like_category(category) {
             return;
         }
 
@@ -160,6 +160,12 @@ fn should_add_options_for_path(path: GString) -> bool {
 
     let path = path.to_string().to_ascii_lowercase();
     path.ends_with(".gltf") || path.ends_with(".glb")
+}
+
+fn is_node_like_category(category: i32) -> bool {
+    category == InternalImportCategory::NODE.ord()
+        || category == InternalImportCategory::MESH_3D_NODE.ord()
+        || category == InternalImportCategory::SKELETON_3D_NODE.ord()
 }
 
 fn option_i32(plugin: &EditorScenePostImportPlugin, name: &str, fallback: i32) -> i32 {
