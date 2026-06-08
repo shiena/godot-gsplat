@@ -1,6 +1,7 @@
-use godot::classes::mesh::{ArrayType, PrimitiveType};
+use godot::classes::mesh::{ArrayCustomFormat, ArrayFormat, ArrayType, PrimitiveType};
 use godot::classes::GltfState;
 use godot::classes::{ArrayMesh, MeshInstance3D, Shader, ShaderMaterial};
+use godot::obj::EngineBitfield;
 use godot::prelude::*;
 
 use crate::asset::GaussianSplatAsset;
@@ -9,31 +10,88 @@ use crate::cloud_settings::GaussianSplatCloudSettings;
 use crate::import_state::{ImportedSplatMetadata, NODE_STATE_KEY, POINT_STRIDE_FLOATS};
 use crate::render_packet::GaussianSplatRenderPacket;
 
+// Anisotropic Gaussian splat shader. Each splat is a screen-aligned quad whose
+// corners (UV in [-2, 2]) are stretched along the projected 2D covariance axes,
+// so the on-screen footprint is an oriented ellipse. The 3D covariance (upper
+// triangle) is passed per-vertex in CUSTOM0/CUSTOM1 and projected to screen
+// space with the perspective Jacobian. Alpha is an isotropic Gaussian in the
+// stretched corner space, which equals the anisotropic Gaussian on screen.
+// NOTE: this path does not depth-sort splats yet, so blending order is only
+// approximate; correct back-to-front sorting is the next step.
 const GAUSSIAN_BILLBOARD_SHADER: &str = r#"
 shader_type spatial;
-render_mode unshaded, cull_disabled, blend_mix, depth_prepass_alpha;
+render_mode unshaded, cull_disabled, blend_mix, depth_draw_never;
 
-varying vec2 splat_offset;
+varying vec2 v_corner;
+varying vec4 v_color;
 
 void vertex() {
-    splat_offset = UV;
+    v_corner = UV;
+    v_color = COLOR;
 
-    vec3 center_world = (MODEL_MATRIX * vec4(VERTEX, 1.0)).xyz;
-    vec3 camera_right = INV_VIEW_MATRIX[0].xyz;
-    vec3 camera_up = INV_VIEW_MATRIX[1].xyz;
-    vec3 world_offset = camera_right * UV.x * UV2.x + camera_up * UV.y * UV2.y;
+    // Reconstruct the symmetric local-space 3D covariance from its upper triangle
+    // (passed as three column vectors; the matrix is symmetric so order is moot).
+    mat3 cov3d = mat3(
+        vec3(CUSTOM0.x, CUSTOM0.y, CUSTOM0.z),
+        vec3(CUSTOM0.y, CUSTOM0.w, CUSTOM1.x),
+        vec3(CUSTOM0.z, CUSTOM1.x, CUSTOM1.y));
 
-    VERTEX = (inverse(MODEL_MATRIX) * vec4(center_world + world_offset, 1.0)).xyz;
+    vec4 center_view = VIEW_MATRIX * MODEL_MATRIX * vec4(VERTEX, 1.0);
+    vec4 center_clip = PROJECTION_MATRIX * center_view;
+
+    float z = center_view.z;
+    if (z > -0.01) {
+        // Behind or too close to the camera: push offscreen so the quad clips.
+        POSITION = vec4(0.0, 0.0, 100.0, 1.0);
+    } else {
+    // Local covariance -> view space (upper-left 3x3 of view * model).
+    mat3 view_linear = mat3(VIEW_MATRIX[0].xyz, VIEW_MATRIX[1].xyz, VIEW_MATRIX[2].xyz);
+    mat3 model_linear = mat3(MODEL_MATRIX[0].xyz, MODEL_MATRIX[1].xyz, MODEL_MATRIX[2].xyz);
+    mat3 W = view_linear * model_linear;
+    mat3 cov_view = W * cov3d * transpose(W);
+
+    // Jacobian of the perspective projection (focal lengths in pixels). The
+    // perspective terms go in the third column (column-major construction).
+    vec2 vp = VIEWPORT_SIZE;
+    float fx = PROJECTION_MATRIX[0][0] * vp.x * 0.5;
+    float fy = PROJECTION_MATRIX[1][1] * vp.y * 0.5;
+    mat3 jacobian = mat3(
+        vec3(fx / z, 0.0, 0.0),
+        vec3(0.0, fy / z, 0.0),
+        vec3(-(fx * center_view.x) / (z * z), -(fy * center_view.y) / (z * z), 0.0));
+    mat3 cov2d = jacobian * cov_view * transpose(jacobian);
+
+    // Dilate slightly so sub-pixel splats stay visible (anti-aliasing).
+    float a = cov2d[0][0] + 0.3;
+    float b = cov2d[0][1];
+    float d = cov2d[1][1] + 0.3;
+
+    // Eigenvalues -> screen-space major/minor axes (pixels).
+    float mid = 0.5 * (a + d);
+    float disc = sqrt(max(mid * mid - (a * d - b * b), 0.0));
+    float lambda1 = mid + disc;
+    float lambda2 = max(mid - disc, 0.0);
+    vec2 axis_dir = normalize(vec2(b, lambda1 - a) + vec2(1e-6, 0.0));
+    vec2 major_axis = min(sqrt(2.0 * lambda1), 1024.0) * axis_dir;
+    vec2 minor_axis = min(sqrt(2.0 * lambda2), 1024.0) * vec2(axis_dir.y, -axis_dir.x);
+
+    // Expand the quad corner along the projected ellipse axes, in clip space.
+    vec2 screen_offset = v_corner.x * major_axis + v_corner.y * minor_axis;
+    vec2 clip_offset = (screen_offset / vp) * 2.0 * center_clip.w;
+    POSITION = center_clip + vec4(clip_offset, 0.0, 0.0);
+    }
 }
 
 void fragment() {
-    float radius2 = dot(splat_offset, splat_offset);
-    float alpha = COLOR.a * exp(-4.5 * radius2);
-    if (alpha < 0.003) {
+    float power = -dot(v_corner, v_corner);
+    if (power < -4.0) {
         discard;
     }
-
-    ALBEDO = COLOR.rgb;
+    float alpha = v_color.a * exp(power);
+    if (alpha < 0.0039) {
+        discard;
+    }
+    ALBEDO = v_color.rgb;
     ALPHA = alpha;
 }
 "#;
@@ -542,7 +600,7 @@ impl GaussianSplatNode3D {
 
         self.ensure_debug_mesh_instance();
 
-        let Some((positions, uvs, uv2s, colors, indices)) =
+        let Some((positions, uvs, colors, custom0, custom1, indices)) =
             self.build_gaussian_billboard_arrays(&asset, cloud_settings.as_ref())
         else {
             self.clear_debug_mesh();
@@ -564,12 +622,22 @@ impl GaussianSplatNode3D {
         }
         arrays.set(ArrayType::VERTEX.ord() as usize, &Variant::from(positions));
         arrays.set(ArrayType::TEX_UV.ord() as usize, &Variant::from(uvs));
-        arrays.set(ArrayType::TEX_UV2.ord() as usize, &Variant::from(uv2s));
         arrays.set(ArrayType::COLOR.ord() as usize, &Variant::from(colors));
+        arrays.set(ArrayType::CUSTOM0.ord() as usize, &Variant::from(custom0));
+        arrays.set(ArrayType::CUSTOM1.ord() as usize, &Variant::from(custom1));
         arrays.set(ArrayType::INDEX.ord() as usize, &Variant::from(indices));
 
+        // CUSTOM0/CUSTOM1 carry the 3D covariance as four float channels each.
+        let custom_format = ArrayCustomFormat::RGBA_FLOAT.ord() as u64;
+        let surface_flags = ArrayFormat::from_ord(
+            (custom_format << ArrayFormat::CUSTOM0_SHIFT.ord())
+                | (custom_format << ArrayFormat::CUSTOM1_SHIFT.ord()),
+        );
+
         let mut mesh = ArrayMesh::new_gd();
-        mesh.add_surface_from_arrays(PrimitiveType::TRIANGLES, &arrays);
+        mesh.add_surface_from_arrays_ex(PrimitiveType::TRIANGLES, &arrays)
+            .flags(surface_flags)
+            .done();
 
         let mut shader = Shader::new_gd();
         shader.set_code(GAUSSIAN_BILLBOARD_SHADER);
@@ -596,8 +664,9 @@ impl GaussianSplatNode3D {
     ) -> Option<(
         PackedVector3Array,
         PackedVector2Array,
-        PackedVector2Array,
         PackedColorArray,
+        PackedFloat32Array,
+        PackedFloat32Array,
         PackedInt32Array,
     )> {
         let values = {
@@ -617,36 +686,42 @@ impl GaussianSplatNode3D {
 
         let scale_multiplier = cloud_settings
             .map(|settings| settings.bind().get_gaussian_scale_multiplier())
-            .unwrap_or(3.0)
+            .unwrap_or(1.0)
             .max(0.01);
-        let max_splat_radius = cloud_settings
-            .map(|settings| settings.bind().get_max_debug_splat_radius())
-            .unwrap_or(0.02)
-            .max(0.001);
+        // Quad corners in [-2, 2]; the vertex shader stretches them along the
+        // projected ellipse axes, so the corner doubles as the Gaussian sample
+        // coordinate (alpha = exp(-dot(corner, corner))).
         let corners = [
-            Vector2::new(-1.0, -1.0),
-            Vector2::new(1.0, -1.0),
-            Vector2::new(1.0, 1.0),
-            Vector2::new(-1.0, 1.0),
+            Vector2::new(-2.0, -2.0),
+            Vector2::new(2.0, -2.0),
+            Vector2::new(2.0, 2.0),
+            Vector2::new(-2.0, 2.0),
         ];
 
         let mut positions = Vec::with_capacity(point_count * 4);
         let mut uvs = Vec::with_capacity(point_count * 4);
-        let mut uv2s = Vec::with_capacity(point_count * 4);
         let mut colors = Vec::with_capacity(point_count * 4);
+        let mut custom0 = Vec::with_capacity(point_count * 4 * 4);
+        let mut custom1 = Vec::with_capacity(point_count * 4 * 4);
         let mut indices = Vec::with_capacity(point_count * 6);
 
         for output_index in 0..point_count {
             let point_index = (output_index * sample_stride).min(source_point_count - 1);
             let offset = point_index * POINT_STRIDE_FLOATS;
             let center = Vector3::new(values[offset], values[offset + 1], values[offset + 2]);
-            let radius = values[offset + 7]
-                .max(values[offset + 8])
-                .max(values[offset + 9])
-                .max(0.0001)
-                * scale_multiplier;
-            let preview_radius = radius.clamp(0.001, max_splat_radius);
-            let size = Vector2::new(preview_radius, preview_radius);
+            let cov = covariance_upper_triangle(
+                [
+                    values[offset + 3],
+                    values[offset + 4],
+                    values[offset + 5],
+                    values[offset + 6],
+                ],
+                [
+                    values[offset + 7] * scale_multiplier,
+                    values[offset + 8] * scale_multiplier,
+                    values[offset + 9] * scale_multiplier,
+                ],
+            );
             let color = Color::from_rgba(
                 values[offset + 14],
                 values[offset + 15],
@@ -657,8 +732,9 @@ impl GaussianSplatNode3D {
             for corner in corners {
                 positions.push(center);
                 uvs.push(corner);
-                uv2s.push(size);
                 colors.push(color);
+                custom0.extend_from_slice(&[cov[0], cov[1], cov[2], cov[3]]);
+                custom1.extend_from_slice(&[cov[4], cov[5], 0.0, 0.0]);
             }
 
             let base = (output_index * 4) as i32;
@@ -668,9 +744,48 @@ impl GaussianSplatNode3D {
         Some((
             PackedVector3Array::from(positions),
             PackedVector2Array::from(uvs),
-            PackedVector2Array::from(uv2s),
             PackedColorArray::from(colors),
+            PackedFloat32Array::from(custom0),
+            PackedFloat32Array::from(custom1),
             PackedInt32Array::from(indices),
         ))
     }
+}
+
+// Build the upper triangle [xx, xy, xz, yy, yz, zz] of the 3D covariance
+// Sigma = R * S^2 * R^T from a normalized rotation quaternion (xyzw) and the
+// per-axis scale (linear standard deviation).
+fn covariance_upper_triangle(quat: [f32; 4], scale: [f32; 3]) -> [f32; 6] {
+    let [qx, qy, qz, qw] = quat;
+    let [sx, sy, sz] = scale;
+
+    // Rotation matrix columns from the quaternion.
+    let r = [
+        [
+            1.0 - 2.0 * (qy * qy + qz * qz),
+            2.0 * (qx * qy + qw * qz),
+            2.0 * (qx * qz - qw * qy),
+        ],
+        [
+            2.0 * (qx * qy - qw * qz),
+            1.0 - 2.0 * (qx * qx + qz * qz),
+            2.0 * (qy * qz + qw * qx),
+        ],
+        [
+            2.0 * (qx * qz + qw * qy),
+            2.0 * (qy * qz - qw * qx),
+            1.0 - 2.0 * (qx * qx + qy * qy),
+        ],
+    ];
+
+    // M = R * diag(scale); columns of R scaled by the matching axis scale.
+    let m = [
+        [r[0][0] * sx, r[1][0] * sy, r[2][0] * sz],
+        [r[0][1] * sx, r[1][1] * sy, r[2][1] * sz],
+        [r[0][2] * sx, r[1][2] * sy, r[2][2] * sz],
+    ];
+
+    // Sigma = M * M^T (symmetric).
+    let dot = |a: usize, b: usize| m[a][0] * m[b][0] + m[a][1] * m[b][1] + m[a][2] * m[b][2];
+    [dot(0, 0), dot(0, 1), dot(0, 2), dot(1, 1), dot(1, 2), dot(2, 2)]
 }
