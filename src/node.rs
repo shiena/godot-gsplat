@@ -1,7 +1,14 @@
-use godot::classes::mesh::{ArrayCustomFormat, ArrayFormat, ArrayType, PrimitiveType};
+use godot::classes::image::Format as ImageFormat;
+use godot::classes::mesh::{ArrayType, PrimitiveType};
+use godot::classes::rendering_device::{
+    DataFormat, ShaderLanguage, ShaderStage, TextureUsageBits, UniformType,
+};
 use godot::classes::GltfState;
-use godot::classes::{ArrayMesh, MeshInstance3D, Shader, ShaderMaterial};
-use godot::obj::EngineBitfield;
+use godot::classes::{
+    ArrayMesh, Engine, Image, ImageTexture, MeshInstance3D, RdShaderSource, RdTextureFormat,
+    RdTextureView, RdUniform, RenderingDevice, RenderingServer, Shader, ShaderMaterial,
+    Texture2Drd,
+};
 use godot::prelude::*;
 
 use crate::asset::GaussianSplatAsset;
@@ -10,33 +17,58 @@ use crate::cloud_settings::GaussianSplatCloudSettings;
 use crate::import_state::{ImportedSplatMetadata, NODE_STATE_KEY, POINT_STRIDE_FLOATS};
 use crate::render_packet::GaussianSplatRenderPacket;
 
-// Anisotropic Gaussian splat shader. Each splat is a screen-aligned quad whose
-// corners (UV in [-2, 2]) are stretched along the projected 2D covariance axes,
-// so the on-screen footprint is an oriented ellipse. The 3D covariance (upper
-// triangle) is passed per-vertex in CUSTOM0/CUSTOM1 and projected to screen
-// space with the perspective Jacobian. Alpha is an isotropic Gaussian in the
-// stretched corner space, which equals the anisotropic Gaussian on screen.
-// NOTE: this path does not depth-sort splats yet, so blending order is only
-// approximate; correct back-to-front sorting is the next step.
-const GAUSSIAN_BILLBOARD_SHADER: &str = r#"
+// Texture-driven anisotropic Gaussian splat shader (Step 1 render path). Per-splat
+// data (center, packed 3D covariance upper triangle, color) lives in `data_tex`,
+// four RGBA-float texels per splat. The mesh is a static "slot" mesh: four
+// vertices per splat at the origin, UV = quad corner in [-2, 2], UV2.x = slot
+// index. Each slot resolves to a splat id via `sort_tex` when `sort_enabled`,
+// otherwise slot == id (unsorted, matching the Phase 1 look). The resolved splat's
+// covariance is projected to screen space with the perspective Jacobian and the
+// corner is stretched along the projected ellipse axes, so the on-screen footprint
+// is an oriented ellipse. Alpha is an isotropic Gaussian in the stretched corner
+// space, which equals the anisotropic Gaussian on screen.
+// NOTE: with `sort_enabled == 0` splats are not depth-sorted, so blending order is
+// only approximate; the GPU compute sort (Step 2) drives `sort_tex` for the correct
+// back-to-front order.
+const SPLAT_TEXTURE_SHADER: &str = r#"
 shader_type spatial;
 render_mode unshaded, cull_disabled, blend_mix, depth_draw_never;
+
+uniform sampler2D data_tex : filter_nearest;
+uniform sampler2D sort_tex : filter_nearest;
+uniform int splat_count;
+uniform int sort_enabled;
 
 varying vec2 v_corner;
 varying vec4 v_color;
 
 void vertex() {
     v_corner = UV;
-    v_color = COLOR;
+    int slot = int(UV2.x + 0.5);
+    int splat_id = slot;
+    if (sort_enabled > 0) {
+        int sw = textureSize(sort_tex, 0).x;
+        splat_id = int(texelFetch(sort_tex, ivec2(slot % sw, slot / sw), 0).r + 0.5);
+    }
+    splat_id = clamp(splat_id, 0, splat_count - 1);
 
-    // Reconstruct the symmetric local-space 3D covariance from its upper triangle
-    // (passed as three column vectors; the matrix is symmetric so order is moot).
+    // Fetch the splat's four-texel data block from the data texture.
+    int w = textureSize(data_tex, 0).x;
+    int base = splat_id * 4;
+    vec4 t0 = texelFetch(data_tex, ivec2(base % w, base / w), 0);
+    vec4 t1 = texelFetch(data_tex, ivec2((base + 1) % w, (base + 1) / w), 0);
+    vec4 t2 = texelFetch(data_tex, ivec2((base + 2) % w, (base + 2) / w), 0);
+    vec4 t3 = texelFetch(data_tex, ivec2((base + 3) % w, (base + 3) / w), 0);
+
+    vec3 center = t0.xyz;
+    v_color = t3;
+    // Reconstruct the symmetric local-space 3D covariance from its upper triangle.
     mat3 cov3d = mat3(
-        vec3(CUSTOM0.x, CUSTOM0.y, CUSTOM0.z),
-        vec3(CUSTOM0.y, CUSTOM0.w, CUSTOM1.x),
-        vec3(CUSTOM0.z, CUSTOM1.x, CUSTOM1.y));
+        vec3(t1.x, t1.y, t1.z),
+        vec3(t1.y, t1.w, t2.x),
+        vec3(t1.z, t2.x, t2.y));
 
-    vec4 center_view = VIEW_MATRIX * MODEL_MATRIX * vec4(VERTEX, 1.0);
+    vec4 center_view = VIEW_MATRIX * MODEL_MATRIX * vec4(center, 1.0);
     vec4 center_clip = PROJECTION_MATRIX * center_view;
 
     float z = center_view.z;
@@ -44,41 +76,41 @@ void vertex() {
         // Behind or too close to the camera: push offscreen so the quad clips.
         POSITION = vec4(0.0, 0.0, 100.0, 1.0);
     } else {
-    // Local covariance -> view space (upper-left 3x3 of view * model).
-    mat3 view_linear = mat3(VIEW_MATRIX[0].xyz, VIEW_MATRIX[1].xyz, VIEW_MATRIX[2].xyz);
-    mat3 model_linear = mat3(MODEL_MATRIX[0].xyz, MODEL_MATRIX[1].xyz, MODEL_MATRIX[2].xyz);
-    mat3 W = view_linear * model_linear;
-    mat3 cov_view = W * cov3d * transpose(W);
+        // Local covariance -> view space (upper-left 3x3 of view * model).
+        mat3 view_linear = mat3(VIEW_MATRIX[0].xyz, VIEW_MATRIX[1].xyz, VIEW_MATRIX[2].xyz);
+        mat3 model_linear = mat3(MODEL_MATRIX[0].xyz, MODEL_MATRIX[1].xyz, MODEL_MATRIX[2].xyz);
+        mat3 W = view_linear * model_linear;
+        mat3 cov_view = W * cov3d * transpose(W);
 
-    // Jacobian of the perspective projection (focal lengths in pixels). The
-    // perspective terms go in the third column (column-major construction).
-    vec2 vp = VIEWPORT_SIZE;
-    float fx = PROJECTION_MATRIX[0][0] * vp.x * 0.5;
-    float fy = PROJECTION_MATRIX[1][1] * vp.y * 0.5;
-    mat3 jacobian = mat3(
-        vec3(fx / z, 0.0, 0.0),
-        vec3(0.0, fy / z, 0.0),
-        vec3(-(fx * center_view.x) / (z * z), -(fy * center_view.y) / (z * z), 0.0));
-    mat3 cov2d = jacobian * cov_view * transpose(jacobian);
+        // Jacobian of the perspective projection (focal lengths in pixels). The
+        // perspective terms go in the third column (column-major construction).
+        vec2 vp = VIEWPORT_SIZE;
+        float fx = PROJECTION_MATRIX[0][0] * vp.x * 0.5;
+        float fy = PROJECTION_MATRIX[1][1] * vp.y * 0.5;
+        mat3 jacobian = mat3(
+            vec3(fx / z, 0.0, 0.0),
+            vec3(0.0, fy / z, 0.0),
+            vec3(-(fx * center_view.x) / (z * z), -(fy * center_view.y) / (z * z), 0.0));
+        mat3 cov2d = jacobian * cov_view * transpose(jacobian);
 
-    // Dilate slightly so sub-pixel splats stay visible (anti-aliasing).
-    float a = cov2d[0][0] + 0.3;
-    float b = cov2d[0][1];
-    float d = cov2d[1][1] + 0.3;
+        // Dilate slightly so sub-pixel splats stay visible (anti-aliasing).
+        float a = cov2d[0][0] + 0.3;
+        float b = cov2d[0][1];
+        float d = cov2d[1][1] + 0.3;
 
-    // Eigenvalues -> screen-space major/minor axes (pixels).
-    float mid = 0.5 * (a + d);
-    float disc = sqrt(max(mid * mid - (a * d - b * b), 0.0));
-    float lambda1 = mid + disc;
-    float lambda2 = max(mid - disc, 0.0);
-    vec2 axis_dir = normalize(vec2(b, lambda1 - a) + vec2(1e-6, 0.0));
-    vec2 major_axis = min(sqrt(2.0 * lambda1), 1024.0) * axis_dir;
-    vec2 minor_axis = min(sqrt(2.0 * lambda2), 1024.0) * vec2(axis_dir.y, -axis_dir.x);
+        // Eigenvalues -> screen-space major/minor axes (pixels).
+        float mid = 0.5 * (a + d);
+        float disc = sqrt(max(mid * mid - (a * d - b * b), 0.0));
+        float lambda1 = mid + disc;
+        float lambda2 = max(mid - disc, 0.0);
+        vec2 axis_dir = normalize(vec2(b, lambda1 - a) + vec2(1e-6, 0.0));
+        vec2 major_axis = min(sqrt(2.0 * lambda1), 1024.0) * axis_dir;
+        vec2 minor_axis = min(sqrt(2.0 * lambda2), 1024.0) * vec2(axis_dir.y, -axis_dir.x);
 
-    // Expand the quad corner along the projected ellipse axes, in clip space.
-    vec2 screen_offset = v_corner.x * major_axis + v_corner.y * minor_axis;
-    vec2 clip_offset = (screen_offset / vp) * 2.0 * center_clip.w;
-    POSITION = center_clip + vec4(clip_offset, 0.0, 0.0);
+        // Expand the quad corner along the projected ellipse axes, in clip space.
+        vec2 screen_offset = v_corner.x * major_axis + v_corner.y * minor_axis;
+        vec2 clip_offset = (screen_offset / vp) * 2.0 * center_clip.w;
+        POSITION = center_clip + vec4(clip_offset, 0.0, 0.0);
     }
 }
 
@@ -95,6 +127,162 @@ void fragment() {
     ALPHA = alpha;
 }
 "#;
+
+// Width (in RGBA-float texels) of the per-splat data texture. Each splat occupies
+// four consecutive texels, so a row holds SPLAT_DATA_TEX_WIDTH / 4 splats.
+const SPLAT_DATA_TEX_WIDTH: i32 = 4096;
+
+// CPU-built render data for the texture-driven splat path: the per-splat data
+// texture bytes plus the static slot mesh arrays.
+struct SplatRenderData {
+    data_bytes: PackedByteArray,
+    tex_width: i32,
+    tex_height: i32,
+    positions: PackedVector3Array,
+    uvs: PackedVector2Array,
+    uv2: PackedVector2Array,
+    indices: PackedInt32Array,
+    // Local-space splat centers as vec4(x, y, z, 1) in slot order, used to seed
+    // the GPU sort's positions storage buffer (Step 2).
+    positions_ssbo: PackedByteArray,
+    splat_count: i32,
+    aabb: Aabb,
+}
+
+// --- Step 2: GPU counting sort -------------------------------------------------
+// Depth bucket count (sort precision) and compute workgroup size, mirroring the
+// validated PoC. The sort-order texture is R32F; one texel per splat holds the
+// splat id to draw at that slot, sampled by SPLAT_TEXTURE_SHADER.
+const SORT_NUM_BUCKETS: i32 = 2048;
+const SORT_LOCAL_SIZE: u32 = 256;
+const SORT_TEX_WIDTH: i32 = 4096;
+
+// Pass 1: count splats per depth bucket (bucket 0 = farthest).
+const SORT_COUNT_GLSL: &str = r#"#version 450
+layout(local_size_x = 256) in;
+layout(set = 0, binding = 0, std430) restrict readonly buffer Pos { vec4 positions[]; };
+layout(set = 0, binding = 1, std430) restrict buffer Hist { uint histogram[]; };
+layout(push_constant, std430) uniform PC {
+    mat4 view;
+    float depth_min;
+    float depth_inv_range;
+    uint num_buckets;
+    uint count;
+    uint tex_width;
+} pc;
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= pc.count) { return; }
+    float vz = (pc.view * vec4(positions[i].xyz, 1.0)).z;
+    float t = clamp((-vz - pc.depth_min) * pc.depth_inv_range, 0.0, 1.0);
+    uint bucket = uint((1.0 - t) * float(pc.num_buckets - 1u) + 0.5);
+    atomicAdd(histogram[bucket], 1u);
+}
+"#;
+
+// Pass 2: serial exclusive prefix sum of the histogram into per-bucket offsets.
+const SORT_SCAN_GLSL: &str = r#"#version 450
+layout(local_size_x = 1) in;
+layout(set = 0, binding = 1, std430) restrict readonly buffer Hist { uint histogram[]; };
+layout(set = 0, binding = 2, std430) restrict buffer Off { uint offsets[]; };
+layout(push_constant, std430) uniform PC {
+    mat4 view;
+    float depth_min;
+    float depth_inv_range;
+    uint num_buckets;
+    uint count;
+    uint tex_width;
+} pc;
+void main() {
+    uint sum = 0u;
+    for (uint b = 0u; b < pc.num_buckets; ++b) {
+        offsets[b] = sum;
+        sum += histogram[b];
+    }
+}
+"#;
+
+// Pass 3: scatter each splat id into its sorted slot in the R32F sort texture.
+const SORT_SCATTER_GLSL: &str = r#"#version 450
+layout(local_size_x = 256) in;
+layout(set = 0, binding = 0, std430) restrict readonly buffer Pos { vec4 positions[]; };
+layout(set = 0, binding = 2, std430) restrict buffer Off { uint offsets[]; };
+layout(set = 0, binding = 3, r32f) uniform restrict writeonly image2D sort_img;
+layout(push_constant, std430) uniform PC {
+    mat4 view;
+    float depth_min;
+    float depth_inv_range;
+    uint num_buckets;
+    uint count;
+    uint tex_width;
+} pc;
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= pc.count) { return; }
+    float vz = (pc.view * vec4(positions[i].xyz, 1.0)).z;
+    float t = clamp((-vz - pc.depth_min) * pc.depth_inv_range, 0.0, 1.0);
+    uint bucket = uint((1.0 - t) * float(pc.num_buckets - 1u) + 0.5);
+    uint slot = atomicAdd(offsets[bucket], 1u);
+    ivec2 c = ivec2(int(slot % pc.tex_width), int(slot / pc.tex_width));
+    imageStore(sort_img, c, vec4(float(i), 0.0, 0.0, 0.0));
+}
+"#;
+
+// Runtime GPU counting-sort state. RIDs live on the main RenderingDevice; the
+// per-frame dispatch runs via RenderingServer::call_on_render_thread.
+struct SortGpu {
+    ready: bool,
+    attempted: bool,
+    // Inputs stashed when the splat render is (re)built.
+    positions: PackedByteArray,
+    splat_count: i32,
+    local_aabb: Aabb,
+    // GPU resources.
+    tex_width: i32,
+    tex_height: i32,
+    pos_buf: Rid,
+    hist_buf: Rid,
+    off_buf: Rid,
+    sort_tex_rid: Rid,
+    count_shader: Rid,
+    scan_shader: Rid,
+    scatter_shader: Rid,
+    count_pipe: Rid,
+    scan_pipe: Rid,
+    scatter_pipe: Rid,
+    count_set: Rid,
+    scan_set: Rid,
+    scatter_set: Rid,
+    texture: Option<Gd<Texture2Drd>>,
+}
+
+impl Default for SortGpu {
+    fn default() -> Self {
+        Self {
+            ready: false,
+            attempted: false,
+            positions: PackedByteArray::new(),
+            splat_count: 0,
+            local_aabb: Aabb::default(),
+            tex_width: 0,
+            tex_height: 0,
+            pos_buf: Rid::Invalid,
+            hist_buf: Rid::Invalid,
+            off_buf: Rid::Invalid,
+            sort_tex_rid: Rid::Invalid,
+            count_shader: Rid::Invalid,
+            scan_shader: Rid::Invalid,
+            scatter_shader: Rid::Invalid,
+            count_pipe: Rid::Invalid,
+            scan_pipe: Rid::Invalid,
+            scatter_pipe: Rid::Invalid,
+            count_set: Rid::Invalid,
+            scan_set: Rid::Invalid,
+            scatter_set: Rid::Invalid,
+            texture: None,
+        }
+    }
+}
 
 #[derive(Clone, Debug, Default)]
 struct NodeTransformState {
@@ -155,6 +343,7 @@ pub struct GaussianSplatNode3D {
     visibility_state: NodeVisibilityState,
     backend_state: NodeBackendState,
     debug_mesh_instance: Option<Gd<MeshInstance3D>>,
+    sort: SortGpu,
 }
 
 #[godot_api]
@@ -162,6 +351,31 @@ impl INode3D for GaussianSplatNode3D {
     fn ready(&mut self) {
         self.sync_runtime_state();
         self.sync_node_name();
+        // The GPU sort runs at runtime only; the editor keeps the unsorted
+        // Step 1 preview.
+        if !Engine::singleton().is_editor_hint() {
+            self.base_mut().set_process(true);
+        }
+    }
+
+    fn process(&mut self, _delta: f64) {
+        if Engine::singleton().is_editor_hint() {
+            return;
+        }
+        if !self.sort.ready {
+            if !self.sort.attempted && self.sort.splat_count > 0 && !self.sort.positions.is_empty()
+            {
+                self.setup_sort();
+            }
+            if !self.sort.ready {
+                return;
+            }
+        }
+        self.dispatch_sort();
+    }
+
+    fn exit_tree(&mut self) {
+        self.teardown_sort();
     }
 }
 
@@ -598,52 +812,67 @@ impl GaussianSplatNode3D {
             return;
         }
 
-        self.ensure_debug_mesh_instance();
-
-        let Some((positions, uvs, colors, custom0, custom1, indices)) =
-            self.build_gaussian_billboard_arrays(&asset, cloud_settings.as_ref())
-        else {
+        let Some(render) = self.build_splat_render_data(&asset, cloud_settings.as_ref()) else {
             self.clear_debug_mesh();
             return;
         };
 
-        if positions.is_empty() {
+        // Per-splat data texture (four RGBA-float texels per splat).
+        let Some(image) = Image::create_from_data(
+            render.tex_width,
+            render.tex_height,
+            false,
+            ImageFormat::RGBAF,
+            &render.data_bytes,
+        ) else {
             self.clear_debug_mesh();
             return;
-        }
+        };
+        let Some(data_texture) = ImageTexture::create_from_image(&image) else {
+            self.clear_debug_mesh();
+            return;
+        };
 
+        self.ensure_debug_mesh_instance();
         let Some(mesh_instance) = &mut self.debug_mesh_instance else {
             return;
         };
 
+        // Static slot mesh: four origin vertices per splat, expanded in the shader.
         let mut arrays = VarArray::new();
         for _ in 0..ArrayType::MAX.ord() {
             arrays.push(&Variant::nil());
         }
-        arrays.set(ArrayType::VERTEX.ord() as usize, &Variant::from(positions));
-        arrays.set(ArrayType::TEX_UV.ord() as usize, &Variant::from(uvs));
-        arrays.set(ArrayType::COLOR.ord() as usize, &Variant::from(colors));
-        arrays.set(ArrayType::CUSTOM0.ord() as usize, &Variant::from(custom0));
-        arrays.set(ArrayType::CUSTOM1.ord() as usize, &Variant::from(custom1));
-        arrays.set(ArrayType::INDEX.ord() as usize, &Variant::from(indices));
-
-        // CUSTOM0/CUSTOM1 carry the 3D covariance as four float channels each.
-        let custom_format = ArrayCustomFormat::RGBA_FLOAT.ord() as u64;
-        let surface_flags = ArrayFormat::from_ord(
-            (custom_format << ArrayFormat::CUSTOM0_SHIFT.ord())
-                | (custom_format << ArrayFormat::CUSTOM1_SHIFT.ord()),
+        arrays.set(
+            ArrayType::VERTEX.ord() as usize,
+            &Variant::from(render.positions),
+        );
+        arrays.set(ArrayType::TEX_UV.ord() as usize, &Variant::from(render.uvs));
+        arrays.set(
+            ArrayType::TEX_UV2.ord() as usize,
+            &Variant::from(render.uv2),
+        );
+        arrays.set(
+            ArrayType::INDEX.ord() as usize,
+            &Variant::from(render.indices),
         );
 
         let mut mesh = ArrayMesh::new_gd();
         mesh.add_surface_from_arrays_ex(PrimitiveType::TRIANGLES, &arrays)
-            .flags(surface_flags)
             .done();
+        // Vertices sit at the origin and are expanded in the shader, so the mesh
+        // needs an explicit AABB covering the splat cloud to avoid frustum culling.
+        mesh.set_custom_aabb(render.aabb);
 
         let mut shader = Shader::new_gd();
-        shader.set_code(GAUSSIAN_BILLBOARD_SHADER);
+        shader.set_code(SPLAT_TEXTURE_SHADER);
 
         let mut material = ShaderMaterial::new_gd();
         material.set_shader(&shader);
+        material.set_shader_parameter("data_tex", &Variant::from(data_texture));
+        material.set_shader_parameter("splat_count", &Variant::from(render.splat_count));
+        // Step 1 renders unsorted (slot == id); the compute sort (Step 2) flips this on.
+        material.set_shader_parameter("sort_enabled", &Variant::from(0_i32));
 
         let mesh_resource = mesh.upcast::<godot::classes::Mesh>();
         let material_resource = material.upcast::<godot::classes::Material>();
@@ -655,20 +884,21 @@ impl GaussianSplatNode3D {
                 .map(|settings| settings.bind().is_debug_visible())
                 .unwrap_or(true),
         );
+
+        // Stash GPU sort inputs (Step 2). A rebuild invalidates any prior sort
+        // (the material above already starts with sort_enabled = 0).
+        self.teardown_sort();
+        self.sort.positions = render.positions_ssbo;
+        self.sort.splat_count = render.splat_count;
+        self.sort.local_aabb = render.aabb;
+        self.sort.attempted = false;
     }
 
-    fn build_gaussian_billboard_arrays(
+    fn build_splat_render_data(
         &self,
         asset: &Gd<GaussianSplatAsset>,
         cloud_settings: Option<&Gd<GaussianSplatCloudSettings>>,
-    ) -> Option<(
-        PackedVector3Array,
-        PackedVector2Array,
-        PackedColorArray,
-        PackedFloat32Array,
-        PackedFloat32Array,
-        PackedInt32Array,
-    )> {
+    ) -> Option<SplatRenderData> {
         let values = {
             let asset_ref = asset.bind();
             asset_ref.payload_float_values()?
@@ -677,7 +907,7 @@ impl GaussianSplatNode3D {
         let source_point_count = values.len() / POINT_STRIDE_FLOATS;
         let max_splats = cloud_settings
             .map(|settings| settings.bind().get_max_debug_splats().max(0) as usize)
-            .unwrap_or(500_000);
+            .unwrap_or(usize::MAX);
         let point_count = source_point_count.min(max_splats);
         if point_count == 0 || point_count > (i32::MAX as usize / 4) {
             return None;
@@ -688,6 +918,13 @@ impl GaussianSplatNode3D {
             .map(|settings| settings.bind().get_gaussian_scale_multiplier())
             .unwrap_or(1.0)
             .max(0.01);
+
+        // Data texture: four RGBA-float texels per splat. Texel 0 = center.xyz,
+        // texels 1-2 = packed covariance upper triangle, texel 3 = color rgba.
+        let tex_width = SPLAT_DATA_TEX_WIDTH as usize;
+        let tex_height = (point_count * 4).div_ceil(tex_width).max(1);
+        let mut data = vec![0.0_f32; tex_width * tex_height * 4];
+
         // Quad corners in [-2, 2]; the vertex shader stretches them along the
         // projected ellipse axes, so the corner doubles as the Gaussian sample
         // coordinate (alpha = exp(-dot(corner, corner))).
@@ -700,13 +937,15 @@ impl GaussianSplatNode3D {
 
         let mut positions = Vec::with_capacity(point_count * 4);
         let mut uvs = Vec::with_capacity(point_count * 4);
-        let mut colors = Vec::with_capacity(point_count * 4);
-        let mut custom0 = Vec::with_capacity(point_count * 4 * 4);
-        let mut custom1 = Vec::with_capacity(point_count * 4 * 4);
+        let mut uv2 = Vec::with_capacity(point_count * 4);
         let mut indices = Vec::with_capacity(point_count * 6);
+        let mut positions_ssbo = Vec::with_capacity(point_count * 4);
 
-        for output_index in 0..point_count {
-            let point_index = (output_index * sample_stride).min(source_point_count - 1);
+        let mut min = Vector3::new(f32::INFINITY, f32::INFINITY, f32::INFINITY);
+        let mut max = Vector3::new(f32::NEG_INFINITY, f32::NEG_INFINITY, f32::NEG_INFINITY);
+
+        for slot in 0..point_count {
+            let point_index = (slot * sample_stride).min(source_point_count - 1);
             let offset = point_index * POINT_STRIDE_FLOATS;
             let center = Vector3::new(values[offset], values[offset + 1], values[offset + 2]);
             let cov = covariance_upper_triangle(
@@ -722,33 +961,276 @@ impl GaussianSplatNode3D {
                     values[offset + 9] * scale_multiplier,
                 ],
             );
-            let color = Color::from_rgba(
-                values[offset + 14],
-                values[offset + 15],
-                values[offset + 16],
-                values[offset + 17],
-            );
 
+            // Pack into the splat's four-texel block (16 contiguous floats).
+            let base = slot * 16;
+            data[base] = center.x;
+            data[base + 1] = center.y;
+            data[base + 2] = center.z;
+            data[base + 4] = cov[0];
+            data[base + 5] = cov[1];
+            data[base + 6] = cov[2];
+            data[base + 7] = cov[3];
+            data[base + 8] = cov[4];
+            data[base + 9] = cov[5];
+            data[base + 12] = values[offset + 14];
+            data[base + 13] = values[offset + 15];
+            data[base + 14] = values[offset + 16];
+            data[base + 15] = values[offset + 17];
+
+            min.x = min.x.min(center.x);
+            min.y = min.y.min(center.y);
+            min.z = min.z.min(center.z);
+            max.x = max.x.max(center.x);
+            max.y = max.y.max(center.y);
+            max.z = max.z.max(center.z);
+
+            positions_ssbo.extend_from_slice(&[center.x, center.y, center.z, 1.0]);
+
+            let slot_coord = Vector2::new(slot as f32, 0.0);
             for corner in corners {
-                positions.push(center);
+                positions.push(Vector3::ZERO);
                 uvs.push(corner);
-                colors.push(color);
-                custom0.extend_from_slice(&[cov[0], cov[1], cov[2], cov[3]]);
-                custom1.extend_from_slice(&[cov[4], cov[5], 0.0, 0.0]);
+                uv2.push(slot_coord);
             }
 
-            let base = (output_index * 4) as i32;
-            indices.extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
+            let quad = (slot * 4) as i32;
+            indices.extend_from_slice(&[quad, quad + 1, quad + 2, quad, quad + 2, quad + 3]);
         }
 
-        Some((
-            PackedVector3Array::from(positions),
-            PackedVector2Array::from(uvs),
-            PackedColorArray::from(colors),
-            PackedFloat32Array::from(custom0),
-            PackedFloat32Array::from(custom1),
-            PackedInt32Array::from(indices),
-        ))
+        let size = max - min;
+        // Grow the bounds so splats extending past their centers stay visible.
+        let aabb = Aabb::new(min, size).grow(size.length() * 0.05 + 0.01);
+
+        Some(SplatRenderData {
+            data_bytes: PackedFloat32Array::from(data).to_byte_array(),
+            tex_width: tex_width as i32,
+            tex_height: tex_height as i32,
+            positions: PackedVector3Array::from(positions),
+            uvs: PackedVector2Array::from(uvs),
+            uv2: PackedVector2Array::from(uv2),
+            indices: PackedInt32Array::from(indices),
+            positions_ssbo: PackedFloat32Array::from(positions_ssbo).to_byte_array(),
+            splat_count: point_count as i32,
+            aabb,
+        })
+    }
+
+    // Build the main-RenderingDevice resources for the GPU counting sort. Runs on
+    // the main thread (== render thread under single-threaded rendering).
+    fn setup_sort(&mut self) {
+        self.sort.attempted = true;
+        let count = self.sort.splat_count.max(0);
+        if count == 0 || self.sort.positions.is_empty() {
+            return;
+        }
+
+        let server = RenderingServer::singleton();
+        let Some(mut device) = server.get_rendering_device() else {
+            return;
+        };
+
+        // Positions storage buffer (vec4 per splat) + histogram/offset buffers.
+        let pos_buf = device
+            .storage_buffer_create_ex(self.sort.positions.len() as u32)
+            .data(&self.sort.positions)
+            .done();
+        let bucket_bytes = (SORT_NUM_BUCKETS as u32) * 4;
+        let hist_buf = device.storage_buffer_create(bucket_bytes);
+        let off_buf = device.storage_buffer_create(bucket_bytes);
+
+        // Sort-order texture (R32F): compute writes, the splat material samples.
+        let tex_width = SORT_TEX_WIDTH;
+        let tex_height = ((count + tex_width - 1) / tex_width).max(1);
+        let mut format = RdTextureFormat::new_gd();
+        format.set_width(tex_width as u32);
+        format.set_height(tex_height as u32);
+        format.set_format(DataFormat::R32_SFLOAT);
+        format.set_usage_bits(
+            TextureUsageBits::STORAGE_BIT
+                | TextureUsageBits::SAMPLING_BIT
+                | TextureUsageBits::CAN_UPDATE_BIT,
+        );
+        let sort_tex_rid = device.texture_create(&format, &RdTextureView::new_gd());
+
+        let (Some(count_shader), Some(scan_shader), Some(scatter_shader)) = (
+            compile_compute_shader(&mut device, SORT_COUNT_GLSL),
+            compile_compute_shader(&mut device, SORT_SCAN_GLSL),
+            compile_compute_shader(&mut device, SORT_SCATTER_GLSL),
+        ) else {
+            godot_error!("[gsplat] failed to compile sort compute shaders");
+            for rid in [pos_buf, hist_buf, off_buf, sort_tex_rid] {
+                if rid.is_valid() {
+                    device.free_rid(rid);
+                }
+            }
+            return;
+        };
+
+        let count_pipe = device.compute_pipeline_create(count_shader);
+        let scan_pipe = device.compute_pipeline_create(scan_shader);
+        let scatter_pipe = device.compute_pipeline_create(scatter_shader);
+
+        let pos_u = ssbo_uniform(pos_buf, 0);
+        let hist_u = ssbo_uniform(hist_buf, 1);
+        let off_u = ssbo_uniform(off_buf, 2);
+        let img_u = image_uniform(sort_tex_rid, 3);
+        let count_set =
+            device.uniform_set_create(&uniform_array(&[&pos_u, &hist_u]), count_shader, 0);
+        let scan_set =
+            device.uniform_set_create(&uniform_array(&[&hist_u, &off_u]), scan_shader, 0);
+        let scatter_set =
+            device.uniform_set_create(&uniform_array(&[&pos_u, &off_u, &img_u]), scatter_shader, 0);
+
+        let mut texture = Texture2Drd::new_gd();
+        texture.set_texture_rd_rid(sort_tex_rid);
+
+        self.sort.pos_buf = pos_buf;
+        self.sort.hist_buf = hist_buf;
+        self.sort.off_buf = off_buf;
+        self.sort.sort_tex_rid = sort_tex_rid;
+        self.sort.count_shader = count_shader;
+        self.sort.scan_shader = scan_shader;
+        self.sort.scatter_shader = scatter_shader;
+        self.sort.count_pipe = count_pipe;
+        self.sort.scan_pipe = scan_pipe;
+        self.sort.scatter_pipe = scatter_pipe;
+        self.sort.count_set = count_set;
+        self.sort.scan_set = scan_set;
+        self.sort.scatter_set = scatter_set;
+        self.sort.tex_width = tex_width;
+        self.sort.tex_height = tex_height;
+        self.sort.texture = Some(texture);
+        self.sort.ready = true;
+
+        // Point the splat shader at the sort texture and switch to sorted indexing.
+        if let Some(mut material) = self.splat_material() {
+            if let Some(texture) = &self.sort.texture {
+                material.set_shader_parameter("sort_tex", &Variant::from(texture.clone()));
+            }
+            material.set_shader_parameter("sort_enabled", &Variant::from(1_i32));
+        }
+    }
+
+    // Queue one back-to-front counting sort for the current camera view. The
+    // closure runs on the render thread and must not touch the node's storage.
+    fn dispatch_sort(&self) {
+        let Some(viewport) = self.base().get_viewport() else {
+            return;
+        };
+        let Some(camera) = viewport.get_camera_3d() else {
+            return;
+        };
+
+        // Sort by camera-space depth of (camera_view * node_model * center).
+        let view = camera.get_global_transform().affine_inverse();
+        let model = self.base().get_global_transform();
+        let combined = view * model;
+        let (depth_min, depth_inv_range) = depth_range(combined, self.sort.local_aabb);
+        let push_constant = build_sort_push_constant(
+            combined,
+            depth_min,
+            depth_inv_range,
+            self.sort.splat_count,
+            self.sort.tex_width,
+        );
+
+        let count = self.sort.splat_count.max(0) as u32;
+        let groups = count.div_ceil(SORT_LOCAL_SIZE);
+        let bucket_bytes = (SORT_NUM_BUCKETS as u32) * 4;
+
+        let hist_buf = self.sort.hist_buf;
+        let count_pipe = self.sort.count_pipe;
+        let scan_pipe = self.sort.scan_pipe;
+        let scatter_pipe = self.sort.scatter_pipe;
+        let count_set = self.sort.count_set;
+        let scan_set = self.sort.scan_set;
+        let scatter_set = self.sort.scatter_set;
+
+        let callable = Callable::from_fn("gsplat_sort_dispatch", move |_args: &[&Variant]| {
+            let server = RenderingServer::singleton();
+            let Some(mut device) = server.get_rendering_device() else {
+                return Variant::nil();
+            };
+            device.buffer_clear(hist_buf, 0, bucket_bytes);
+            let list = device.compute_list_begin();
+            device.compute_list_bind_compute_pipeline(list, count_pipe);
+            device.compute_list_bind_uniform_set(list, count_set, 0);
+            device.compute_list_set_push_constant(list, &push_constant, push_constant.len() as u32);
+            device.compute_list_dispatch(list, groups, 1, 1);
+            device.compute_list_add_barrier(list);
+            device.compute_list_bind_compute_pipeline(list, scan_pipe);
+            device.compute_list_bind_uniform_set(list, scan_set, 0);
+            device.compute_list_set_push_constant(list, &push_constant, push_constant.len() as u32);
+            device.compute_list_dispatch(list, 1, 1, 1);
+            device.compute_list_add_barrier(list);
+            device.compute_list_bind_compute_pipeline(list, scatter_pipe);
+            device.compute_list_bind_uniform_set(list, scatter_set, 0);
+            device.compute_list_set_push_constant(list, &push_constant, push_constant.len() as u32);
+            device.compute_list_dispatch(list, groups, 1, 1);
+            device.compute_list_end();
+            Variant::nil()
+        });
+        RenderingServer::singleton().call_on_render_thread(&callable);
+    }
+
+    fn teardown_sort(&mut self) {
+        let has_resources = self.sort.pos_buf.is_valid()
+            || self.sort.count_shader.is_valid()
+            || self.sort.sort_tex_rid.is_valid();
+        if has_resources {
+            let server = RenderingServer::singleton();
+            if let Some(mut device) = server.get_rendering_device() {
+                for rid in [
+                    self.sort.count_set,
+                    self.sort.scan_set,
+                    self.sort.scatter_set,
+                    self.sort.count_pipe,
+                    self.sort.scan_pipe,
+                    self.sort.scatter_pipe,
+                    self.sort.count_shader,
+                    self.sort.scan_shader,
+                    self.sort.scatter_shader,
+                    self.sort.sort_tex_rid,
+                    self.sort.pos_buf,
+                    self.sort.hist_buf,
+                    self.sort.off_buf,
+                ] {
+                    if rid.is_valid() {
+                        device.free_rid(rid);
+                    }
+                }
+            }
+        }
+
+        // Reset GPU state but keep the stashed inputs so a later tree re-entry can
+        // rebuild the sort.
+        let positions = std::mem::take(&mut self.sort.positions);
+        let splat_count = self.sort.splat_count;
+        let local_aabb = self.sort.local_aabb;
+        self.sort = SortGpu::default();
+        self.sort.positions = positions;
+        self.sort.splat_count = splat_count;
+        self.sort.local_aabb = local_aabb;
+
+        // Stop the shader from sampling a freed sort texture.
+        self.set_material_sort_enabled(false);
+    }
+
+    fn splat_material(&self) -> Option<Gd<ShaderMaterial>> {
+        self.debug_mesh_instance
+            .as_ref()
+            .and_then(|mesh_instance| mesh_instance.get_material_override())
+            .and_then(|material| material.try_cast::<ShaderMaterial>().ok())
+    }
+
+    fn set_material_sort_enabled(&self, enabled: bool) {
+        if let Some(mut material) = self.splat_material() {
+            material.set_shader_parameter(
+                "sort_enabled",
+                &Variant::from(if enabled { 1_i32 } else { 0_i32 }),
+            );
+        }
     }
 }
 
@@ -787,5 +1269,111 @@ fn covariance_upper_triangle(quat: [f32; 4], scale: [f32; 3]) -> [f32; 6] {
 
     // Sigma = M * M^T (symmetric).
     let dot = |a: usize, b: usize| m[a][0] * m[b][0] + m[a][1] * m[b][1] + m[a][2] * m[b][2];
-    [dot(0, 0), dot(0, 1), dot(0, 2), dot(1, 1), dot(1, 2), dot(2, 2)]
+    [
+        dot(0, 0),
+        dot(0, 1),
+        dot(0, 2),
+        dot(1, 1),
+        dot(1, 2),
+        dot(2, 2),
+    ]
+}
+
+// Compile one GLSL compute shader on the given device, returning its shader RID.
+fn compile_compute_shader(device: &mut Gd<RenderingDevice>, glsl: &str) -> Option<Rid> {
+    let mut source = RdShaderSource::new_gd();
+    source.set_language(ShaderLanguage::GLSL);
+    source.set_stage_source(ShaderStage::COMPUTE, glsl);
+    let spirv = device.shader_compile_spirv_from_source(&source)?;
+    let error = spirv.get_stage_compile_error(ShaderStage::COMPUTE);
+    if !error.to_string().is_empty() {
+        godot_error!("[gsplat] sort compute compile error: {error}");
+        return None;
+    }
+    let shader = device.shader_create_from_spirv(&spirv);
+    shader.is_valid().then_some(shader)
+}
+
+fn ssbo_uniform(buffer: Rid, binding: i32) -> Gd<RdUniform> {
+    let mut uniform = RdUniform::new_gd();
+    uniform.set_uniform_type(UniformType::STORAGE_BUFFER);
+    uniform.set_binding(binding);
+    uniform.add_id(buffer);
+    uniform
+}
+
+fn image_uniform(image: Rid, binding: i32) -> Gd<RdUniform> {
+    let mut uniform = RdUniform::new_gd();
+    uniform.set_uniform_type(UniformType::IMAGE);
+    uniform.set_binding(binding);
+    uniform.add_id(image);
+    uniform
+}
+
+fn uniform_array(uniforms: &[&Gd<RdUniform>]) -> Array<Gd<RdUniform>> {
+    let mut array = Array::new();
+    for uniform in uniforms {
+        array.push(*uniform);
+    }
+    array
+}
+
+// Pack the 84-byte std430 push constant: column-major mat4, depth range, and the
+// bucket/count/tex-width scalars. Matches the layout in the sort compute shaders.
+fn build_sort_push_constant(
+    view: Transform3D,
+    depth_min: f32,
+    depth_inv_range: f32,
+    count: i32,
+    tex_width: i32,
+) -> PackedByteArray {
+    let columns = [
+        (view.basis.col_a(), 0.0_f32),
+        (view.basis.col_b(), 0.0_f32),
+        (view.basis.col_c(), 0.0_f32),
+        (view.origin, 1.0_f32),
+    ];
+    let mut bytes: Vec<u8> = Vec::with_capacity(84);
+    for (column, w) in columns {
+        bytes.extend_from_slice(&column.x.to_le_bytes());
+        bytes.extend_from_slice(&column.y.to_le_bytes());
+        bytes.extend_from_slice(&column.z.to_le_bytes());
+        bytes.extend_from_slice(&w.to_le_bytes());
+    }
+    bytes.extend_from_slice(&depth_min.to_le_bytes());
+    bytes.extend_from_slice(&depth_inv_range.to_le_bytes());
+    bytes.extend_from_slice(&(SORT_NUM_BUCKETS as u32).to_le_bytes());
+    bytes.extend_from_slice(&(count as u32).to_le_bytes());
+    bytes.extend_from_slice(&(tex_width as u32).to_le_bytes());
+    PackedByteArray::from(bytes)
+}
+
+// Camera-space depth bounds (as positive distances) of the AABB under `view`.
+fn depth_range(view: Transform3D, aabb: Aabb) -> (f32, f32) {
+    let mut depth_min = f32::INFINITY;
+    let mut depth_max = f32::NEG_INFINITY;
+    for corner in aabb_corners(aabb) {
+        let view_z = (view * corner).z;
+        depth_min = depth_min.min(-view_z);
+        depth_max = depth_max.max(-view_z);
+    }
+    if !depth_min.is_finite() || !depth_max.is_finite() {
+        return (0.0, 1.0);
+    }
+    (depth_min, 1.0 / (depth_max - depth_min).max(1e-4))
+}
+
+fn aabb_corners(aabb: Aabb) -> [Vector3; 8] {
+    let p = aabb.position;
+    let s = aabb.size;
+    [
+        Vector3::new(p.x, p.y, p.z),
+        Vector3::new(p.x + s.x, p.y, p.z),
+        Vector3::new(p.x, p.y + s.y, p.z),
+        Vector3::new(p.x, p.y, p.z + s.z),
+        Vector3::new(p.x + s.x, p.y + s.y, p.z),
+        Vector3::new(p.x + s.x, p.y, p.z + s.z),
+        Vector3::new(p.x, p.y + s.y, p.z + s.z),
+        Vector3::new(p.x + s.x, p.y + s.y, p.z + s.z),
+    ]
 }
