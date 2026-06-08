@@ -477,6 +477,9 @@ pub struct GaussianSplatNode3D {
     sort: SortGpu,
     // Backing storage for the `render_profile` export (PhantomVar holds no state).
     render_profile_value: RenderProfile,
+    // True while a preset is being applied, so preset-driven writes to the
+    // individual fields don't flip the profile back to Custom.
+    applying_profile: bool,
 }
 
 #[godot_api]
@@ -564,8 +567,11 @@ impl GaussianSplatNode3D {
         }
         self.backend_state.profile_hint = self.resolve_backend_pipeline();
         self.mark_backend_dirty("render_profile");
-        // The budget caps the rendered splat count and rebuilds the render.
+        // The budget caps the rendered splat count and rebuilds the render. Guard
+        // so this preset-driven write does not flip the profile back to Custom.
+        self.applying_profile = true;
         self.set_preview_max_splats(budget);
+        self.applying_profile = false;
     }
 
     #[func]
@@ -652,6 +658,10 @@ impl GaussianSplatNode3D {
 
     #[func]
     pub fn set_preview_max_splats(&mut self, max_splats: i32) {
+        // A manual budget edit no longer matches a fixed preset, so drop to Custom.
+        if !self.applying_profile {
+            self.render_profile_value = RenderProfile::Custom;
+        }
         self.ensure_cloud_settings();
         let max_splats = self.clamp_preview_max_splats(max_splats);
         if let Some(settings) = &mut self.cloud_settings {
