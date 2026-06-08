@@ -5,14 +5,16 @@ use godot::classes::rendering_device::{
 };
 use godot::classes::GltfState;
 use godot::classes::{
-    ArrayMesh, Engine, Image, ImageTexture, MeshInstance3D, RdShaderSource, RdTextureFormat,
-    RdTextureView, RdUniform, RenderingDevice, RenderingServer, Shader, ShaderMaterial, Texture2D,
-    Texture2Drd,
+    ArrayMesh, Engine, Image, ImageTexture, MeshInstance3D, Node3D, RdShaderSource,
+    RdTextureFormat, RdTextureView, RdUniform, RenderingDevice, RenderingServer, Shader,
+    ShaderMaterial, Texture2D, Texture2Drd, Viewport, XrServer,
 };
 use godot::prelude::*;
 
 use crate::asset::GaussianSplatAsset;
-use crate::backend::{GaussianSplatBackendSettings, BACKEND_PROFILE_DESKTOP};
+use crate::backend::{
+    GaussianSplatBackendSettings, BACKEND_PROFILE_DESKTOP, VR_VIEW_BASIS_PER_EYE,
+};
 use crate::cloud_settings::GaussianSplatCloudSettings;
 use crate::import_state::{ImportedSplatMetadata, NODE_STATE_KEY, POINT_STRIDE_FLOATS};
 use crate::render_packet::GaussianSplatRenderPacket;
@@ -36,6 +38,7 @@ render_mode unshaded, cull_disabled, blend_mix, depth_draw_never;
 
 uniform sampler2D data_tex : filter_nearest;
 uniform sampler2D sort_tex : filter_nearest;
+uniform sampler2D sort_tex_b : filter_nearest;
 uniform int splat_count;
 uniform int sort_enabled;
 
@@ -47,8 +50,15 @@ void vertex() {
     int slot = int(UV2.x + 0.5);
     int splat_id = slot;
     if (sort_enabled > 0) {
-        int sw = textureSize(sort_tex, 0).x;
-        splat_id = int(texelFetch(sort_tex, ivec2(slot % sw, slot / sw), 0).r + 0.5);
+        // VIEW_INDEX selects the per-eye sort order under multiview (VR). It is
+        // always 0 on flat displays, so sort_tex_b is then unused.
+        if (VIEW_INDEX == 1) {
+            int sw = textureSize(sort_tex_b, 0).x;
+            splat_id = int(texelFetch(sort_tex_b, ivec2(slot % sw, slot / sw), 0).r + 0.5);
+        } else {
+            int sw = textureSize(sort_tex, 0).x;
+            splat_id = int(texelFetch(sort_tex, ivec2(slot % sw, slot / sw), 0).r + 0.5);
+        }
     }
     splat_id = clamp(splat_id, 0, splat_count - 1);
 
@@ -347,6 +357,10 @@ struct SortGpu {
     pipelines: [Rid; SORT_STAGES],
     sets: [Rid; SORT_STAGES],
     texture: Option<Gd<Texture2Drd>>,
+    // Second eye's sort order for VR per-eye sorting (unused on flat displays).
+    sort_tex_rid_b: Rid,
+    scatter_set_b: Rid,
+    texture_b: Option<Gd<Texture2Drd>>,
 }
 
 impl Default for SortGpu {
@@ -371,6 +385,9 @@ impl Default for SortGpu {
             pipelines: [Rid::Invalid; SORT_STAGES],
             sets: [Rid::Invalid; SORT_STAGES],
             texture: None,
+            sort_tex_rid_b: Rid::Invalid,
+            scatter_set_b: Rid::Invalid,
+            texture_b: None,
         }
     }
 }
@@ -462,18 +479,19 @@ impl INode3D for GaussianSplatNode3D {
         if !self.sort.ready {
             return;
         }
-        let Some(view) = self.current_sort_view() else {
+        let eyes = self.current_sort_views();
+        let Some(&(primary, _)) = eyes.first() else {
             return;
         };
         // Re-sort only when the camera/node view changes meaningfully; a static
         // view keeps the last back-to-front order, saving per-frame GPU work.
         let should_sort = match self.sort.last_view {
-            Some(last) => self.sort_view_changed(last, view),
+            Some(last) => self.sort_view_changed(last, primary),
             None => true,
         };
         if should_sort {
-            self.dispatch_sort(view);
-            self.sort.last_view = Some(view);
+            self.dispatch_sort(&eyes);
+            self.sort.last_view = Some(primary);
         }
         // Enable sorted sampling one frame after the first dispatch, so the sort
         // texture is registered and written before the material binds it.
@@ -1268,6 +1286,7 @@ impl GaussianSplatNode3D {
                 | TextureUsageBits::CAN_UPDATE_BIT,
         );
         let sort_tex_rid = device.texture_create(&format, &RdTextureView::new_gd());
+        let sort_tex_rid_b = device.texture_create(&format, &RdTextureView::new_gd());
 
         // Compile the counting-sort compute stages (one shader + pipeline each).
         let sources = [
@@ -1288,6 +1307,7 @@ impl GaussianSplatNode3D {
                     off_buf,
                     blocks_buf,
                     sort_tex_rid,
+                    sort_tex_rid_b,
                 ]) {
                     if rid.is_valid() {
                         device.free_rid(rid);
@@ -1325,9 +1345,18 @@ impl GaussianSplatNode3D {
             shaders[ST_SCATTER],
             0,
         );
+        // Second eye scatters into its own sort texture (VR per-eye).
+        let img_u_b = image_uniform(sort_tex_rid_b, 3);
+        let scatter_set_b = device.uniform_set_create(
+            &uniform_array(&[&pos_u, &off_u, &img_u_b]),
+            shaders[ST_SCATTER],
+            0,
+        );
 
         let mut texture = Texture2Drd::new_gd();
         texture.set_texture_rd_rid(sort_tex_rid);
+        let mut texture_b = Texture2Drd::new_gd();
+        texture_b.set_texture_rd_rid(sort_tex_rid_b);
 
         self.sort.pos_buf = pos_buf;
         self.sort.hist_buf = hist_buf;
@@ -1340,19 +1369,71 @@ impl GaussianSplatNode3D {
         self.sort.tex_width = tex_width;
         self.sort.tex_height = tex_height;
         self.sort.texture = Some(texture);
+        self.sort.sort_tex_rid_b = sort_tex_rid_b;
+        self.sort.scatter_set_b = scatter_set_b;
+        self.sort.texture_b = Some(texture_b);
         self.sort.ready = true;
         // The material is pointed at the sort texture only after the first dispatch
         // (see process); binding the Texture2Drd the frame it is created would make
         // the renderer sample an unregistered texture for one frame.
     }
 
-    // Current sort view = camera_view * node_model. None when there is no active
-    // camera (e.g. before one is set), in which case the previous order is kept.
-    fn current_sort_view(&self) -> Option<Transform3D> {
-        let camera = self.base().get_viewport()?.get_camera_3d()?;
-        let view = camera.get_global_transform().affine_inverse();
+    // Per-eye sort views (combined = camera_view * node_model). One entry on flat
+    // displays; two (left, right) for VR per-eye sorting. Empty when there is no
+    // active camera, in which case the previous order is kept.
+    fn current_sort_views(&self) -> Vec<(Transform3D, usize)> {
+        let Some(viewport) = self.base().get_viewport() else {
+            return Vec::new();
+        };
         let model = self.base().get_global_transform();
-        Some(view * model)
+
+        // VR per-eye path (structure only; unverified — needs real XR hardware).
+        if viewport.is_using_xr() && self.vr_per_eye_enabled() {
+            if let Some(eyes) = self.xr_eye_views(&viewport, model) {
+                return eyes;
+            }
+        }
+
+        // Flat / head-center: a single view from the active camera.
+        let Some(camera) = viewport.get_camera_3d() else {
+            return Vec::new();
+        };
+        let view = camera.get_global_transform().affine_inverse();
+        vec![(view * model, 0)]
+    }
+
+    fn vr_per_eye_enabled(&self) -> bool {
+        self.backend_settings
+            .as_ref()
+            .map(|settings| settings.bind().get_vr_view_basis() == VR_VIEW_BASIS_PER_EYE)
+            .unwrap_or(false)
+    }
+
+    // Acquire per-eye world views from the XR interface. Assumes the standard
+    // XROrigin3D > XRCamera3D hierarchy for the reference transform; the exact
+    // per-eye math must be validated on real XR hardware.
+    fn xr_eye_views(
+        &self,
+        viewport: &Gd<Viewport>,
+        model: Transform3D,
+    ) -> Option<Vec<(Transform3D, usize)>> {
+        let interface = XrServer::singleton().get_primary_interface()?;
+        let view_count = interface.get_view_count().min(2);
+        if view_count == 0 {
+            return None;
+        }
+        let reference = viewport
+            .get_camera_3d()
+            .and_then(|camera| camera.get_parent())
+            .and_then(|parent| parent.try_cast::<Node3D>().ok())
+            .map(|origin| origin.get_global_transform())
+            .unwrap_or(Transform3D::IDENTITY);
+        let mut eyes = Vec::with_capacity(view_count as usize);
+        for eye in 0..view_count {
+            let eye_world = interface.get_transform_for_view(eye, reference);
+            eyes.push((eye_world.affine_inverse() * model, eye as usize));
+        }
+        Some(eyes)
     }
 
     // Whether the view moved/rotated enough to warrant a re-sort.
@@ -1367,19 +1448,29 @@ impl GaussianSplatNode3D {
         axis_cos < SORT_RESORT_AXIS_COS
     }
 
-    // Queue one back-to-front counting sort for the given view (camera_view *
-    // node_model). The closure runs on the render thread and must not touch the
-    // node's storage.
-    fn dispatch_sort(&self, combined: Transform3D) {
-        // Sort by camera-space depth of (combined * center).
-        let (depth_min, depth_inv_range) = depth_range(combined, self.sort.local_aabb);
-        let push_constant = build_sort_push_constant(
-            combined,
-            depth_min,
-            depth_inv_range,
-            self.sort.splat_count,
-            self.sort.tex_width,
-        );
+    // Queue a back-to-front counting sort per view (camera_view * node_model). One
+    // pass on flat displays; one per eye for VR, each scattering into its own sort
+    // texture. The closure runs on the render thread and must not touch the node.
+    fn dispatch_sort(&self, eyes: &[(Transform3D, usize)]) {
+        // Resolve each eye to (push constant, scatter uniform set). Eye 1 targets
+        // the second sort texture; all others target the primary one.
+        let mut passes: Vec<(PackedByteArray, Rid)> = Vec::with_capacity(eyes.len());
+        for &(combined, eye) in eyes {
+            let (depth_min, depth_inv_range) = depth_range(combined, self.sort.local_aabb);
+            let push_constant = build_sort_push_constant(
+                combined,
+                depth_min,
+                depth_inv_range,
+                self.sort.splat_count,
+                self.sort.tex_width,
+            );
+            let scatter_set = if eye == 1 {
+                self.sort.scatter_set_b
+            } else {
+                self.sort.sets[ST_SCATTER]
+            };
+            passes.push((push_constant, scatter_set));
+        }
 
         let count = self.sort.splat_count.max(0) as u32;
         let groups = count.div_ceil(SORT_LOCAL_SIZE);
@@ -1394,42 +1485,46 @@ impl GaussianSplatNode3D {
             let Some(mut device) = server.get_rendering_device() else {
                 return Variant::nil();
             };
-            device.buffer_clear(hist_buf, 0, bucket_bytes);
-            let list = device.compute_list_begin();
-            let pc_len = push_constant.len() as u32;
+            // Each eye recomputes the histogram for its own view (buffer_clear must
+            // run outside a compute list), then runs the 5 stages.
+            for (push_constant, scatter_set) in &passes {
+                device.buffer_clear(hist_buf, 0, bucket_bytes);
+                let list = device.compute_list_begin();
+                let pc_len = push_constant.len() as u32;
 
-            // Count splats per depth bucket.
-            device.compute_list_bind_compute_pipeline(list, pipelines[ST_COUNT]);
-            device.compute_list_bind_uniform_set(list, sets[ST_COUNT], 0);
-            device.compute_list_set_push_constant(list, &push_constant, pc_len);
-            device.compute_list_dispatch(list, groups, 1, 1);
-            device.compute_list_add_barrier(list);
+                // Count splats per depth bucket.
+                device.compute_list_bind_compute_pipeline(list, pipelines[ST_COUNT]);
+                device.compute_list_bind_uniform_set(list, sets[ST_COUNT], 0);
+                device.compute_list_set_push_constant(list, push_constant, pc_len);
+                device.compute_list_dispatch(list, groups, 1, 1);
+                device.compute_list_add_barrier(list);
 
-            // Parallel block prefix sum of the histogram -> per-bucket offsets.
-            // Every stage re-sets the push constant so its pipeline's expected size
-            // matches (all stages declare the same 84-byte block).
-            device.compute_list_bind_compute_pipeline(list, pipelines[ST_SCAN_LOCAL]);
-            device.compute_list_bind_uniform_set(list, sets[ST_SCAN_LOCAL], 0);
-            device.compute_list_set_push_constant(list, &push_constant, pc_len);
-            device.compute_list_dispatch(list, scan_blocks, 1, 1);
-            device.compute_list_add_barrier(list);
-            device.compute_list_bind_compute_pipeline(list, pipelines[ST_SCAN_BLOCKSUMS]);
-            device.compute_list_bind_uniform_set(list, sets[ST_SCAN_BLOCKSUMS], 0);
-            device.compute_list_set_push_constant(list, &push_constant, pc_len);
-            device.compute_list_dispatch(list, 1, 1, 1);
-            device.compute_list_add_barrier(list);
-            device.compute_list_bind_compute_pipeline(list, pipelines[ST_SCAN_ADD]);
-            device.compute_list_bind_uniform_set(list, sets[ST_SCAN_ADD], 0);
-            device.compute_list_set_push_constant(list, &push_constant, pc_len);
-            device.compute_list_dispatch(list, scan_blocks, 1, 1);
-            device.compute_list_add_barrier(list);
+                // Parallel block prefix sum of the histogram -> per-bucket offsets.
+                // Every stage re-sets the push constant so its pipeline's expected
+                // size matches (all stages declare the same 84-byte block).
+                device.compute_list_bind_compute_pipeline(list, pipelines[ST_SCAN_LOCAL]);
+                device.compute_list_bind_uniform_set(list, sets[ST_SCAN_LOCAL], 0);
+                device.compute_list_set_push_constant(list, push_constant, pc_len);
+                device.compute_list_dispatch(list, scan_blocks, 1, 1);
+                device.compute_list_add_barrier(list);
+                device.compute_list_bind_compute_pipeline(list, pipelines[ST_SCAN_BLOCKSUMS]);
+                device.compute_list_bind_uniform_set(list, sets[ST_SCAN_BLOCKSUMS], 0);
+                device.compute_list_set_push_constant(list, push_constant, pc_len);
+                device.compute_list_dispatch(list, 1, 1, 1);
+                device.compute_list_add_barrier(list);
+                device.compute_list_bind_compute_pipeline(list, pipelines[ST_SCAN_ADD]);
+                device.compute_list_bind_uniform_set(list, sets[ST_SCAN_ADD], 0);
+                device.compute_list_set_push_constant(list, push_constant, pc_len);
+                device.compute_list_dispatch(list, scan_blocks, 1, 1);
+                device.compute_list_add_barrier(list);
 
-            // Scatter each splat id into its sorted slot in the sort texture.
-            device.compute_list_bind_compute_pipeline(list, pipelines[ST_SCATTER]);
-            device.compute_list_bind_uniform_set(list, sets[ST_SCATTER], 0);
-            device.compute_list_set_push_constant(list, &push_constant, pc_len);
-            device.compute_list_dispatch(list, groups, 1, 1);
-            device.compute_list_end();
+                // Scatter each splat id into its sorted slot in this eye's texture.
+                device.compute_list_bind_compute_pipeline(list, pipelines[ST_SCATTER]);
+                device.compute_list_bind_uniform_set(list, *scatter_set, 0);
+                device.compute_list_set_push_constant(list, push_constant, pc_len);
+                device.compute_list_dispatch(list, groups, 1, 1);
+                device.compute_list_end();
+            }
             Variant::nil()
         });
         RenderingServer::singleton().call_on_render_thread(&callable);
@@ -1444,6 +1539,7 @@ impl GaussianSplatNode3D {
             if let Some(mut device) = server.get_rendering_device() {
                 let buffers = [
                     self.sort.sort_tex_rid,
+                    self.sort.sort_tex_rid_b,
                     self.sort.pos_buf,
                     self.sort.hist_buf,
                     self.sort.off_buf,
@@ -1453,6 +1549,7 @@ impl GaussianSplatNode3D {
                     .sort
                     .sets
                     .into_iter()
+                    .chain([self.sort.scatter_set_b])
                     .chain(self.sort.pipelines)
                     .chain(self.sort.shaders)
                     .chain(buffers)
@@ -1493,10 +1590,14 @@ impl GaussianSplatNode3D {
             if let Some(texture) = &self.sort.texture {
                 material.set_shader_parameter("sort_tex", &Variant::from(texture.clone()));
             }
+            if let Some(texture_b) = &self.sort.texture_b {
+                material.set_shader_parameter("sort_tex_b", &Variant::from(texture_b.clone()));
+            }
             material.set_shader_parameter("sort_enabled", &Variant::from(1_i32));
         } else {
             material.set_shader_parameter("sort_enabled", &Variant::from(0_i32));
             material.set_shader_parameter("sort_tex", &Variant::nil());
+            material.set_shader_parameter("sort_tex_b", &Variant::nil());
         }
     }
 }
