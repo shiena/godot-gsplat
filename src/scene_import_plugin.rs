@@ -122,11 +122,28 @@ impl GsplatScenePostImportPlugin {
     }
 
     fn read_options_from_plugin(plugin: &EditorScenePostImportPlugin) -> PreviewImportOptions {
-        PreviewImportOptions {
+        let mut options = PreviewImportOptions {
             max_splats: option_i32(plugin, OPTION_PREVIEW_MAX_SPLATS, 10_000),
             max_splat_radius: option_f32(plugin, OPTION_PREVIEW_MAX_SPLAT_RADIUS, 0.02),
             scale_multiplier: option_f32(plugin, OPTION_PREVIEW_SCALE_MULTIPLIER, 1.0),
+        };
+
+        let subresources = plugin.get_option_value("_subresources");
+        if let Some(max_splats) = find_i32_option(&subresources, OPTION_PREVIEW_MAX_SPLATS) {
+            options.max_splats = max_splats;
         }
+        if let Some(max_splat_radius) =
+            find_f32_option(&subresources, OPTION_PREVIEW_MAX_SPLAT_RADIUS)
+        {
+            options.max_splat_radius = max_splat_radius;
+        }
+        if let Some(scale_multiplier) =
+            find_f32_option(&subresources, OPTION_PREVIEW_SCALE_MULTIPLIER)
+        {
+            options.scale_multiplier = scale_multiplier;
+        }
+
+        options
     }
 
     fn add_i32_option(&mut self, name: &str, default_value: i32, hint_string: &str) {
@@ -180,6 +197,38 @@ fn option_f32(plugin: &EditorScenePostImportPlugin, name: &str, fallback: f32) -
         .get_option_value(name)
         .try_to::<f32>()
         .unwrap_or(fallback)
+}
+
+fn find_i32_option(value: &Variant, name: &str) -> Option<i32> {
+    find_option(value, name).and_then(|value| value.try_to::<i32>().ok())
+}
+
+fn find_f32_option(value: &Variant, name: &str) -> Option<f32> {
+    find_option(value, name).and_then(|value| value.try_to::<f32>().ok())
+}
+
+fn find_option(value: &Variant, name: &str) -> Option<Variant> {
+    if let Ok(dictionary) = value.try_to::<VarDictionary>() {
+        if let Some(option_value) = dictionary.get(name) {
+            return Some(option_value);
+        }
+
+        for nested_value in dictionary.values_array().iter_shared() {
+            if let Some(option_value) = find_option(&nested_value, name) {
+                return Some(option_value);
+            }
+        }
+    }
+
+    if let Ok(array) = value.try_to::<VarArray>() {
+        for nested_value in array.iter_shared() {
+            if let Some(option_value) = find_option(&nested_value, name) {
+                return Some(option_value);
+            }
+        }
+    }
+
+    None
 }
 
 fn apply_preview_options_to_tree(mut node: Gd<Node>, options: &PreviewImportOptions) {
