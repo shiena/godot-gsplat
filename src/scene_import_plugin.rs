@@ -19,14 +19,41 @@ pub struct GsplatScenePostImportPlugin {
 
 #[godot_api]
 impl IEditorScenePostImportPlugin for GsplatScenePostImportPlugin {
+    fn get_import_options(&mut self, path: GString) {
+        if !should_add_options_for_path(path) {
+            return;
+        }
+
+        self.add_preview_options();
+    }
+
     fn get_internal_import_options(&mut self, category: i32) {
         if category != InternalImportCategory::NODE.ord() {
             return;
         }
 
-        self.add_i32_option(OPTION_PREVIEW_MAX_SPLATS, 10_000, "0,5000000,1");
-        self.add_f32_option(OPTION_PREVIEW_MAX_SPLAT_RADIUS, 0.02, "0.001,1.0,0.001");
-        self.add_f32_option(OPTION_PREVIEW_SCALE_MULTIPLIER, 1.0, "0.01,64.0,0.01");
+        self.add_preview_options();
+    }
+
+    fn get_option_visibility(
+        &self,
+        path: GString,
+        _for_animation: bool,
+        option: GString,
+    ) -> Variant {
+        if !should_add_options_for_path(path) {
+            return Variant::nil();
+        }
+
+        let option = option.to_string();
+        let is_gsplat_option = option == OPTION_PREVIEW_MAX_SPLATS
+            || option == OPTION_PREVIEW_MAX_SPLAT_RADIUS
+            || option == OPTION_PREVIEW_SCALE_MULTIPLIER;
+        if is_gsplat_option {
+            Variant::from(true)
+        } else {
+            Variant::nil()
+        }
     }
 
     fn get_internal_option_visibility(
@@ -88,6 +115,12 @@ impl GsplatScenePostImportPlugin {
         Self::read_options_from_plugin(&self.base())
     }
 
+    fn add_preview_options(&mut self) {
+        self.add_i32_option(OPTION_PREVIEW_MAX_SPLATS, 10_000, "0,5000000,1");
+        self.add_f32_option(OPTION_PREVIEW_MAX_SPLAT_RADIUS, 0.02, "0.001,1.0,0.001");
+        self.add_f32_option(OPTION_PREVIEW_SCALE_MULTIPLIER, 1.0, "0.01,64.0,0.01");
+    }
+
     fn read_options_from_plugin(plugin: &EditorScenePostImportPlugin) -> PreviewImportOptions {
         PreviewImportOptions {
             max_splats: option_i32(plugin, OPTION_PREVIEW_MAX_SPLATS, 10_000),
@@ -118,6 +151,15 @@ struct PreviewImportOptions {
     max_splats: i32,
     max_splat_radius: f32,
     scale_multiplier: f32,
+}
+
+fn should_add_options_for_path(path: GString) -> bool {
+    if path.is_empty() {
+        return true;
+    }
+
+    let path = path.to_string().to_ascii_lowercase();
+    path.ends_with(".gltf") || path.ends_with(".glb")
 }
 
 fn option_i32(plugin: &EditorScenePostImportPlugin, name: &str, fallback: i32) -> i32 {
