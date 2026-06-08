@@ -6,7 +6,7 @@ use godot::classes::rendering_device::{
 use godot::classes::GltfState;
 use godot::classes::{
     ArrayMesh, Engine, Image, ImageTexture, MeshInstance3D, RdShaderSource, RdTextureFormat,
-    RdTextureView, RdUniform, RenderingDevice, RenderingServer, Shader, ShaderMaterial,
+    RdTextureView, RdUniform, RenderingDevice, RenderingServer, Shader, ShaderMaterial, Texture2D,
     Texture2Drd,
 };
 use godot::prelude::*;
@@ -233,6 +233,8 @@ void main() {
 struct SortGpu {
     ready: bool,
     attempted: bool,
+    enabled_in_shader: bool,
+    dispatched_once: bool,
     // Inputs stashed when the splat render is (re)built.
     positions: PackedByteArray,
     splat_count: i32,
@@ -261,6 +263,8 @@ impl Default for SortGpu {
         Self {
             ready: false,
             attempted: false,
+            enabled_in_shader: false,
+            dispatched_once: false,
             positions: PackedByteArray::new(),
             splat_count: 0,
             local_aabb: Aabb::default(),
@@ -349,6 +353,9 @@ pub struct GaussianSplatNode3D {
 #[godot_api]
 impl INode3D for GaussianSplatNode3D {
     fn ready(&mut self) {
+        // Reconnect to the baked render child when instanced from a pre-imported
+        // .scn (the field itself is not serialized); also marks renderable data.
+        self.adopt_serialized_render();
         self.sync_runtime_state();
         self.sync_node_name();
         // The GPU sort runs at runtime only; the editor keeps the unsorted
@@ -362,16 +369,19 @@ impl INode3D for GaussianSplatNode3D {
         if Engine::singleton().is_editor_hint() {
             return;
         }
-        if !self.sort.ready {
-            if !self.sort.attempted && self.sort.splat_count > 0 && !self.sort.positions.is_empty()
-            {
-                self.setup_sort();
-            }
-            if !self.sort.ready {
-                return;
-            }
+        if !self.sort.ready && !self.sort.attempted {
+            self.try_enable_sort();
         }
-        self.dispatch_sort();
+        if self.sort.ready {
+            self.dispatch_sort();
+            // Enable sorted sampling one frame after setup, so the sort texture is
+            // registered and holds valid contents before the material binds it.
+            if self.sort.dispatched_once && !self.sort.enabled_in_shader {
+                self.set_material_sort(true);
+                self.sort.enabled_in_shader = true;
+            }
+            self.sort.dispatched_once = true;
+        }
     }
 
     fn exit_tree(&mut self) {
@@ -1016,10 +1026,113 @@ impl GaussianSplatNode3D {
         })
     }
 
+    // Reconnect the field to the baked render child when the node is deserialized
+    // from a pre-imported .scn (the field itself is not serialized). A baked mesh
+    // means there is renderable data even without a live asset.
+    fn adopt_serialized_render(&mut self) {
+        if self.debug_mesh_instance.is_some() {
+            return;
+        }
+        for child in self.base().get_children().iter_shared() {
+            if let Ok(mesh_instance) = child.try_cast::<MeshInstance3D>() {
+                if mesh_instance.get_mesh().is_some() {
+                    self.visibility_state.asset_ready = true;
+                    self.debug_mesh_instance = Some(mesh_instance);
+                    return;
+                }
+            }
+        }
+    }
+
+    // One-shot attempt to bring up the GPU sort once renderable data exists.
+    fn try_enable_sort(&mut self) {
+        self.sort.attempted = true;
+        if self.sort.positions.is_empty() {
+            // Case B: no live asset (instanced from a pre-imported .scn) — recover
+            // the splat centers from the serialized data texture.
+            self.reconstruct_sort_inputs_from_material();
+        }
+        if self.sort.splat_count > 0 && !self.sort.positions.is_empty() {
+            self.setup_sort();
+        }
+    }
+
+    // Recover per-splat centers from the data texture so a node instanced from a
+    // pre-imported .scn (no live asset) can still be depth-sorted. Each splat is
+    // four RGBA-float texels; texel 0 (.rgb) holds the center.
+    fn reconstruct_sort_inputs_from_material(&mut self) {
+        let Some(material) = self.splat_material() else {
+            return;
+        };
+        let splat_count = material
+            .get_shader_parameter("splat_count")
+            .try_to::<i32>()
+            .unwrap_or(0);
+        if splat_count <= 0 {
+            return;
+        }
+        let Ok(data_texture) = material
+            .get_shader_parameter("data_tex")
+            .try_to::<Gd<Texture2D>>()
+        else {
+            return;
+        };
+        let Some(image) = data_texture.get_image() else {
+            return;
+        };
+
+        let count = splat_count as usize;
+        let mut positions: Vec<f32> = Vec::with_capacity(count * 4);
+        let mut min = Vector3::new(f32::INFINITY, f32::INFINITY, f32::INFINITY);
+        let mut max = Vector3::new(f32::NEG_INFINITY, f32::NEG_INFINITY, f32::NEG_INFINITY);
+
+        if image.get_format() == ImageFormat::RGBAF {
+            // Fast path: read the raw float bytes (16 floats per splat).
+            let floats = image.get_data().to_float32_array();
+            let values = floats.as_slice();
+            if values.len() < count * 16 {
+                return;
+            }
+            for i in 0..count {
+                let base = i * 16;
+                let center = Vector3::new(values[base], values[base + 1], values[base + 2]);
+                positions.extend_from_slice(&[center.x, center.y, center.z, 1.0]);
+                min.x = min.x.min(center.x);
+                min.y = min.y.min(center.y);
+                min.z = min.z.min(center.z);
+                max.x = max.x.max(center.x);
+                max.y = max.y.max(center.y);
+                max.z = max.z.max(center.z);
+            }
+        } else {
+            // Format-agnostic fallback.
+            let width = image.get_width();
+            if width <= 0 {
+                return;
+            }
+            for i in 0..count {
+                let texel = (i * 4) as i32;
+                let pixel = image.get_pixel(texel % width, texel / width);
+                let center = Vector3::new(pixel.r, pixel.g, pixel.b);
+                positions.extend_from_slice(&[center.x, center.y, center.z, 1.0]);
+                min.x = min.x.min(center.x);
+                min.y = min.y.min(center.y);
+                min.z = min.z.min(center.z);
+                max.x = max.x.max(center.x);
+                max.y = max.y.max(center.y);
+                max.z = max.z.max(center.z);
+            }
+        }
+
+        let size = max - min;
+        self.sort.positions = PackedFloat32Array::from(positions).to_byte_array();
+        self.sort.splat_count = splat_count;
+        self.sort.local_aabb = Aabb::new(min, size).grow(size.length() * 0.05 + 0.01);
+    }
+
     // Build the main-RenderingDevice resources for the GPU counting sort. Runs on
     // the main thread (== render thread under single-threaded rendering).
     fn setup_sort(&mut self) {
-        self.sort.attempted = true;
         let count = self.sort.splat_count.max(0);
         if count == 0 || self.sort.positions.is_empty() {
             return;
@@ -1102,14 +1215,9 @@ impl GaussianSplatNode3D {
         self.sort.tex_height = tex_height;
         self.sort.texture = Some(texture);
         self.sort.ready = true;
-
-        // Point the splat shader at the sort texture and switch to sorted indexing.
-        if let Some(mut material) = self.splat_material() {
-            if let Some(texture) = &self.sort.texture {
-                material.set_shader_parameter("sort_tex", &Variant::from(texture.clone()));
-            }
-            material.set_shader_parameter("sort_enabled", &Variant::from(1_i32));
-        }
+        // The material is pointed at the sort texture only after the first dispatch
+        // (see process); binding the Texture2Drd the frame it is created would make
+        // the renderer sample an unregistered texture for one frame.
     }
 
     // Queue one back-to-front counting sort for the current camera view. The
@@ -1214,7 +1322,7 @@ impl GaussianSplatNode3D {
         self.sort.local_aabb = local_aabb;
 
         // Stop the shader from sampling a freed sort texture.
-        self.set_material_sort_enabled(false);
+        self.set_material_sort(false);
     }
 
     fn splat_material(&self) -> Option<Gd<ShaderMaterial>> {
@@ -1224,12 +1332,18 @@ impl GaussianSplatNode3D {
             .and_then(|material| material.try_cast::<ShaderMaterial>().ok())
     }
 
-    fn set_material_sort_enabled(&self, enabled: bool) {
-        if let Some(mut material) = self.splat_material() {
-            material.set_shader_parameter(
-                "sort_enabled",
-                &Variant::from(if enabled { 1_i32 } else { 0_i32 }),
-            );
+    fn set_material_sort(&self, enabled: bool) {
+        let Some(mut material) = self.splat_material() else {
+            return;
+        };
+        if enabled {
+            if let Some(texture) = &self.sort.texture {
+                material.set_shader_parameter("sort_tex", &Variant::from(texture.clone()));
+            }
+            material.set_shader_parameter("sort_enabled", &Variant::from(1_i32));
+        } else {
+            material.set_shader_parameter("sort_enabled", &Variant::from(0_i32));
+            material.set_shader_parameter("sort_tex", &Variant::nil());
         }
     }
 }
