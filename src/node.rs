@@ -157,6 +157,12 @@ const SORT_NUM_BUCKETS: i32 = 2048;
 const SORT_LOCAL_SIZE: u32 = 256;
 const SORT_TEX_WIDTH: i32 = 4096;
 
+// Re-sort gating thresholds: a static view keeps the previous back-to-front order.
+// Position is a fraction of the splat cloud diagonal; orientation is a per-axis
+// cosine (~0.3 degrees).
+const SORT_RESORT_POS_FRACTION: f32 = 0.002;
+const SORT_RESORT_AXIS_COS: f32 = 0.999_986;
+
 // Pass 1: count splats per depth bucket (bucket 0 = farthest).
 const SORT_COUNT_GLSL: &str = r#"#version 450
 layout(local_size_x = 256) in;
@@ -235,6 +241,8 @@ struct SortGpu {
     attempted: bool,
     enabled_in_shader: bool,
     dispatched_once: bool,
+    // Last view (camera_view * node_model) used for a sort; gates re-sorting.
+    last_view: Option<Transform3D>,
     // Inputs stashed when the splat render is (re)built.
     positions: PackedByteArray,
     splat_count: i32,
@@ -265,6 +273,7 @@ impl Default for SortGpu {
             attempted: false,
             enabled_in_shader: false,
             dispatched_once: false,
+            last_view: None,
             positions: PackedByteArray::new(),
             splat_count: 0,
             local_aabb: Aabb::default(),
@@ -372,11 +381,26 @@ impl INode3D for GaussianSplatNode3D {
         if !self.sort.ready && !self.sort.attempted {
             self.try_enable_sort();
         }
-        if self.sort.ready {
-            self.dispatch_sort();
-            // Enable sorted sampling one frame after setup, so the sort texture is
-            // registered and holds valid contents before the material binds it.
-            if self.sort.dispatched_once && !self.sort.enabled_in_shader {
+        if !self.sort.ready {
+            return;
+        }
+        let Some(view) = self.current_sort_view() else {
+            return;
+        };
+        // Re-sort only when the camera/node view changes meaningfully; a static
+        // view keeps the last back-to-front order, saving per-frame GPU work.
+        let should_sort = match self.sort.last_view {
+            Some(last) => self.sort_view_changed(last, view),
+            None => true,
+        };
+        if should_sort {
+            self.dispatch_sort(view);
+            self.sort.last_view = Some(view);
+        }
+        // Enable sorted sampling one frame after the first dispatch, so the sort
+        // texture is registered and written before the material binds it.
+        if self.sort.last_view.is_some() && !self.sort.enabled_in_shader {
+            if self.sort.dispatched_once {
                 self.set_material_sort(true);
                 self.sort.enabled_in_shader = true;
             }
@@ -1220,20 +1244,32 @@ impl GaussianSplatNode3D {
         // the renderer sample an unregistered texture for one frame.
     }
 
-    // Queue one back-to-front counting sort for the current camera view. The
-    // closure runs on the render thread and must not touch the node's storage.
-    fn dispatch_sort(&self) {
-        let Some(viewport) = self.base().get_viewport() else {
-            return;
-        };
-        let Some(camera) = viewport.get_camera_3d() else {
-            return;
-        };
-
-        // Sort by camera-space depth of (camera_view * node_model * center).
+    // Current sort view = camera_view * node_model. None when there is no active
+    // camera (e.g. before one is set), in which case the previous order is kept.
+    fn current_sort_view(&self) -> Option<Transform3D> {
+        let camera = self.base().get_viewport()?.get_camera_3d()?;
         let view = camera.get_global_transform().affine_inverse();
         let model = self.base().get_global_transform();
-        let combined = view * model;
+        Some(view * model)
+    }
+
+    // Whether the view moved/rotated enough to warrant a re-sort.
+    fn sort_view_changed(&self, last: Transform3D, current: Transform3D) -> bool {
+        let scale = self.sort.local_aabb.size.length().max(1.0e-3);
+        if (current.origin - last.origin).length() > scale * SORT_RESORT_POS_FRACTION {
+            return true;
+        }
+        let axis_cos = normalized_dot(last.basis.col_a(), current.basis.col_a())
+            .min(normalized_dot(last.basis.col_b(), current.basis.col_b()))
+            .min(normalized_dot(last.basis.col_c(), current.basis.col_c()));
+        axis_cos < SORT_RESORT_AXIS_COS
+    }
+
+    // Queue one back-to-front counting sort for the given view (camera_view *
+    // node_model). The closure runs on the render thread and must not touch the
+    // node's storage.
+    fn dispatch_sort(&self, combined: Transform3D) {
+        // Sort by camera-space depth of (combined * center).
         let (depth_min, depth_inv_range) = depth_range(combined, self.sort.local_aabb);
         let push_constant = build_sort_push_constant(
             combined,
@@ -1475,6 +1511,11 @@ fn depth_range(view: Transform3D, aabb: Aabb) -> (f32, f32) {
         return (0.0, 1.0);
     }
     (depth_min, 1.0 / (depth_max - depth_min).max(1e-4))
+}
+
+// Cosine of the angle between two vectors (1.0 = identical direction).
+fn normalized_dot(a: Vector3, b: Vector3) -> f32 {
+    a.normalized().dot(b.normalized())
 }
 
 fn aabb_corners(aabb: Aabb) -> [Vector3; 8] {
