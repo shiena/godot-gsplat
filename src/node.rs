@@ -153,9 +153,24 @@ struct SplatRenderData {
 // Depth bucket count (sort precision) and compute workgroup size, mirroring the
 // validated PoC. The sort-order texture is R32F; one texel per splat holds the
 // splat id to draw at that slot, sampled by SPLAT_TEXTURE_SHADER.
-const SORT_NUM_BUCKETS: i32 = 2048;
+// 16-bit depth precision: 65536 buckets scanned with a parallel block prefix sum
+// (SORT_SCAN_BLOCK threads per block, SORT_NUM_BLOCKS blocks). A single-pass
+// counting sort is order-agnostic within a bucket, so a high bucket count yields
+// near-exact back-to-front ordering. SORT_SCAN_BLOCK / SORT_NUM_BLOCKS are mirrored
+// as `#define`s in the scan shaders below and must stay in sync.
+const SORT_NUM_BUCKETS: i32 = 65536;
 const SORT_LOCAL_SIZE: u32 = 256;
+const SORT_SCAN_BLOCK: i32 = 1024;
+const SORT_NUM_BLOCKS: i32 = SORT_NUM_BUCKETS / SORT_SCAN_BLOCK;
 const SORT_TEX_WIDTH: i32 = 4096;
+
+// Compute stages: count -> scan_local -> scan_blocksums -> scan_add -> scatter.
+const SORT_STAGES: usize = 5;
+const ST_COUNT: usize = 0;
+const ST_SCAN_LOCAL: usize = 1;
+const ST_SCAN_BLOCKSUMS: usize = 2;
+const ST_SCAN_ADD: usize = 3;
+const ST_SCATTER: usize = 4;
 
 // Re-sort gating thresholds: a static view keeps the previous back-to-front order.
 // Position is a fraction of the splat cloud diagonal; orientation is a per-axis
@@ -186,11 +201,85 @@ void main() {
 }
 "#;
 
-// Pass 2: serial exclusive prefix sum of the histogram into per-bucket offsets.
-const SORT_SCAN_GLSL: &str = r#"#version 450
-layout(local_size_x = 1) in;
+// All stages declare the same 84-byte push constant (the scan stages only read
+// num_buckets) so one push-constant value is valid for every dispatch in the list.
+//
+// Pass 2a: per-block exclusive prefix sum of the histogram into offsets, plus the
+// per-block total into block_sums. BLOCK must match SORT_SCAN_BLOCK.
+const SORT_SCAN_LOCAL_GLSL: &str = r#"#version 450
+#define BLOCK 1024u
+layout(local_size_x = 1024) in;
 layout(set = 0, binding = 1, std430) restrict readonly buffer Hist { uint histogram[]; };
+layout(set = 0, binding = 2, std430) restrict writeonly buffer Off { uint offsets[]; };
+layout(set = 0, binding = 4, std430) restrict writeonly buffer Blocks { uint block_sums[]; };
+layout(push_constant, std430) uniform PC {
+    mat4 view;
+    float depth_min;
+    float depth_inv_range;
+    uint num_buckets;
+    uint count;
+    uint tex_width;
+} pc;
+shared uint temp[BLOCK];
+void main() {
+    uint tid = gl_LocalInvocationID.x;
+    uint gid = gl_WorkGroupID.x * BLOCK + tid;
+    uint original = gid < pc.num_buckets ? histogram[gid] : 0u;
+    temp[tid] = original;
+    barrier();
+    for (uint offset = 1u; offset < BLOCK; offset <<= 1u) {
+        uint add = (tid >= offset) ? temp[tid - offset] : 0u;
+        barrier();
+        temp[tid] += add;
+        barrier();
+    }
+    if (gid < pc.num_buckets) {
+        offsets[gid] = temp[tid] - original; // exclusive prefix within the block
+    }
+    if (tid == BLOCK - 1u) {
+        block_sums[gl_WorkGroupID.x] = temp[tid]; // inclusive total of the block
+    }
+}
+"#;
+
+// Pass 2b: exclusive prefix sum of the per-block totals. NUM_BLOCKS must match
+// SORT_NUM_BLOCKS.
+const SORT_SCAN_BLOCKSUMS_GLSL: &str = r#"#version 450
+#define NUM_BLOCKS 64u
+layout(local_size_x = 64) in;
+layout(set = 0, binding = 4, std430) restrict buffer Blocks { uint block_sums[]; };
+layout(push_constant, std430) uniform PC {
+    mat4 view;
+    float depth_min;
+    float depth_inv_range;
+    uint num_buckets;
+    uint count;
+    uint tex_width;
+} pc;
+shared uint temp[NUM_BLOCKS];
+void main() {
+    uint tid = gl_LocalInvocationID.x;
+    uint original = block_sums[tid];
+    temp[tid] = original;
+    barrier();
+    for (uint offset = 1u; offset < NUM_BLOCKS; offset <<= 1u) {
+        uint add = (tid >= offset) ? temp[tid - offset] : 0u;
+        barrier();
+        temp[tid] += add;
+        barrier();
+    }
+    if (pc.num_buckets > 0u) {
+        block_sums[tid] = temp[tid] - original; // exclusive prefix of prior blocks
+    }
+}
+"#;
+
+// Pass 2c: add each block's prior-blocks offset to make a global exclusive scan.
+const SORT_SCAN_ADD_GLSL: &str = r#"#version 450
+#define BLOCK 1024u
+layout(local_size_x = 1024) in;
 layout(set = 0, binding = 2, std430) restrict buffer Off { uint offsets[]; };
+layout(set = 0, binding = 4, std430) restrict readonly buffer Blocks { uint block_sums[]; };
 layout(push_constant, std430) uniform PC {
     mat4 view;
     float depth_min;
@@ -200,10 +289,9 @@ layout(push_constant, std430) uniform PC {
     uint tex_width;
 } pc;
 void main() {
-    uint sum = 0u;
-    for (uint b = 0u; b < pc.num_buckets; ++b) {
-        offsets[b] = sum;
-        sum += histogram[b];
+    uint gid = gl_WorkGroupID.x * BLOCK + gl_LocalInvocationID.x;
+    if (gid < pc.num_buckets) {
+        offsets[gid] += block_sums[gl_WorkGroupID.x];
     }
 }
 "#;
@@ -253,16 +341,11 @@ struct SortGpu {
     pos_buf: Rid,
     hist_buf: Rid,
     off_buf: Rid,
+    blocks_buf: Rid,
     sort_tex_rid: Rid,
-    count_shader: Rid,
-    scan_shader: Rid,
-    scatter_shader: Rid,
-    count_pipe: Rid,
-    scan_pipe: Rid,
-    scatter_pipe: Rid,
-    count_set: Rid,
-    scan_set: Rid,
-    scatter_set: Rid,
+    shaders: [Rid; SORT_STAGES],
+    pipelines: [Rid; SORT_STAGES],
+    sets: [Rid; SORT_STAGES],
     texture: Option<Gd<Texture2Drd>>,
 }
 
@@ -282,16 +365,11 @@ impl Default for SortGpu {
             pos_buf: Rid::Invalid,
             hist_buf: Rid::Invalid,
             off_buf: Rid::Invalid,
+            blocks_buf: Rid::Invalid,
             sort_tex_rid: Rid::Invalid,
-            count_shader: Rid::Invalid,
-            scan_shader: Rid::Invalid,
-            scatter_shader: Rid::Invalid,
-            count_pipe: Rid::Invalid,
-            scan_pipe: Rid::Invalid,
-            scatter_pipe: Rid::Invalid,
-            count_set: Rid::Invalid,
-            scan_set: Rid::Invalid,
-            scatter_set: Rid::Invalid,
+            shaders: [Rid::Invalid; SORT_STAGES],
+            pipelines: [Rid::Invalid; SORT_STAGES],
+            sets: [Rid::Invalid; SORT_STAGES],
             texture: None,
         }
     }
@@ -1175,6 +1253,7 @@ impl GaussianSplatNode3D {
         let bucket_bytes = (SORT_NUM_BUCKETS as u32) * 4;
         let hist_buf = device.storage_buffer_create(bucket_bytes);
         let off_buf = device.storage_buffer_create(bucket_bytes);
+        let blocks_buf = device.storage_buffer_create((SORT_NUM_BLOCKS as u32) * 4);
 
         // Sort-order texture (R32F): compute writes, the splat material samples.
         let tex_width = SORT_TEX_WIDTH;
@@ -1190,34 +1269,62 @@ impl GaussianSplatNode3D {
         );
         let sort_tex_rid = device.texture_create(&format, &RdTextureView::new_gd());
 
-        let (Some(count_shader), Some(scan_shader), Some(scatter_shader)) = (
-            compile_compute_shader(&mut device, SORT_COUNT_GLSL),
-            compile_compute_shader(&mut device, SORT_SCAN_GLSL),
-            compile_compute_shader(&mut device, SORT_SCATTER_GLSL),
-        ) else {
-            godot_error!("[gsplat] failed to compile sort compute shaders");
-            for rid in [pos_buf, hist_buf, off_buf, sort_tex_rid] {
-                if rid.is_valid() {
-                    device.free_rid(rid);
+        // Compile the counting-sort compute stages (one shader + pipeline each).
+        let sources = [
+            SORT_COUNT_GLSL,
+            SORT_SCAN_LOCAL_GLSL,
+            SORT_SCAN_BLOCKSUMS_GLSL,
+            SORT_SCAN_ADD_GLSL,
+            SORT_SCATTER_GLSL,
+        ];
+        let mut shaders = [Rid::Invalid; SORT_STAGES];
+        let mut pipelines = [Rid::Invalid; SORT_STAGES];
+        for (stage, source) in sources.iter().enumerate() {
+            let Some(shader) = compile_compute_shader(&mut device, source) else {
+                godot_error!("[gsplat] failed to compile sort compute stage {stage}");
+                for rid in shaders.into_iter().chain(pipelines).chain([
+                    pos_buf,
+                    hist_buf,
+                    off_buf,
+                    blocks_buf,
+                    sort_tex_rid,
+                ]) {
+                    if rid.is_valid() {
+                        device.free_rid(rid);
+                    }
                 }
-            }
-            return;
-        };
+                return;
+            };
+            shaders[stage] = shader;
+            pipelines[stage] = device.compute_pipeline_create(shader);
+        }
 
-        let count_pipe = device.compute_pipeline_create(count_shader);
-        let scan_pipe = device.compute_pipeline_create(scan_shader);
-        let scatter_pipe = device.compute_pipeline_create(scatter_shader);
-
+        // Uniform sets per stage (bindings: pos=0, hist=1, off=2, img=3, blocks=4).
         let pos_u = ssbo_uniform(pos_buf, 0);
         let hist_u = ssbo_uniform(hist_buf, 1);
         let off_u = ssbo_uniform(off_buf, 2);
         let img_u = image_uniform(sort_tex_rid, 3);
-        let count_set =
-            device.uniform_set_create(&uniform_array(&[&pos_u, &hist_u]), count_shader, 0);
-        let scan_set =
-            device.uniform_set_create(&uniform_array(&[&hist_u, &off_u]), scan_shader, 0);
-        let scatter_set =
-            device.uniform_set_create(&uniform_array(&[&pos_u, &off_u, &img_u]), scatter_shader, 0);
+        let blocks_u = ssbo_uniform(blocks_buf, 4);
+        let mut sets = [Rid::Invalid; SORT_STAGES];
+        sets[ST_COUNT] =
+            device.uniform_set_create(&uniform_array(&[&pos_u, &hist_u]), shaders[ST_COUNT], 0);
+        sets[ST_SCAN_LOCAL] = device.uniform_set_create(
+            &uniform_array(&[&hist_u, &off_u, &blocks_u]),
+            shaders[ST_SCAN_LOCAL],
+            0,
+        );
+        sets[ST_SCAN_BLOCKSUMS] =
+            device.uniform_set_create(&uniform_array(&[&blocks_u]), shaders[ST_SCAN_BLOCKSUMS], 0);
+        sets[ST_SCAN_ADD] = device.uniform_set_create(
+            &uniform_array(&[&off_u, &blocks_u]),
+            shaders[ST_SCAN_ADD],
+            0,
+        );
+        sets[ST_SCATTER] = device.uniform_set_create(
+            &uniform_array(&[&pos_u, &off_u, &img_u]),
+            shaders[ST_SCATTER],
+            0,
+        );
 
         let mut texture = Texture2Drd::new_gd();
         texture.set_texture_rd_rid(sort_tex_rid);
@@ -1225,16 +1332,11 @@ impl GaussianSplatNode3D {
         self.sort.pos_buf = pos_buf;
         self.sort.hist_buf = hist_buf;
         self.sort.off_buf = off_buf;
+        self.sort.blocks_buf = blocks_buf;
         self.sort.sort_tex_rid = sort_tex_rid;
-        self.sort.count_shader = count_shader;
-        self.sort.scan_shader = scan_shader;
-        self.sort.scatter_shader = scatter_shader;
-        self.sort.count_pipe = count_pipe;
-        self.sort.scan_pipe = scan_pipe;
-        self.sort.scatter_pipe = scatter_pipe;
-        self.sort.count_set = count_set;
-        self.sort.scan_set = scan_set;
-        self.sort.scatter_set = scatter_set;
+        self.sort.shaders = shaders;
+        self.sort.pipelines = pipelines;
+        self.sort.sets = sets;
         self.sort.tex_width = tex_width;
         self.sort.tex_height = tex_height;
         self.sort.texture = Some(texture);
@@ -1282,14 +1384,10 @@ impl GaussianSplatNode3D {
         let count = self.sort.splat_count.max(0) as u32;
         let groups = count.div_ceil(SORT_LOCAL_SIZE);
         let bucket_bytes = (SORT_NUM_BUCKETS as u32) * 4;
-
+        let scan_blocks = SORT_NUM_BLOCKS as u32;
         let hist_buf = self.sort.hist_buf;
-        let count_pipe = self.sort.count_pipe;
-        let scan_pipe = self.sort.scan_pipe;
-        let scatter_pipe = self.sort.scatter_pipe;
-        let count_set = self.sort.count_set;
-        let scan_set = self.sort.scan_set;
-        let scatter_set = self.sort.scatter_set;
+        let pipelines = self.sort.pipelines;
+        let sets = self.sort.sets;
 
         let callable = Callable::from_fn("gsplat_sort_dispatch", move |_args: &[&Variant]| {
             let server = RenderingServer::singleton();
@@ -1298,19 +1396,38 @@ impl GaussianSplatNode3D {
             };
             device.buffer_clear(hist_buf, 0, bucket_bytes);
             let list = device.compute_list_begin();
-            device.compute_list_bind_compute_pipeline(list, count_pipe);
-            device.compute_list_bind_uniform_set(list, count_set, 0);
-            device.compute_list_set_push_constant(list, &push_constant, push_constant.len() as u32);
+            let pc_len = push_constant.len() as u32;
+
+            // Count splats per depth bucket.
+            device.compute_list_bind_compute_pipeline(list, pipelines[ST_COUNT]);
+            device.compute_list_bind_uniform_set(list, sets[ST_COUNT], 0);
+            device.compute_list_set_push_constant(list, &push_constant, pc_len);
             device.compute_list_dispatch(list, groups, 1, 1);
             device.compute_list_add_barrier(list);
-            device.compute_list_bind_compute_pipeline(list, scan_pipe);
-            device.compute_list_bind_uniform_set(list, scan_set, 0);
-            device.compute_list_set_push_constant(list, &push_constant, push_constant.len() as u32);
+
+            // Parallel block prefix sum of the histogram -> per-bucket offsets.
+            // Every stage re-sets the push constant so its pipeline's expected size
+            // matches (all stages declare the same 84-byte block).
+            device.compute_list_bind_compute_pipeline(list, pipelines[ST_SCAN_LOCAL]);
+            device.compute_list_bind_uniform_set(list, sets[ST_SCAN_LOCAL], 0);
+            device.compute_list_set_push_constant(list, &push_constant, pc_len);
+            device.compute_list_dispatch(list, scan_blocks, 1, 1);
+            device.compute_list_add_barrier(list);
+            device.compute_list_bind_compute_pipeline(list, pipelines[ST_SCAN_BLOCKSUMS]);
+            device.compute_list_bind_uniform_set(list, sets[ST_SCAN_BLOCKSUMS], 0);
+            device.compute_list_set_push_constant(list, &push_constant, pc_len);
             device.compute_list_dispatch(list, 1, 1, 1);
             device.compute_list_add_barrier(list);
-            device.compute_list_bind_compute_pipeline(list, scatter_pipe);
-            device.compute_list_bind_uniform_set(list, scatter_set, 0);
-            device.compute_list_set_push_constant(list, &push_constant, push_constant.len() as u32);
+            device.compute_list_bind_compute_pipeline(list, pipelines[ST_SCAN_ADD]);
+            device.compute_list_bind_uniform_set(list, sets[ST_SCAN_ADD], 0);
+            device.compute_list_set_push_constant(list, &push_constant, pc_len);
+            device.compute_list_dispatch(list, scan_blocks, 1, 1);
+            device.compute_list_add_barrier(list);
+
+            // Scatter each splat id into its sorted slot in the sort texture.
+            device.compute_list_bind_compute_pipeline(list, pipelines[ST_SCATTER]);
+            device.compute_list_bind_uniform_set(list, sets[ST_SCATTER], 0);
+            device.compute_list_set_push_constant(list, &push_constant, pc_len);
             device.compute_list_dispatch(list, groups, 1, 1);
             device.compute_list_end();
             Variant::nil()
@@ -1320,26 +1437,26 @@ impl GaussianSplatNode3D {
 
     fn teardown_sort(&mut self) {
         let has_resources = self.sort.pos_buf.is_valid()
-            || self.sort.count_shader.is_valid()
+            || self.sort.shaders[ST_COUNT].is_valid()
             || self.sort.sort_tex_rid.is_valid();
         if has_resources {
             let server = RenderingServer::singleton();
             if let Some(mut device) = server.get_rendering_device() {
-                for rid in [
-                    self.sort.count_set,
-                    self.sort.scan_set,
-                    self.sort.scatter_set,
-                    self.sort.count_pipe,
-                    self.sort.scan_pipe,
-                    self.sort.scatter_pipe,
-                    self.sort.count_shader,
-                    self.sort.scan_shader,
-                    self.sort.scatter_shader,
+                let buffers = [
                     self.sort.sort_tex_rid,
                     self.sort.pos_buf,
                     self.sort.hist_buf,
                     self.sort.off_buf,
-                ] {
+                    self.sort.blocks_buf,
+                ];
+                for rid in self
+                    .sort
+                    .sets
+                    .into_iter()
+                    .chain(self.sort.pipelines)
+                    .chain(self.sort.shaders)
+                    .chain(buffers)
+                {
                     if rid.is_valid() {
                         device.free_rid(rid);
                     }
