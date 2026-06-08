@@ -1174,9 +1174,14 @@ impl GaussianSplatNode3D {
 
             positions_ssbo.extend_from_slice(&[center.x, center.y, center.z, 1.0]);
 
+            // The shader positions each splat from the data texture, not from
+            // VERTEX, so the vertex value is otherwise unused. Place it at the
+            // splat center anyway so the mesh's vertex AABB covers the cloud — the
+            // editor's import-preview auto-framing uses that AABB (it ignores
+            // `custom_aabb`), and origin vertices would frame an empty point.
             let slot_coord = Vector2::new(slot as f32, 0.0);
             for corner in corners {
-                positions.push(Vector3::ZERO);
+                positions.push(center);
                 uvs.push(corner);
                 uv2.push(slot_coord);
             }
