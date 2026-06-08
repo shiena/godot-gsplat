@@ -10,6 +10,7 @@ mod node;
 mod preview_mesh;
 mod render_manager;
 mod render_packet;
+mod scene_import_plugin;
 
 struct GodotGsplatExtension;
 
@@ -28,3 +29,4 @@ pub use node::GaussianSplatNode3D;
 pub use preview_mesh::GaussianSplatPreviewMeshInstance3D;
 pub use render_manager::GaussianSplatRenderManager;
 pub use render_packet::GaussianSplatRenderPacket;
+pub use scene_import_plugin::GsplatScenePostImportPlugin;
