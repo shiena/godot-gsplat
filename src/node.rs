@@ -449,6 +449,9 @@ pub struct GaussianSplatNode3D {
     cloud_settings: Option<Gd<GaussianSplatCloudSettings>>,
     backend_settings: Option<Gd<GaussianSplatBackendSettings>>,
     #[var(get, set)]
+    #[export(file = "*.gltf,*.glb")]
+    source_gltf: PhantomVar<GString>,
+    #[var(get, set)]
     #[export]
     render_profile: PhantomVar<RenderProfile>,
     #[var(get, set)]
@@ -478,6 +481,8 @@ pub struct GaussianSplatNode3D {
     // True while a preset is being applied, so preset-driven writes to the
     // individual fields don't flip the profile back to Custom.
     applying_profile: bool,
+    // Backing storage for the `source_gltf` export (PhantomVar holds no state).
+    source_gltf_path: GString,
 }
 
 #[godot_api]
@@ -570,6 +575,41 @@ impl GaussianSplatNode3D {
         self.applying_profile = true;
         self.set_preview_max_splats(budget);
         self.applying_profile = false;
+    }
+
+    #[func]
+    fn get_source_gltf(&self) -> GString {
+        self.source_gltf_path.clone()
+    }
+
+    #[func]
+    fn set_source_gltf(&mut self, path: GString) {
+        self.source_gltf_path = path.clone();
+        // Only (re)load when a path is set. An empty path leaves the current asset
+        // intact, so nodes created by the scene importer (which never set this) are
+        // not cleared on load.
+        if !path.to_string().is_empty() {
+            self.load_from_gltf(path);
+        }
+    }
+
+    // Decode the first splat primitive from the glTF and bind it as the asset.
+    fn load_from_gltf(&mut self, path: GString) {
+        let path_str = path.to_string();
+        match crate::import_state::decode_first_splat_from_gltf(&path_str) {
+            Ok((metadata, decoded)) => {
+                let mut asset = GaussianSplatAsset::new_gd();
+                {
+                    let mut bound = asset.bind_mut();
+                    bound.apply_import_metadata(metadata);
+                    bound.apply_decoded_data(decoded);
+                }
+                self.bind_asset(Some(asset));
+            }
+            Err(error) => {
+                godot_error!("[gsplat] failed to load splat from '{path_str}': {error}");
+            }
+        }
     }
 
     #[func]

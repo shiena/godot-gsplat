@@ -1,5 +1,6 @@
 use godot::classes::gltf_accessor::{GltfAccessorType, GltfComponentType};
-use godot::classes::{GltfAccessor, GltfBufferView, GltfState};
+use godot::classes::{GltfAccessor, GltfBufferView, GltfDocument, GltfState};
+use godot::global::Error;
 use godot::prelude::*;
 
 pub const BASE_EXTENSION: &str = "KHR_gaussian_splatting";
@@ -520,6 +521,28 @@ pub fn decode_splat_payload(
         payload,
         local_aabb,
     })
+}
+
+// Load a glTF file and decode its first valid gaussian-splat primitive. Lets a
+// GaussianSplatNode3D be pointed at a glTF directly (e.g. from the inspector)
+// without going through the scene importer.
+pub fn decode_first_splat_from_gltf(
+    path: &str,
+) -> Result<(VarDictionary, DecodedSplatData), String> {
+    let mut document = GltfDocument::new_gd();
+    let state = GltfState::new_gd();
+    if document.append_from_file(path, &state) != Error::OK {
+        return Err(format!("Failed to read glTF '{path}'."));
+    }
+
+    let json = state.get_json();
+    let accessors = state.get_accessors();
+    let metadata = inspect_gsplat_nodes(&json, &accessors)?
+        .into_iter()
+        .find(|metadata| metadata.is_valid())
+        .ok_or_else(|| "glTF contains no valid KHR_gaussian_splatting primitive.".to_string())?;
+    let decoded = decode_splat_payload(&state, &metadata)?;
+    Ok((metadata.to_dictionary(), decoded))
 }
 
 fn validate_accessor_match(
