@@ -6,9 +6,10 @@ use godot::classes::rendering_device::{
 };
 use godot::classes::GltfState;
 use godot::classes::{
-    ArrayMesh, Engine, Image, ImageTexture, MultiMesh, MultiMeshInstance3D, Node3D, RdShaderSource,
-    RdTextureFormat, RdTextureView, RdUniform, RenderingDevice, RenderingServer, Shader,
-    ShaderMaterial, Texture2D, Texture2Drd, Viewport, XrServer,
+    ArrayMesh, Camera3D, EditorInterface, Engine, Image, ImageTexture, MultiMesh,
+    MultiMeshInstance3D, Node3D, RdShaderSource, RdTextureFormat, RdTextureView, RdUniform,
+    RenderingDevice, RenderingServer, Shader, ShaderMaterial, Texture2D, Texture2Drd, Viewport,
+    XrServer,
 };
 use godot::prelude::*;
 
@@ -591,17 +592,14 @@ impl INode3D for GaussianSplatNode3D {
         self.adopt_serialized_render();
         self.sync_runtime_state();
         self.sync_node_name();
-        // The GPU sort runs at runtime only; the editor keeps the unsorted
-        // Step 1 preview.
-        if !Engine::singleton().is_editor_hint() {
-            self.base_mut().set_process(true);
-        }
+        // Run the per-frame loop (chunk streaming + GPU depth sort) in both the editor
+        // and at runtime, so the editor preview is depth-sorted too (unsorted splats
+        // over-blend and look washed out). The sort is view-change-gated, so a static
+        // editor view costs nothing.
+        self.base_mut().set_process(true);
     }
 
     fn process(&mut self, _delta: f64) {
-        if Engine::singleton().is_editor_hint() {
-            return;
-        }
         // Apply any finished async chunk rebuild, then re-select nearby chunks when
         // the camera crosses a boundary (Phase C2/C2b). Applying a rebuild tears down
         // the sort, which the block below brings back up at the new active count.
@@ -1425,11 +1423,21 @@ impl GaussianSplatNode3D {
             .unwrap_or(i32::MAX)
     }
 
-    // Active camera position in the node's local space (the space of the payload
-    // positions and chunk bounds). None when there is no active camera.
+    // The camera the sort/selection tracks: in the editor, the 3D viewport's
+    // navigation camera (so the preview follows the editor view); at runtime, the
+    // scene's active camera.
+    fn active_camera(&self) -> Option<Gd<Camera3D>> {
+        if Engine::singleton().is_editor_hint() {
+            EditorInterface::singleton()
+                .get_editor_viewport_3d()
+                .and_then(|viewport| viewport.get_camera_3d())
+        } else {
+            self.base().get_viewport()?.get_camera_3d()
+        }
+    }
+
     fn camera_local_pos(&self) -> Option<Vector3> {
-        let viewport = self.base().get_viewport()?;
-        let camera = viewport.get_camera_3d()?;
+        let camera = self.active_camera()?;
         let cam_world = camera.get_global_transform().origin;
         Some(self.base().get_global_transform().affine_inverse() * cam_world)
     }
@@ -1749,8 +1757,9 @@ impl GaussianSplatNode3D {
             }
         }
 
-        // Flat / head-center: a single view from the active camera.
-        let Some(camera) = viewport.get_camera_3d() else {
+        // Flat / head-center: a single view from the active camera (the editor
+        // viewport camera in the editor, the scene camera at runtime).
+        let Some(camera) = self.active_camera() else {
             return Vec::new();
         };
         let view = camera.get_global_transform().affine_inverse();
