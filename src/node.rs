@@ -174,7 +174,9 @@ struct SplatRenderData {
 // Present only when the bound asset was decoded with a chunk table.
 struct ChunkRuntime {
     table: crate::chunking::ChunkTable,
-    active: Vec<u32>,
+    // Active render set as (chunk_index, lod_count) — lod_count is the distance-LOD
+    // prefix of the chunk taken this frame (Phase C3).
+    active: Vec<(u32, u32)>,
     last_select_pos: Option<Vector3>,
     last_budget: i32,
 }
@@ -1273,45 +1275,41 @@ impl GaussianSplatNode3D {
             .asset
             .as_ref()
             .and_then(|asset| asset.bind().chunk_table().cloned());
-        self.chunk_runtime = table.map(|table| ChunkRuntime {
+        let Some(table) = table else {
+            self.chunk_runtime = None;
+            return;
+        };
+        // Seed the active set with a budget-bounded selection around the cloud center
+        // (no camera yet); process() re-selects from the real camera on the next tick.
+        let budget = self.active_budget();
+        let center = crate::chunking::table_center(&table);
+        let budget_u = if budget <= 0 { u32::MAX } else { budget as u32 };
+        let active = crate::chunking::select_chunks(&table, center, budget_u);
+        self.chunk_runtime = Some(ChunkRuntime {
             table,
-            active: Vec::new(),
+            active,
             last_select_pos: None,
-            last_budget: -1,
+            last_budget: budget,
         });
-        if self.chunk_runtime.is_some() {
-            let budget = self.active_budget();
-            let center = {
-                let rt = self.chunk_runtime.as_ref().unwrap();
-                let c = crate::chunking::table_center(&rt.table);
-                Vector3::new(c[0], c[1], c[2])
-            };
-            let active = self.select_chunks(center, budget);
-            if let Some(rt) = self.chunk_runtime.as_mut() {
-                rt.active = active;
-                rt.last_budget = budget;
-            }
-        }
     }
 
     // Re-select the active chunks when the camera moves far enough to change the
     // nearest-within-budget set, then rebuild the render set. Gated like the sort's
     // view-change check so a near-static camera does no work.
     fn update_chunk_selection(&mut self) {
-        if self.chunk_runtime.is_none() {
-            return;
-        }
         let Some(cam) = self.camera_local_pos() else {
             return;
         };
         let budget = self.active_budget();
-        let changed = {
-            let rt = self.chunk_runtime.as_ref().unwrap();
-            let threshold = (rt.table.chunk_size * 0.25).max(1.0e-3);
-            match rt.last_select_pos {
-                Some(last) => budget != rt.last_budget || (cam - last).length() > threshold,
-                None => true,
+        let changed = match &self.chunk_runtime {
+            Some(rt) => {
+                let threshold = (rt.table.chunk_size * 0.25).max(1.0e-3);
+                match rt.last_select_pos {
+                    Some(last) => budget != rt.last_budget || (cam - last).length() > threshold,
+                    None => true,
+                }
             }
+            None => return,
         };
         if !changed {
             return;
@@ -1334,7 +1332,7 @@ impl GaussianSplatNode3D {
         }
     }
 
-    fn select_chunks(&self, cam_local: Vector3, budget: i32) -> Vec<u32> {
+    fn select_chunks(&self, cam_local: Vector3, budget: i32) -> Vec<(u32, u32)> {
         let Some(rt) = &self.chunk_runtime else {
             return Vec::new();
         };
