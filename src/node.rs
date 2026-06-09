@@ -12,6 +12,8 @@ use godot::classes::{
 };
 use godot::prelude::*;
 
+use std::sync::Arc;
+
 use crate::asset::GaussianSplatAsset;
 use crate::backend::{
     GaussianSplatBackendSettings, BACKEND_PROFILE_DESKTOP, BACKEND_PROFILE_MOBILE,
@@ -173,12 +175,29 @@ struct SplatRenderData {
 // currently selected (active) chunk indices and the selection-gating reference.
 // Present only when the bound asset was decoded with a chunk table.
 struct ChunkRuntime {
-    table: crate::chunking::ChunkTable,
-    // Active render set as (chunk_index, lod_count) — lod_count is the distance-LOD
-    // prefix of the chunk taken this frame (Phase C3).
+    // Shared (immutable) so an async rebuild worker can borrow them off-thread.
+    table: Arc<crate::chunking::ChunkTable>,
+    payload: Arc<Vec<f32>>,
+    // Active render set as (chunk_index, lod_count) — the importance top-K prefix of
+    // each selected chunk taken this frame (Phase C3).
     active: Vec<(u32, u32)>,
     last_select_pos: Option<Vector3>,
     last_budget: i32,
+    // In-flight async render-set rebuild (Phase C2b); None when idle.
+    pending: Option<std::sync::mpsc::Receiver<RawRenderData>>,
+}
+
+// Plain (Send) render-set data produced off the main thread by `pack_raw`: the data
+// texture floats + sort positions + grown bounds. The main thread turns it into a
+// `SplatRenderData` (Godot types) via `raw_to_render`.
+struct RawRenderData {
+    data: Vec<f32>,
+    tex_width: i32,
+    tex_height: i32,
+    positions: Vec<f32>,
+    splat_count: i32,
+    aabb_pos: [f32; 3],
+    aabb_size: [f32; 3],
 }
 
 // --- Step 2: GPU counting sort -------------------------------------------------
@@ -527,9 +546,10 @@ impl INode3D for GaussianSplatNode3D {
         if Engine::singleton().is_editor_hint() {
             return;
         }
-        // Re-select nearby chunks and rebuild the active render set when the camera
-        // moves across chunk boundaries (Phase C2). A rebuild tears down the sort,
-        // which the block below brings back up at the new active count.
+        // Apply any finished async chunk rebuild, then re-select nearby chunks when
+        // the camera crosses a boundary (Phase C2/C2b). Applying a rebuild tears down
+        // the sort, which the block below brings back up at the new active count.
+        self.poll_chunk_rebuild();
         self.update_chunk_selection();
         if !self.sort.ready && !self.sort.attempted {
             self.try_enable_sort();
@@ -1038,6 +1058,15 @@ impl GaussianSplatNode3D {
             return;
         };
 
+        self.apply_render_data(render);
+    }
+
+    // Build the data texture + MultiMesh + material from a finished render set and
+    // re-arm the GPU sort. Shared by the synchronous rebuild above and the async
+    // chunk rebuild (Phase C2b), which both produce a `SplatRenderData`.
+    fn apply_render_data(&mut self, render: SplatRenderData) {
+        let cloud_settings = self.cloud_settings.clone();
+
         // Per-splat data texture (four RGBA-float texels per splat).
         let Some(image) = Image::create_from_data(
             render.tex_width,
@@ -1154,21 +1183,21 @@ impl GaussianSplatNode3D {
         asset: &Gd<GaussianSplatAsset>,
         cloud_settings: Option<&Gd<GaussianSplatCloudSettings>>,
     ) -> Option<SplatRenderData> {
-        let values = {
-            let asset_ref = asset.bind();
-            asset_ref.payload_float_values()?
-        };
         let scale_multiplier = cloud_settings
             .map(|settings| settings.bind().get_gaussian_scale_multiplier())
             .unwrap_or(1.0)
             .max(0.01);
 
-        // Chunked path: gather the currently selected chunks' contiguous payload
-        // ranges (selection bounds the count). Legacy path (no chunk table):
-        // uniformly decimate the whole payload to the budget.
+        // Chunked path: gather the currently selected chunks from the shared payload
+        // (selection bounds the count). Legacy path (no chunk table): clone the asset
+        // payload and uniformly decimate it to the budget.
         let slice: Vec<f32> = if let Some(rt) = &self.chunk_runtime {
-            crate::chunking::gather_active(&values, &rt.table, &rt.active)
+            crate::chunking::gather_active(rt.payload.as_slice(), rt.table.as_ref(), &rt.active)
         } else {
+            let values = {
+                let asset_ref = asset.bind();
+                asset_ref.payload_float_values()?
+            };
             let source_point_count = values.len() / POINT_STRIDE_FLOATS;
             let max_splats = cloud_settings
                 .map(|settings| settings.bind().get_max_debug_splats().max(0) as usize)
@@ -1188,94 +1217,20 @@ impl GaussianSplatNode3D {
             slice
         };
 
-        self.pack_render_data(&slice, scale_multiplier)
-    }
-
-    // Pack an already-ordered splat slice (POINT_STRIDE_FLOATS per splat, the final
-    // render set) into the four-texel data texture, the sort positions SSBO, and the
-    // bounds. No further decimation happens here.
-    fn pack_render_data(&self, slice: &[f32], scale_multiplier: f32) -> Option<SplatRenderData> {
-        let point_count = slice.len() / POINT_STRIDE_FLOATS;
-        if point_count == 0 || point_count > (i32::MAX as usize / 4) {
-            return None;
-        }
-
-        // Data texture: four RGBA-float texels per splat. Texel 0 = center.xyz,
-        // texels 1-2 = packed covariance upper triangle, texel 3 = color rgba.
-        let tex_width = SPLAT_DATA_TEX_WIDTH as usize;
-        let tex_height = (point_count * 4).div_ceil(tex_width).max(1);
-        let mut data = vec![0.0_f32; tex_width * tex_height * 4];
-
-        let mut positions_ssbo = Vec::with_capacity(point_count * 4);
-        let mut min = Vector3::new(f32::INFINITY, f32::INFINITY, f32::INFINITY);
-        let mut max = Vector3::new(f32::NEG_INFINITY, f32::NEG_INFINITY, f32::NEG_INFINITY);
-
-        for slot in 0..point_count {
-            let offset = slot * POINT_STRIDE_FLOATS;
-            let center = Vector3::new(slice[offset], slice[offset + 1], slice[offset + 2]);
-            let cov = covariance_upper_triangle(
-                [
-                    slice[offset + 3],
-                    slice[offset + 4],
-                    slice[offset + 5],
-                    slice[offset + 6],
-                ],
-                [
-                    slice[offset + 7] * scale_multiplier,
-                    slice[offset + 8] * scale_multiplier,
-                    slice[offset + 9] * scale_multiplier,
-                ],
-            );
-
-            // Pack into the splat's four-texel block (16 contiguous floats).
-            let base = slot * 16;
-            data[base] = center.x;
-            data[base + 1] = center.y;
-            data[base + 2] = center.z;
-            data[base + 4] = cov[0];
-            data[base + 5] = cov[1];
-            data[base + 6] = cov[2];
-            data[base + 7] = cov[3];
-            data[base + 8] = cov[4];
-            data[base + 9] = cov[5];
-            data[base + 12] = slice[offset + 14];
-            data[base + 13] = slice[offset + 15];
-            data[base + 14] = slice[offset + 16];
-            data[base + 15] = slice[offset + 17];
-
-            min.x = min.x.min(center.x);
-            min.y = min.y.min(center.y);
-            min.z = min.z.min(center.z);
-            max.x = max.x.max(center.x);
-            max.y = max.y.max(center.y);
-            max.z = max.z.max(center.z);
-
-            positions_ssbo.extend_from_slice(&[center.x, center.y, center.z, 1.0]);
-        }
-
-        let size = max - min;
-        // Grow the bounds so splats extending past their centers stay visible.
-        let aabb = Aabb::new(min, size).grow(size.length() * 0.05 + 0.01);
-
-        Some(SplatRenderData {
-            data_bytes: PackedFloat32Array::from(data).to_byte_array(),
-            tex_width: tex_width as i32,
-            tex_height: tex_height as i32,
-            positions_ssbo: PackedFloat32Array::from(positions_ssbo).to_byte_array(),
-            splat_count: point_count as i32,
-            aabb,
-        })
+        pack_raw(&slice, scale_multiplier).map(raw_to_render)
     }
 
     // Build the chunk-streaming runtime from the bound asset's chunk table, seeding
     // the active set with a budget-bounded selection around the cloud center (no
     // camera yet). None when the asset has no chunk table (placeholder/legacy).
     fn refresh_chunk_runtime(&mut self) {
-        let table = self
-            .asset
-            .as_ref()
-            .and_then(|asset| asset.bind().chunk_table().cloned());
-        let Some(table) = table else {
+        let decoded = self.asset.as_ref().and_then(|asset| {
+            let asset_ref = asset.bind();
+            let table = asset_ref.chunk_table().cloned()?;
+            let payload = asset_ref.payload_float_values()?;
+            Some((table, payload))
+        });
+        let Some((table, payload)) = decoded else {
             self.chunk_runtime = None;
             return;
         };
@@ -1286,10 +1241,12 @@ impl GaussianSplatNode3D {
         let budget_u = if budget <= 0 { u32::MAX } else { budget as u32 };
         let active = crate::chunking::select_chunks(&table, center, budget_u);
         self.chunk_runtime = Some(ChunkRuntime {
-            table,
+            table: Arc::new(table),
+            payload: Arc::new(payload),
             active,
             last_select_pos: None,
             last_budget: budget,
+            pending: None,
         });
     }
 
@@ -1297,6 +1254,15 @@ impl GaussianSplatNode3D {
     // nearest-within-budget set, then rebuild the render set. Gated like the sort's
     // view-change check so a near-static camera does no work.
     fn update_chunk_selection(&mut self) {
+        // Skip while a rebuild is in flight; the next gate-crossing picks up the latest.
+        if self
+            .chunk_runtime
+            .as_ref()
+            .map(|rt| rt.pending.is_some())
+            .unwrap_or(false)
+        {
+            return;
+        }
         let Some(cam) = self.camera_local_pos() else {
             return;
         };
@@ -1328,7 +1294,7 @@ impl GaussianSplatNode3D {
             }
         }
         if differs {
-            self.rebuild_debug_mesh();
+            self.begin_chunk_rebuild();
         }
     }
 
@@ -1337,7 +1303,11 @@ impl GaussianSplatNode3D {
             return Vec::new();
         };
         let budget = if budget <= 0 { u32::MAX } else { budget as u32 };
-        crate::chunking::select_chunks(&rt.table, [cam_local.x, cam_local.y, cam_local.z], budget)
+        crate::chunking::select_chunks(
+            rt.table.as_ref(),
+            [cam_local.x, cam_local.y, cam_local.z],
+            budget,
+        )
     }
 
     fn active_budget(&self) -> i32 {
@@ -1354,6 +1324,67 @@ impl GaussianSplatNode3D {
         let camera = viewport.get_camera_3d()?;
         let cam_world = camera.get_global_transform().origin;
         Some(self.base().get_global_transform().affine_inverse() * cam_world)
+    }
+
+    // Kick off an async rebuild of the active render set on a worker thread (Phase
+    // C2b). Only one runs at a time; the heavy gather + covariance packing happen off
+    // the main thread, which later applies the result in `poll_chunk_rebuild`.
+    fn begin_chunk_rebuild(&mut self) {
+        let scale_multiplier = self
+            .cloud_settings
+            .as_ref()
+            .map(|settings| settings.bind().get_gaussian_scale_multiplier())
+            .unwrap_or(1.0)
+            .max(0.01);
+        let receiver = match &self.chunk_runtime {
+            Some(rt) if rt.pending.is_none() => {
+                let payload = Arc::clone(&rt.payload);
+                let table = Arc::clone(&rt.table);
+                let active = rt.active.clone();
+                let (tx, rx) = std::sync::mpsc::channel();
+                std::thread::spawn(move || {
+                    let slice =
+                        crate::chunking::gather_active(payload.as_slice(), table.as_ref(), &active);
+                    if let Some(raw) = pack_raw(&slice, scale_multiplier) {
+                        let _ = tx.send(raw);
+                    }
+                });
+                Some(rx)
+            }
+            _ => None,
+        };
+        if let Some(rx) = receiver {
+            if let Some(rt) = self.chunk_runtime.as_mut() {
+                rt.pending = Some(rx);
+            }
+        }
+    }
+
+    // Apply a finished async rebuild, if any (Phase C2b). Non-blocking: keeps the
+    // current render set until the worker delivers the new one, avoiding a hitch.
+    fn poll_chunk_rebuild(&mut self) {
+        let result = match self
+            .chunk_runtime
+            .as_ref()
+            .and_then(|rt| rt.pending.as_ref())
+        {
+            Some(rx) => rx.try_recv(),
+            None => return,
+        };
+        match result {
+            Ok(raw) => {
+                if let Some(rt) = self.chunk_runtime.as_mut() {
+                    rt.pending = None;
+                }
+                self.apply_render_data(raw_to_render(raw));
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => {}
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                if let Some(rt) = self.chunk_runtime.as_mut() {
+                    rt.pending = None;
+                }
+            }
+        }
     }
 
     // Reconnect the field to the baked render child when the node is deserialized
@@ -1809,6 +1840,88 @@ impl GaussianSplatNode3D {
             material.set_shader_parameter("sort_tex", &Variant::nil());
             material.set_shader_parameter("sort_tex_b", &Variant::nil());
         }
+    }
+}
+
+// Pack an already-gathered splat slice (POINT_STRIDE_FLOATS per splat) into plain
+// (Send) render data off the main thread: project each splat's covariance and lay
+// out the data-texture floats + sort positions + grown bounds. Shared by the
+// synchronous build path and the async chunk rebuild (Phase C2b).
+fn pack_raw(slice: &[f32], scale_multiplier: f32) -> Option<RawRenderData> {
+    let point_count = slice.len() / POINT_STRIDE_FLOATS;
+    if point_count == 0 || point_count > (i32::MAX as usize / 4) {
+        return None;
+    }
+    let tex_width = SPLAT_DATA_TEX_WIDTH as usize;
+    let tex_height = (point_count * 4).div_ceil(tex_width).max(1);
+    let mut data = vec![0.0_f32; tex_width * tex_height * 4];
+    let mut positions = Vec::with_capacity(point_count * 4);
+    let mut min = [f32::INFINITY; 3];
+    let mut max = [f32::NEG_INFINITY; 3];
+
+    for slot in 0..point_count {
+        let off = slot * POINT_STRIDE_FLOATS;
+        let center = [slice[off], slice[off + 1], slice[off + 2]];
+        let cov = covariance_upper_triangle(
+            [
+                slice[off + 3],
+                slice[off + 4],
+                slice[off + 5],
+                slice[off + 6],
+            ],
+            [
+                slice[off + 7] * scale_multiplier,
+                slice[off + 8] * scale_multiplier,
+                slice[off + 9] * scale_multiplier,
+            ],
+        );
+        let base = slot * 16;
+        data[base] = center[0];
+        data[base + 1] = center[1];
+        data[base + 2] = center[2];
+        data[base + 4] = cov[0];
+        data[base + 5] = cov[1];
+        data[base + 6] = cov[2];
+        data[base + 7] = cov[3];
+        data[base + 8] = cov[4];
+        data[base + 9] = cov[5];
+        data[base + 12] = slice[off + 14];
+        data[base + 13] = slice[off + 15];
+        data[base + 14] = slice[off + 16];
+        data[base + 15] = slice[off + 17];
+        for k in 0..3 {
+            min[k] = min[k].min(center[k]);
+            max[k] = max[k].max(center[k]);
+        }
+        positions.extend_from_slice(&[center[0], center[1], center[2], 1.0]);
+    }
+
+    let size = [max[0] - min[0], max[1] - min[1], max[2] - min[2]];
+    let len = (size[0] * size[0] + size[1] * size[1] + size[2] * size[2]).sqrt();
+    let g = len * 0.05 + 0.01;
+    Some(RawRenderData {
+        data,
+        tex_width: tex_width as i32,
+        tex_height: tex_height as i32,
+        positions,
+        splat_count: point_count as i32,
+        aabb_pos: [min[0] - g, min[1] - g, min[2] - g],
+        aabb_size: [size[0] + 2.0 * g, size[1] + 2.0 * g, size[2] + 2.0 * g],
+    })
+}
+
+// Convert worker output into a `SplatRenderData` on the main thread (Godot types).
+fn raw_to_render(raw: RawRenderData) -> SplatRenderData {
+    SplatRenderData {
+        data_bytes: PackedFloat32Array::from(raw.data).to_byte_array(),
+        tex_width: raw.tex_width,
+        tex_height: raw.tex_height,
+        positions_ssbo: PackedFloat32Array::from(raw.positions).to_byte_array(),
+        splat_count: raw.splat_count,
+        aabb: Aabb::new(
+            Vector3::new(raw.aabb_pos[0], raw.aabb_pos[1], raw.aabb_pos[2]),
+            Vector3::new(raw.aabb_size[0], raw.aabb_size[1], raw.aabb_size[2]),
+        ),
     }
 }
 
