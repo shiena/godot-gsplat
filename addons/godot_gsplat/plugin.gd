@@ -5,6 +5,8 @@ const EXTENSION_CLASS_NAME := "GltfGsplatDocumentExtension"
 const SCENE_POST_IMPORT_PLUGIN_CLASS_NAME := "GsplatScenePostImportPlugin"
 const EXTENSION_LIBRARY_PATH := "res://godot_gsplat.gdextension"
 const OPTION_PREVIEW_MAX_SPLATS := "gsplat/preview_max_splats"
+const GAUSSIAN_SPLAT_NODE_CLASS_NAME := "GaussianSplatNode3D"
+const SOURCE_GLTF_PROPERTY := "source_gltf"
 
 var _gltf_extension: Object
 var _scene_post_import_plugin: Object
@@ -14,8 +16,10 @@ func _enter_tree() -> void:
 	_register_gltf_extension()
 	_register_scene_post_import_plugin()
 	_register_filesystem_hooks()
+	_register_viewport_drop_hook()
 
 func _exit_tree() -> void:
+	_unregister_viewport_drop_hook()
 	_unregister_filesystem_hooks()
 	_unregister_scene_post_import_plugin()
 	_unregister_gltf_extension()
@@ -79,6 +83,101 @@ func _unregister_filesystem_hooks() -> void:
 	if _resource_filesystem.resources_reimported.is_connected(_on_resources_reimported):
 		_resource_filesystem.resources_reimported.disconnect(_on_resources_reimported)
 	_resource_filesystem = null
+
+# --- Drag-and-drop into the 3D viewport -------------------------------------
+#
+# Godot's 3D viewport has no EditorPlugin hook for drops, so dropping a glTF
+# instances its imported scene: a plain Node3D root that wraps the generated
+# GaussianSplatNode3D. We watch the editor tree for that freshly instanced
+# wrapper and swap it for a clean GaussianSplatNode3D whose Source glTF points
+# at the dropped file (it then live-loads the splats).
+
+func _register_viewport_drop_hook() -> void:
+	var tree := get_tree()
+	if tree == null:
+		return
+	if not tree.node_added.is_connected(_on_scene_node_added):
+		tree.node_added.connect(_on_scene_node_added)
+
+func _unregister_viewport_drop_hook() -> void:
+	var tree := get_tree()
+	if tree == null:
+		return
+	if tree.node_added.is_connected(_on_scene_node_added):
+		tree.node_added.disconnect(_on_scene_node_added)
+
+func _on_scene_node_added(node: Node) -> void:
+	# A just-dropped instance enters the tree before the editor assigns its owner;
+	# nodes streamed in while a saved scene loads already carry their owner. Only
+	# the former is a fresh drop we should rewrite.
+	if node.owner != null:
+		return
+	var source_path := node.scene_file_path
+	if source_path == "" or not _is_gltf_path(source_path):
+		return
+	if not _subtree_has_gsplat(node):
+		return
+	var edited_root := get_editor_interface().get_edited_scene_root()
+	if edited_root == null:
+		return
+	var parent := node.get_parent()
+	if parent == null:
+		return
+	if parent != edited_root and not edited_root.is_ancestor_of(parent):
+		return
+	# Defer: let the drop's own undo action finish committing first.
+	_replace_with_gsplat_node.call_deferred(node, source_path, edited_root)
+
+func _subtree_has_gsplat(node: Node) -> bool:
+	if node.is_class(GAUSSIAN_SPLAT_NODE_CLASS_NAME):
+		return true
+	for child in node.get_children():
+		if _subtree_has_gsplat(child):
+			return true
+	return false
+
+func _replace_with_gsplat_node(wrapper: Node, source_path: String, edited_root: Node) -> void:
+	if not is_instance_valid(wrapper) or not is_instance_valid(edited_root):
+		return
+	var parent := wrapper.get_parent()
+	if parent == null:
+		return
+	if not ClassDB.class_exists(GAUSSIAN_SPLAT_NODE_CLASS_NAME):
+		push_warning("GDExtension class '%s' is not available." % GAUSSIAN_SPLAT_NODE_CLASS_NAME)
+		return
+
+	var gsplat: Node = ClassDB.instantiate(GAUSSIAN_SPLAT_NODE_CLASS_NAME)
+	gsplat.name = source_path.get_file().get_basename()
+	var index := wrapper.get_index()
+	var has_xform := wrapper is Node3D and gsplat is Node3D
+	var xform: Transform3D = (wrapper as Node3D).transform if has_xform else Transform3D.IDENTITY
+
+	var undo_redo := get_undo_redo()
+	undo_redo.create_action("Drop Gaussian Splat glTF", UndoRedo.MERGE_DISABLE, edited_root)
+	undo_redo.add_do_method(parent, "remove_child", wrapper)
+	undo_redo.add_do_method(parent, "add_child", gsplat, true)
+	undo_redo.add_do_method(parent, "move_child", gsplat, index)
+	if has_xform:
+		undo_redo.add_do_property(gsplat, "transform", xform)
+	undo_redo.add_do_method(gsplat, "set_owner", edited_root)
+	undo_redo.add_do_property(gsplat, SOURCE_GLTF_PROPERTY, source_path)
+	undo_redo.add_do_method(self, "_select_only_node", gsplat)
+	undo_redo.add_do_reference(gsplat)
+	undo_redo.add_undo_method(parent, "remove_child", gsplat)
+	undo_redo.add_undo_method(parent, "add_child", wrapper, true)
+	undo_redo.add_undo_method(parent, "move_child", wrapper, index)
+	undo_redo.add_undo_method(self, "_select_only_node", wrapper)
+	undo_redo.add_undo_reference(wrapper)
+	undo_redo.commit_action()
+
+func _select_only_node(node: Node) -> void:
+	if not is_instance_valid(node):
+		return
+	var selection := get_editor_interface().get_selection()
+	if selection == null:
+		return
+	selection.clear()
+	selection.add_node(node)
 
 func _on_resources_reimported(resources: PackedStringArray) -> void:
 	print("[godot-gsplat] resources_reimported: %s" % [Array(resources)])
