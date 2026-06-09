@@ -18,6 +18,10 @@ pub struct GaussianSplatAsset {
     payload_layout: GString,
     fallback_mode: GString,
     local_aabb: Aabb,
+    // Spatial grid partition of `payload` (Phase C). In-memory only for now; not a
+    // Godot property, so it is not serialized into a baked .scn (Case B keeps using
+    // the baked render set until disk streaming lands).
+    chunk_table: Option<crate::chunking::ChunkTable>,
 }
 
 #[godot_api]
@@ -30,6 +34,7 @@ impl GaussianSplatAsset {
         self.payload_layout = PAYLOAD_LAYOUT_V1.into();
         self.fallback_mode = FALLBACK_NONE.into();
         self.local_aabb = Aabb::default();
+        self.chunk_table = None;
         self.base_mut().emit_changed();
     }
 
@@ -216,7 +221,14 @@ impl GaussianSplatAsset {
         self.payload = decoded.payload;
         self.payload_layout = decoded.payload_layout;
         self.local_aabb = decoded.local_aabb;
+        self.chunk_table = decoded.chunk_table;
         self.base_mut().emit_changed();
+    }
+
+    // Spatial chunk partition of the payload (Phase C), if the asset was decoded
+    // with chunking. None for placeholder/legacy assets.
+    pub fn chunk_table(&self) -> Option<&crate::chunking::ChunkTable> {
+        self.chunk_table.as_ref()
     }
 }
 

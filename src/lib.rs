@@ -3,6 +3,7 @@ use godot::prelude::*;
 
 mod asset;
 mod backend;
+mod chunking;
 mod cloud_settings;
 mod gltf_extension;
 mod import_state;

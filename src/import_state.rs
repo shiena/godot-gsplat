@@ -35,6 +35,7 @@ pub struct DecodedSplatData {
     pub payload_layout: GString,
     pub payload: PackedByteArray,
     pub local_aabb: Aabb,
+    pub chunk_table: Option<crate::chunking::ChunkTable>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -511,7 +512,12 @@ pub fn decode_splat_payload(
         ]);
     }
 
-    let payload = PackedFloat32Array::from(payload_floats).to_byte_array();
+    // Reorder the payload into spatial grid chunks (importance-sorted within each)
+    // so the runtime can stream/select nearby chunks (Phase C). Reordering is a pure
+    // permutation, so the rendered set and the bounds are unchanged.
+    let partitioned =
+        crate::chunking::partition_payload(&payload_floats, crate::chunking::DEFAULT_CHUNK_SIZE);
+    let payload = PackedFloat32Array::from(partitioned.payload).to_byte_array();
     let size = max - min;
     let local_aabb = Aabb::new(min, size);
 
@@ -520,6 +526,7 @@ pub fn decode_splat_payload(
         payload_layout: GString::from(PAYLOAD_LAYOUT_FLOAT32_V1),
         payload,
         local_aabb,
+        chunk_table: Some(partitioned.table),
     })
 }
 
