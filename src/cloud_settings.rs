@@ -12,6 +12,9 @@ pub struct GaussianSplatCloudSettings {
     gaussian_scale_multiplier: f32,
     max_debug_splat_radius: f32,
     max_debug_splats: i32,
+    // Spherical-harmonics degree (0-3) to evaluate for view-dependent color. Capped
+    // at the degree the source glTF actually provides.
+    sh_degree: i32,
 }
 
 #[godot_api]
@@ -28,6 +31,7 @@ impl IResource for GaussianSplatCloudSettings {
             // point count once an asset is bound, so a raw glTF loaded at runtime
             // (no .import) previews all of its points.
             max_debug_splats: i32::MAX,
+            sh_degree: 3,
         }
     }
 }
@@ -101,6 +105,17 @@ impl GaussianSplatCloudSettings {
     }
 
     #[func]
+    pub fn get_sh_degree(&self) -> i32 {
+        self.sh_degree
+    }
+
+    #[func]
+    pub fn set_sh_degree(&mut self, sh_degree: i32) {
+        self.sh_degree = sh_degree.clamp(0, 3);
+        self.base_mut().emit_changed();
+    }
+
+    #[func]
     pub fn apply_debug_defaults(&mut self) {
         self.debug_point_size = 24.0;
         self.debug_visible = true;
@@ -108,6 +123,7 @@ impl GaussianSplatCloudSettings {
         self.gaussian_scale_multiplier = 1.0;
         self.max_debug_splat_radius = 0.02;
         self.max_debug_splats = i32::MAX;
+        self.sh_degree = 3;
         self.base_mut().emit_changed();
     }
 }

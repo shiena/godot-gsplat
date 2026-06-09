@@ -47,9 +47,46 @@ uniform sampler2D sort_tex : filter_nearest;
 uniform sampler2D sort_tex_b : filter_nearest;
 uniform int splat_count;
 uniform int sort_enabled;
+uniform int sh_degree;
 
 varying vec2 v_corner;
 varying vec4 v_color;
+
+// Fetch float `idx` from the flat SH region starting at texel `sh_base`.
+float sh_tex_float(int sh_base, int idx, int w) {
+    int t = sh_base + idx / 4;
+    return texelFetch(data_tex, ivec2(t % w, t / w), 0)[idx % 4];
+}
+vec3 sh_coeff(int sh_base, int c, int w) {
+    int f = c * 3;
+    return vec3(sh_tex_float(sh_base, f, w), sh_tex_float(sh_base, f + 1, w), sh_tex_float(sh_base, f + 2, w));
+}
+// View-dependent color: the base color (COLOR_0 == SH degree 0) plus the degree 1-3
+// contributions for view direction `d`. Standard real-SH basis (INRIA 3DGS order).
+vec3 eval_sh(vec3 base_color, int sh_base, int w, vec3 d, int degree) {
+    float x = d.x, y = d.y, z = d.z;
+    vec3 c = base_color;
+    c += 0.48860251 * (-y * sh_coeff(sh_base, 0, w) + z * sh_coeff(sh_base, 1, w) - x * sh_coeff(sh_base, 2, w));
+    if (degree >= 2) {
+        float xx = x * x, yy = y * y, zz = z * z;
+        float xy = x * y, yz = y * z, xz = x * z;
+        c += 1.09254843 * xy * sh_coeff(sh_base, 3, w);
+        c += -1.09254843 * yz * sh_coeff(sh_base, 4, w);
+        c += 0.31539157 * (2.0 * zz - xx - yy) * sh_coeff(sh_base, 5, w);
+        c += -1.09254843 * xz * sh_coeff(sh_base, 6, w);
+        c += 0.54627422 * (xx - yy) * sh_coeff(sh_base, 7, w);
+        if (degree >= 3) {
+            c += -0.59004360 * y * (3.0 * xx - yy) * sh_coeff(sh_base, 8, w);
+            c += 2.89061142 * xy * z * sh_coeff(sh_base, 9, w);
+            c += -0.45704580 * y * (4.0 * zz - xx - yy) * sh_coeff(sh_base, 10, w);
+            c += 0.37317633 * z * (2.0 * zz - 3.0 * xx - 3.0 * yy) * sh_coeff(sh_base, 11, w);
+            c += -0.45704580 * x * (4.0 * zz - xx - yy) * sh_coeff(sh_base, 12, w);
+            c += 1.44530572 * z * (xx - yy) * sh_coeff(sh_base, 13, w);
+            c += -0.59004360 * x * (xx - 3.0 * yy) * sh_coeff(sh_base, 14, w);
+        }
+    }
+    return max(c, vec3(0.0));
+}
 
 void vertex() {
     v_corner = UV;
@@ -68,9 +105,10 @@ void vertex() {
     }
     splat_id = clamp(splat_id, 0, splat_count - 1);
 
-    // Fetch the splat's four-texel data block from the data texture.
+    // Fetch the splat's data block (4 core texels, then SH texels) from data_tex.
     int w = textureSize(data_tex, 0).x;
-    int base = splat_id * 4;
+    int sh_tex = sh_degree <= 0 ? 0 : (sh_degree == 1 ? 3 : (sh_degree == 2 ? 6 : 12));
+    int base = splat_id * (4 + sh_tex);
     vec4 t0 = texelFetch(data_tex, ivec2(base % w, base / w), 0);
     vec4 t1 = texelFetch(data_tex, ivec2((base + 1) % w, (base + 1) / w), 0);
     vec4 t2 = texelFetch(data_tex, ivec2((base + 2) % w, (base + 2) / w), 0);
@@ -78,6 +116,12 @@ void vertex() {
 
     vec3 center = t0.xyz;
     v_color = t3;
+    // View-dependent color from higher-degree SH (COLOR_0 is the degree-0 base).
+    if (sh_degree >= 1) {
+        vec3 center_world = (MODEL_MATRIX * vec4(center, 1.0)).xyz;
+        vec3 cam = INV_VIEW_MATRIX[3].xyz;
+        v_color.rgb = eval_sh(v_color.rgb, base + 4, w, normalize(center_world - cam), sh_degree);
+    }
     // Reconstruct the symmetric local-space 3D covariance from its upper triangle.
     mat3 cov3d = mat3(
         vec3(t1.x, t1.y, t1.z),
@@ -169,6 +213,7 @@ struct SplatRenderData {
     positions_ssbo: PackedByteArray,
     splat_count: i32,
     aabb: Aabb,
+    sh_degree: i32,
 }
 
 // Runtime chunk-streaming state (Phase C2): the spatial chunk table plus the
@@ -178,6 +223,8 @@ struct ChunkRuntime {
     // Shared (immutable) so an async rebuild worker can borrow them off-thread.
     table: Arc<crate::chunking::ChunkTable>,
     payload: Arc<Vec<f32>>,
+    // Highest SH degree available in the payload (from the asset at refresh).
+    sh_degree_available: i32,
     // Active render set as (chunk_index, lod_count) — the importance top-K prefix of
     // each selected chunk taken this frame (Phase C3).
     active: Vec<(u32, u32)>,
@@ -198,6 +245,8 @@ struct RawRenderData {
     splat_count: i32,
     aabb_pos: [f32; 3],
     aabb_size: [f32; 3],
+    // SH degree packed into the data texture (drives the shader's texels-per-splat).
+    sh_degree: i32,
 }
 
 // --- Step 2: GPU counting sort -------------------------------------------------
@@ -479,6 +528,10 @@ enum RenderProfile {
 const RENDER_PROFILE_LOW_SPLATS: i32 = 150_000;
 const RENDER_PROFILE_MIDDLE_SPLATS: i32 = 500_000;
 const RENDER_PROFILE_HIGH_SPLATS: i32 = i32::MAX;
+// SH degree cap per render profile (Low cheapest for VR/mobile, High full fidelity).
+const RENDER_PROFILE_LOW_SH_DEGREE: i32 = 0;
+const RENDER_PROFILE_MIDDLE_SH_DEGREE: i32 = 1;
+const RENDER_PROFILE_HIGH_SH_DEGREE: i32 = 3;
 
 #[derive(GodotClass)]
 #[class(tool, init, base=Node3D)]
@@ -504,6 +557,9 @@ pub struct GaussianSplatNode3D {
     #[var(get, set)]
     #[export]
     preview_scale_multiplier: PhantomVar<f32>,
+    #[var(get, set)]
+    #[export]
+    sh_degree: PhantomVar<i32>,
     #[var(get, set, usage_flags = [EDITOR])]
     show_all_preview_splats_action: PhantomVar<bool>,
     // The decoded asset is not serialized into the .scn, so persist the point
@@ -603,11 +659,23 @@ impl GaussianSplatNode3D {
     // Apply a fixed Low/Middle/High preset: map to a backend platform target and a
     // splat budget. Custom makes no change (individual fields stay manual).
     fn apply_render_profile(&mut self, profile: RenderProfile) {
-        let (target_hint, budget) = match profile {
+        let (target_hint, budget, sh_degree) = match profile {
             RenderProfile::Custom => return,
-            RenderProfile::Low => (BACKEND_PROFILE_VR_SAFE, RENDER_PROFILE_LOW_SPLATS),
-            RenderProfile::Middle => (BACKEND_PROFILE_MOBILE, RENDER_PROFILE_MIDDLE_SPLATS),
-            RenderProfile::High => (BACKEND_PROFILE_DESKTOP, RENDER_PROFILE_HIGH_SPLATS),
+            RenderProfile::Low => (
+                BACKEND_PROFILE_VR_SAFE,
+                RENDER_PROFILE_LOW_SPLATS,
+                RENDER_PROFILE_LOW_SH_DEGREE,
+            ),
+            RenderProfile::Middle => (
+                BACKEND_PROFILE_MOBILE,
+                RENDER_PROFILE_MIDDLE_SPLATS,
+                RENDER_PROFILE_MIDDLE_SH_DEGREE,
+            ),
+            RenderProfile::High => (
+                BACKEND_PROFILE_DESKTOP,
+                RENDER_PROFILE_HIGH_SPLATS,
+                RENDER_PROFILE_HIGH_SH_DEGREE,
+            ),
         };
         self.ensure_backend_settings();
         if let Some(backend_settings) = &mut self.backend_settings {
@@ -617,8 +685,12 @@ impl GaussianSplatNode3D {
         }
         self.backend_state.profile_hint = self.resolve_backend_pipeline();
         self.mark_backend_dirty("render_profile");
+        self.ensure_cloud_settings();
+        if let Some(settings) = &mut self.cloud_settings {
+            settings.bind_mut().set_sh_degree(sh_degree);
+        }
         // The budget caps the rendered splat count and rebuilds the render. Guard
-        // so this preset-driven write does not flip the profile back to Custom.
+        // so these preset-driven writes do not flip the profile back to Custom.
         self.applying_profile = true;
         self.set_preview_max_splats(budget);
         self.applying_profile = false;
@@ -752,6 +824,28 @@ impl GaussianSplatNode3D {
             settings.bind_mut().set_max_debug_splats(max_splats);
         }
         self.mark_backend_dirty("preview_max_splats");
+        self.rebuild_debug_mesh();
+    }
+
+    #[func]
+    pub fn get_sh_degree(&self) -> i32 {
+        self.cloud_settings
+            .as_ref()
+            .map(|settings| settings.bind().get_sh_degree())
+            .unwrap_or(3)
+    }
+
+    #[func]
+    pub fn set_sh_degree(&mut self, sh_degree: i32) {
+        // A manual SH-degree edit no longer matches a fixed preset, so drop to Custom.
+        if !self.applying_profile {
+            self.render_profile_value = RenderProfile::Custom;
+        }
+        self.ensure_cloud_settings();
+        if let Some(settings) = &mut self.cloud_settings {
+            settings.bind_mut().set_sh_degree(sh_degree);
+        }
+        self.mark_backend_dirty("sh_degree");
         self.rebuild_debug_mesh();
     }
 
@@ -1153,6 +1247,7 @@ impl GaussianSplatNode3D {
         material.set_shader(&shader);
         material.set_shader_parameter("data_tex", &Variant::from(data_texture));
         material.set_shader_parameter("splat_count", &Variant::from(render.splat_count));
+        material.set_shader_parameter("sh_degree", &Variant::from(render.sh_degree));
         // Step 1 renders unsorted (slot == id); the compute sort (Step 2) flips this on.
         material.set_shader_parameter("sort_enabled", &Variant::from(0_i32));
 
@@ -1191,40 +1286,45 @@ impl GaussianSplatNode3D {
         // Chunked path: gather the currently selected chunks from the shared payload
         // (selection bounds the count). Legacy path (no chunk table): clone the asset
         // payload and uniformly decimate it to the budget.
-        let (slice, stride): (Vec<f32>, usize) = if let Some(rt) = &self.chunk_runtime {
-            (
-                crate::chunking::gather_active(
-                    rt.payload.as_slice(),
-                    rt.table.as_ref(),
-                    &rt.active,
-                ),
-                rt.table.stride,
-            )
-        } else {
-            let values = {
-                let asset_ref = asset.bind();
-                asset_ref.payload_float_values()?
+        let (slice, stride, sh_degree): (Vec<f32>, usize, i32) =
+            if let Some(rt) = &self.chunk_runtime {
+                let cap = cloud_settings
+                    .map(|settings| settings.bind().get_sh_degree())
+                    .unwrap_or(0);
+                (
+                    crate::chunking::gather_active(
+                        rt.payload.as_slice(),
+                        rt.table.as_ref(),
+                        &rt.active,
+                    ),
+                    rt.table.stride,
+                    cap.clamp(0, 3).min(rt.sh_degree_available),
+                )
+            } else {
+                let values = {
+                    let asset_ref = asset.bind();
+                    asset_ref.payload_float_values()?
+                };
+                let source_point_count = values.len() / POINT_STRIDE_FLOATS;
+                let max_splats = cloud_settings
+                    .map(|settings| settings.bind().get_max_debug_splats().max(0) as usize)
+                    .unwrap_or(usize::MAX);
+                let point_count = source_point_count.min(max_splats);
+                if point_count == 0 {
+                    return None;
+                }
+                let sample_stride = source_point_count.div_ceil(point_count);
+                let mut slice = Vec::with_capacity(point_count * POINT_STRIDE_FLOATS);
+                for slot in 0..point_count {
+                    let pi = (slot * sample_stride).min(source_point_count - 1);
+                    slice.extend_from_slice(
+                        &values[pi * POINT_STRIDE_FLOATS..(pi + 1) * POINT_STRIDE_FLOATS],
+                    );
+                }
+                (slice, POINT_STRIDE_FLOATS, 0)
             };
-            let source_point_count = values.len() / POINT_STRIDE_FLOATS;
-            let max_splats = cloud_settings
-                .map(|settings| settings.bind().get_max_debug_splats().max(0) as usize)
-                .unwrap_or(usize::MAX);
-            let point_count = source_point_count.min(max_splats);
-            if point_count == 0 {
-                return None;
-            }
-            let sample_stride = source_point_count.div_ceil(point_count);
-            let mut slice = Vec::with_capacity(point_count * POINT_STRIDE_FLOATS);
-            for slot in 0..point_count {
-                let pi = (slot * sample_stride).min(source_point_count - 1);
-                slice.extend_from_slice(
-                    &values[pi * POINT_STRIDE_FLOATS..(pi + 1) * POINT_STRIDE_FLOATS],
-                );
-            }
-            (slice, POINT_STRIDE_FLOATS)
-        };
 
-        pack_raw(&slice, scale_multiplier, stride).map(raw_to_render)
+        pack_raw(&slice, scale_multiplier, stride, sh_degree).map(raw_to_render)
     }
 
     // Build the chunk-streaming runtime from the bound asset's chunk table, seeding
@@ -1235,9 +1335,9 @@ impl GaussianSplatNode3D {
             let asset_ref = asset.bind();
             let table = asset_ref.chunk_table().cloned()?;
             let payload = asset_ref.payload_float_values()?;
-            Some((table, payload))
+            Some((table, payload, asset_ref.sh_degree_available()))
         });
-        let Some((table, payload)) = decoded else {
+        let Some((table, payload, sh_degree_available)) = decoded else {
             self.chunk_runtime = None;
             return;
         };
@@ -1250,6 +1350,7 @@ impl GaussianSplatNode3D {
         self.chunk_runtime = Some(ChunkRuntime {
             table: Arc::new(table),
             payload: Arc::new(payload),
+            sh_degree_available,
             active,
             last_select_pos: None,
             last_budget: budget,
@@ -1345,6 +1446,12 @@ impl GaussianSplatNode3D {
             .max(0.01);
         let receiver = match &self.chunk_runtime {
             Some(rt) if rt.pending.is_none() => {
+                let cap = self
+                    .cloud_settings
+                    .as_ref()
+                    .map(|settings| settings.bind().get_sh_degree())
+                    .unwrap_or(0);
+                let sh_degree = cap.clamp(0, 3).min(rt.sh_degree_available);
                 let payload = Arc::clone(&rt.payload);
                 let table = Arc::clone(&rt.table);
                 let active = rt.active.clone();
@@ -1352,7 +1459,7 @@ impl GaussianSplatNode3D {
                 std::thread::spawn(move || {
                     let slice =
                         crate::chunking::gather_active(payload.as_slice(), table.as_ref(), &active);
-                    if let Some(raw) = pack_raw(&slice, scale_multiplier, table.stride) {
+                    if let Some(raw) = pack_raw(&slice, scale_multiplier, table.stride, sh_degree) {
                         let _ = tx.send(raw);
                     }
                 });
@@ -1850,19 +1957,39 @@ impl GaussianSplatNode3D {
     }
 }
 
+// Higher-SH float / texel counts for degrees 0-3. Degree 0 lives in COLOR_0, so these
+// count only the appended degree 1-3 coefficients packed after the four core texels.
+fn sh_floats(degree: i32) -> usize {
+    match degree.clamp(0, 3) {
+        0 => 0,
+        1 => 9,
+        2 => 24,
+        _ => 45,
+    }
+}
+fn sh_texels(degree: i32) -> usize {
+    sh_floats(degree).div_ceil(4)
+}
+
 // Pack an already-gathered splat slice (`stride` floats per splat) into plain (Send)
 // render data off the main thread: project each splat's covariance and lay out the
-// data-texture floats + sort positions + grown bounds. Reads only the core fields,
-// which always live in the first POINT_STRIDE_FLOATS floats. Shared by the synchronous
-// build path and the async chunk rebuild (Phase C2b).
-fn pack_raw(slice: &[f32], scale_multiplier: f32, stride: usize) -> Option<RawRenderData> {
+// data-texture floats (4 core texels + SH texels for `sh_degree`) + sort positions +
+// grown bounds. Shared by the synchronous build path and the async rebuild (C2b).
+fn pack_raw(
+    slice: &[f32],
+    scale_multiplier: f32,
+    stride: usize,
+    sh_degree: i32,
+) -> Option<RawRenderData> {
     let stride = stride.max(POINT_STRIDE_FLOATS);
     let point_count = slice.len() / stride;
-    if point_count == 0 || point_count > (i32::MAX as usize / 4) {
+    let sh_degree = sh_degree.clamp(0, 3);
+    let texels_per_splat = 4 + sh_texels(sh_degree);
+    if point_count == 0 || point_count > (i32::MAX as usize / (4 * texels_per_splat)) {
         return None;
     }
     let tex_width = SPLAT_DATA_TEX_WIDTH as usize;
-    let tex_height = (point_count * 4).div_ceil(tex_width).max(1);
+    let tex_height = (point_count * texels_per_splat).div_ceil(tex_width).max(1);
     let mut data = vec![0.0_f32; tex_width * tex_height * 4];
     let mut positions = Vec::with_capacity(point_count * 4);
     let mut min = [f32::INFINITY; 3];
@@ -1884,7 +2011,7 @@ fn pack_raw(slice: &[f32], scale_multiplier: f32, stride: usize) -> Option<RawRe
                 slice[off + 9] * scale_multiplier,
             ],
         );
-        let base = slot * 16;
+        let base = slot * texels_per_splat * 4;
         data[base] = center[0];
         data[base + 1] = center[1];
         data[base + 2] = center[2];
@@ -1898,6 +2025,12 @@ fn pack_raw(slice: &[f32], scale_multiplier: f32, stride: usize) -> Option<RawRe
         data[base + 13] = slice[off + 15];
         data[base + 14] = slice[off + 16];
         data[base + 15] = slice[off + 17];
+        // Higher-degree SH (degree 1..sh_degree) from the payload at off+18, packed
+        // flat into the texels after the four core texels.
+        let sh_count = sh_floats(sh_degree);
+        for k in 0..sh_count {
+            data[base + 16 + k] = slice[off + 18 + k];
+        }
         for k in 0..3 {
             min[k] = min[k].min(center[k]);
             max[k] = max[k].max(center[k]);
@@ -1916,6 +2049,7 @@ fn pack_raw(slice: &[f32], scale_multiplier: f32, stride: usize) -> Option<RawRe
         splat_count: point_count as i32,
         aabb_pos: [min[0] - g, min[1] - g, min[2] - g],
         aabb_size: [size[0] + 2.0 * g, size[1] + 2.0 * g, size[2] + 2.0 * g],
+        sh_degree,
     })
 }
 
@@ -1931,6 +2065,7 @@ fn raw_to_render(raw: RawRenderData) -> SplatRenderData {
             Vector3::new(raw.aabb_pos[0], raw.aabb_pos[1], raw.aabb_pos[2]),
             Vector3::new(raw.aabb_size[0], raw.aabb_size[1], raw.aabb_size[2]),
         ),
+        sh_degree: raw.sh_degree,
     }
 }
 
