@@ -29,8 +29,10 @@ use crate::import_state::{ImportedSplatMetadata, NODE_STATE_KEY, POINT_STRIDE_FL
 // otherwise slot == id (unsorted, matching the Phase 1 look). The resolved splat's
 // covariance is projected to screen space with the perspective Jacobian and the
 // corner is stretched along the projected ellipse axes, so the on-screen footprint
-// is an oriented ellipse. Alpha is an isotropic Gaussian in the stretched corner
-// space, which equals the anisotropic Gaussian on screen.
+// is an oriented ellipse; splats whose footprint is entirely outside the viewport
+// are frustum-culled (pushed offscreen) to skip their overdraw. Alpha is an
+// isotropic Gaussian in the stretched corner space, which equals the anisotropic
+// Gaussian on screen.
 // NOTE: with `sort_enabled == 0` splats are not depth-sorted, so blending order is
 // only approximate; the GPU compute sort (Step 2) drives `sort_tex` for the correct
 // back-to-front order.
@@ -119,10 +121,20 @@ void vertex() {
         vec2 major_axis = min(sqrt(2.0 * lambda1), 1024.0) * axis_dir;
         vec2 minor_axis = min(sqrt(2.0 * lambda2), 1024.0) * vec2(axis_dir.y, -axis_dir.x);
 
-        // Expand the quad corner along the projected ellipse axes, in clip space.
-        vec2 screen_offset = v_corner.x * major_axis + v_corner.y * minor_axis;
-        vec2 clip_offset = (screen_offset / vp) * 2.0 * center_clip.w;
-        POSITION = center_clip + vec4(clip_offset, 0.0, 0.0);
+        // Frustum cull: if the footprint lies entirely outside the viewport in X
+        // or Y, push the splat offscreen so its quad clips (skips the overdraw).
+        // The quad corner reaches +/-2, so the footprint radius is 2 * major axis.
+        vec2 ndc = center_clip.xy / center_clip.w;
+        vec2 margin = vec2(4.0 * length(major_axis)) / vp;
+        if (ndc.x - margin.x > 1.0 || ndc.x + margin.x < -1.0
+            || ndc.y - margin.y > 1.0 || ndc.y + margin.y < -1.0) {
+            POSITION = vec4(0.0, 0.0, 100.0, 1.0);
+        } else {
+            // Expand the quad corner along the projected ellipse axes, in clip space.
+            vec2 screen_offset = v_corner.x * major_axis + v_corner.y * minor_axis;
+            vec2 clip_offset = (screen_offset / vp) * 2.0 * center_clip.w;
+            POSITION = center_clip + vec4(clip_offset, 0.0, 0.0);
+        }
     }
 }
 
