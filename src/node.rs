@@ -169,6 +169,16 @@ struct SplatRenderData {
     aabb: Aabb,
 }
 
+// Runtime chunk-streaming state (Phase C2): the spatial chunk table plus the
+// currently selected (active) chunk indices and the selection-gating reference.
+// Present only when the bound asset was decoded with a chunk table.
+struct ChunkRuntime {
+    table: crate::chunking::ChunkTable,
+    active: Vec<u32>,
+    last_select_pos: Option<Vector3>,
+    last_budget: i32,
+}
+
 // --- Step 2: GPU counting sort -------------------------------------------------
 // Depth bucket count (sort precision) and compute workgroup size, mirroring the
 // validated PoC. The sort-order texture is R32F; one texel per splat holds the
@@ -486,6 +496,7 @@ pub struct GaussianSplatNode3D {
     backend_state: NodeBackendState,
     debug_mesh_instance: Option<Gd<MultiMeshInstance3D>>,
     sort: SortGpu,
+    chunk_runtime: Option<ChunkRuntime>,
     // Backing storage for the `render_profile` export (PhantomVar holds no state).
     render_profile_value: RenderProfile,
     // True while a preset is being applied, so preset-driven writes to the
@@ -514,6 +525,10 @@ impl INode3D for GaussianSplatNode3D {
         if Engine::singleton().is_editor_hint() {
             return;
         }
+        // Re-select nearby chunks and rebuild the active render set when the camera
+        // moves across chunk boundaries (Phase C2). A rebuild tears down the sort,
+        // which the block below brings back up at the new active count.
+        self.update_chunk_selection();
         if !self.sort.ready && !self.sort.attempted {
             self.try_enable_sort();
         }
@@ -909,6 +924,7 @@ impl GaussianSplatNode3D {
             self.backend_state.profile_hint.clear();
         }
         self.mark_backend_dirty("asset");
+        self.refresh_chunk_runtime();
         self.rebuild_debug_mesh();
         self.sync_runtime_state();
         self.sync_node_name();
@@ -1140,21 +1156,47 @@ impl GaussianSplatNode3D {
             let asset_ref = asset.bind();
             asset_ref.payload_float_values()?
         };
-
-        let source_point_count = values.len() / POINT_STRIDE_FLOATS;
-        let max_splats = cloud_settings
-            .map(|settings| settings.bind().get_max_debug_splats().max(0) as usize)
-            .unwrap_or(usize::MAX);
-        let point_count = source_point_count.min(max_splats);
-        if point_count == 0 || point_count > (i32::MAX as usize / 4) {
-            return None;
-        }
-        let sample_stride = source_point_count.div_ceil(point_count);
-
         let scale_multiplier = cloud_settings
             .map(|settings| settings.bind().get_gaussian_scale_multiplier())
             .unwrap_or(1.0)
             .max(0.01);
+
+        // Chunked path: gather the currently selected chunks' contiguous payload
+        // ranges (selection bounds the count). Legacy path (no chunk table):
+        // uniformly decimate the whole payload to the budget.
+        let slice: Vec<f32> = if let Some(rt) = &self.chunk_runtime {
+            crate::chunking::gather_active(&values, &rt.table, &rt.active)
+        } else {
+            let source_point_count = values.len() / POINT_STRIDE_FLOATS;
+            let max_splats = cloud_settings
+                .map(|settings| settings.bind().get_max_debug_splats().max(0) as usize)
+                .unwrap_or(usize::MAX);
+            let point_count = source_point_count.min(max_splats);
+            if point_count == 0 {
+                return None;
+            }
+            let sample_stride = source_point_count.div_ceil(point_count);
+            let mut slice = Vec::with_capacity(point_count * POINT_STRIDE_FLOATS);
+            for slot in 0..point_count {
+                let pi = (slot * sample_stride).min(source_point_count - 1);
+                slice.extend_from_slice(
+                    &values[pi * POINT_STRIDE_FLOATS..(pi + 1) * POINT_STRIDE_FLOATS],
+                );
+            }
+            slice
+        };
+
+        self.pack_render_data(&slice, scale_multiplier)
+    }
+
+    // Pack an already-ordered splat slice (POINT_STRIDE_FLOATS per splat, the final
+    // render set) into the four-texel data texture, the sort positions SSBO, and the
+    // bounds. No further decimation happens here.
+    fn pack_render_data(&self, slice: &[f32], scale_multiplier: f32) -> Option<SplatRenderData> {
+        let point_count = slice.len() / POINT_STRIDE_FLOATS;
+        if point_count == 0 || point_count > (i32::MAX as usize / 4) {
+            return None;
+        }
 
         // Data texture: four RGBA-float texels per splat. Texel 0 = center.xyz,
         // texels 1-2 = packed covariance upper triangle, texel 3 = color rgba.
@@ -1163,25 +1205,23 @@ impl GaussianSplatNode3D {
         let mut data = vec![0.0_f32; tex_width * tex_height * 4];
 
         let mut positions_ssbo = Vec::with_capacity(point_count * 4);
-
         let mut min = Vector3::new(f32::INFINITY, f32::INFINITY, f32::INFINITY);
         let mut max = Vector3::new(f32::NEG_INFINITY, f32::NEG_INFINITY, f32::NEG_INFINITY);
 
         for slot in 0..point_count {
-            let point_index = (slot * sample_stride).min(source_point_count - 1);
-            let offset = point_index * POINT_STRIDE_FLOATS;
-            let center = Vector3::new(values[offset], values[offset + 1], values[offset + 2]);
+            let offset = slot * POINT_STRIDE_FLOATS;
+            let center = Vector3::new(slice[offset], slice[offset + 1], slice[offset + 2]);
             let cov = covariance_upper_triangle(
                 [
-                    values[offset + 3],
-                    values[offset + 4],
-                    values[offset + 5],
-                    values[offset + 6],
+                    slice[offset + 3],
+                    slice[offset + 4],
+                    slice[offset + 5],
+                    slice[offset + 6],
                 ],
                 [
-                    values[offset + 7] * scale_multiplier,
-                    values[offset + 8] * scale_multiplier,
-                    values[offset + 9] * scale_multiplier,
+                    slice[offset + 7] * scale_multiplier,
+                    slice[offset + 8] * scale_multiplier,
+                    slice[offset + 9] * scale_multiplier,
                 ],
             );
 
@@ -1196,10 +1236,10 @@ impl GaussianSplatNode3D {
             data[base + 7] = cov[3];
             data[base + 8] = cov[4];
             data[base + 9] = cov[5];
-            data[base + 12] = values[offset + 14];
-            data[base + 13] = values[offset + 15];
-            data[base + 14] = values[offset + 16];
-            data[base + 15] = values[offset + 17];
+            data[base + 12] = slice[offset + 14];
+            data[base + 13] = slice[offset + 15];
+            data[base + 14] = slice[offset + 16];
+            data[base + 15] = slice[offset + 17];
 
             min.x = min.x.min(center.x);
             min.y = min.y.min(center.y);
@@ -1223,6 +1263,99 @@ impl GaussianSplatNode3D {
             splat_count: point_count as i32,
             aabb,
         })
+    }
+
+    // Build the chunk-streaming runtime from the bound asset's chunk table, seeding
+    // the active set with a budget-bounded selection around the cloud center (no
+    // camera yet). None when the asset has no chunk table (placeholder/legacy).
+    fn refresh_chunk_runtime(&mut self) {
+        let table = self
+            .asset
+            .as_ref()
+            .and_then(|asset| asset.bind().chunk_table().cloned());
+        self.chunk_runtime = table.map(|table| ChunkRuntime {
+            table,
+            active: Vec::new(),
+            last_select_pos: None,
+            last_budget: -1,
+        });
+        if self.chunk_runtime.is_some() {
+            let budget = self.active_budget();
+            let center = {
+                let rt = self.chunk_runtime.as_ref().unwrap();
+                let c = crate::chunking::table_center(&rt.table);
+                Vector3::new(c[0], c[1], c[2])
+            };
+            let active = self.select_chunks(center, budget);
+            if let Some(rt) = self.chunk_runtime.as_mut() {
+                rt.active = active;
+                rt.last_budget = budget;
+            }
+        }
+    }
+
+    // Re-select the active chunks when the camera moves far enough to change the
+    // nearest-within-budget set, then rebuild the render set. Gated like the sort's
+    // view-change check so a near-static camera does no work.
+    fn update_chunk_selection(&mut self) {
+        if self.chunk_runtime.is_none() {
+            return;
+        }
+        let Some(cam) = self.camera_local_pos() else {
+            return;
+        };
+        let budget = self.active_budget();
+        let changed = {
+            let rt = self.chunk_runtime.as_ref().unwrap();
+            let threshold = (rt.table.chunk_size * 0.25).max(1.0e-3);
+            match rt.last_select_pos {
+                Some(last) => budget != rt.last_budget || (cam - last).length() > threshold,
+                None => true,
+            }
+        };
+        if !changed {
+            return;
+        }
+        let active = self.select_chunks(cam, budget);
+        let differs = self
+            .chunk_runtime
+            .as_ref()
+            .map(|rt| rt.active != active)
+            .unwrap_or(false);
+        if let Some(rt) = self.chunk_runtime.as_mut() {
+            rt.last_select_pos = Some(cam);
+            rt.last_budget = budget;
+            if differs {
+                rt.active = active;
+            }
+        }
+        if differs {
+            self.rebuild_debug_mesh();
+        }
+    }
+
+    fn select_chunks(&self, cam_local: Vector3, budget: i32) -> Vec<u32> {
+        let Some(rt) = &self.chunk_runtime else {
+            return Vec::new();
+        };
+        let budget = if budget <= 0 { u32::MAX } else { budget as u32 };
+        crate::chunking::select_chunks(&rt.table, [cam_local.x, cam_local.y, cam_local.z], budget)
+    }
+
+    fn active_budget(&self) -> i32 {
+        self.cloud_settings
+            .as_ref()
+            .map(|settings| settings.bind().get_max_debug_splats().max(0))
+            .unwrap_or(i32::MAX)
+    }
+
+    // Active camera position in the node's local space (the space of the payload
+    // positions and chunk bounds). None when there is no active camera.
+    fn camera_local_pos(&self) -> Option<Vector3> {
+        let viewport = self.base().get_viewport()?;
+        let camera = viewport.get_camera_3d()?;
+        let cam_world = camera.get_global_transform().origin;
+        Some(self.base().get_global_transform().affine_inverse() * cam_world)
     }
 
     // Reconnect the field to the baked render child when the node is deserialized

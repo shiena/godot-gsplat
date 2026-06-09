@@ -164,6 +164,97 @@ fn splat_importance(s: &[f32]) -> f32 {
     alpha * footprint
 }
 
+/// Euclidean distance from a point to an axis-aligned box (0 if inside).
+pub fn aabb_distance(p: [f32; 3], min: [f32; 3], max: [f32; 3]) -> f32 {
+    let mut sum = 0.0_f32;
+    for k in 0..3 {
+        let d = (min[k] - p[k]).max(0.0).max(p[k] - max[k]);
+        sum += d * d;
+    }
+    sum.sqrt()
+}
+
+/// Center of the union of all chunk bounds (a stable reference for selection when
+/// no camera is available yet). `[0,0,0]` for an empty table.
+pub fn table_center(table: &ChunkTable) -> [f32; 3] {
+    let mut mn = [f32::INFINITY; 3];
+    let mut mx = [f32::NEG_INFINITY; 3];
+    for e in &table.entries {
+        for k in 0..3 {
+            mn[k] = mn[k].min(e.aabb_min[k]);
+            mx[k] = mx[k].max(e.aabb_max[k]);
+        }
+    }
+    if !mn[0].is_finite() {
+        return [0.0; 3];
+    }
+    [
+        (mn[0] + mx[0]) * 0.5,
+        (mn[1] + mx[1]) * 0.5,
+        (mn[2] + mx[2]) * 0.5,
+    ]
+}
+
+/// Select the chunks nearest `cam` (by distance to their grown bounds) whose total
+/// splat count fits within `budget`, including whole chunks only. At least the
+/// nearest chunk is always included. The returned indices are sorted ascending
+/// (== payload-offset order) for a cache-friendly gather.
+pub fn select_chunks(table: &ChunkTable, cam: [f32; 3], budget: u32) -> Vec<u32> {
+    let n = table.entries.len();
+    if n == 0 {
+        return Vec::new();
+    }
+    let mut order: Vec<u32> = (0..n as u32).collect();
+    order.sort_by(|&a, &b| {
+        let ea = &table.entries[a as usize];
+        let eb = &table.entries[b as usize];
+        let da = aabb_distance(cam, ea.aabb_min, ea.aabb_max);
+        let db = aabb_distance(cam, eb.aabb_min, eb.aabb_max);
+        da.partial_cmp(&db)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then(a.cmp(&b))
+    });
+
+    let mut selected = Vec::new();
+    let mut total: u32 = 0;
+    for idx in order {
+        let c = table.entries[idx as usize].count;
+        if !selected.is_empty() && total.saturating_add(c) > budget {
+            break;
+        }
+        selected.push(idx);
+        total = total.saturating_add(c);
+        if total >= budget {
+            break;
+        }
+    }
+    selected.sort_unstable();
+    selected
+}
+
+/// Concatenate the payload float ranges of the given chunk indices into one slice
+/// (the active render set). Out-of-range chunks are skipped.
+pub fn gather_active(payload: &[f32], table: &ChunkTable, active: &[u32]) -> Vec<f32> {
+    let stride = POINT_STRIDE_FLOATS;
+    let mut total = 0usize;
+    for &ci in active {
+        if let Some(e) = table.entries.get(ci as usize) {
+            total += e.count as usize * stride;
+        }
+    }
+    let mut out = Vec::with_capacity(total);
+    for &ci in active {
+        if let Some(e) = table.entries.get(ci as usize) {
+            let start = e.offset as usize * stride;
+            let end = (e.offset as usize + e.count as usize) * stride;
+            if end <= payload.len() {
+                out.extend_from_slice(&payload[start..end]);
+            }
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -270,5 +361,45 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn select_respects_budget_and_is_offset_sorted() {
+        let payload = grid_payload();
+        let part = partition_payload(&payload, 2.0);
+        let table = &part.table;
+
+        let all = select_chunks(table, [0.0, 0.0, 0.0], u32::MAX);
+        assert_eq!(all.len(), table.entries.len());
+
+        let total: u32 = table.entries.iter().map(|e| e.count).sum();
+        let budget = (total / 3).max(1);
+        let sel = select_chunks(table, [0.0, 0.0, 0.0], budget);
+        assert!(!sel.is_empty());
+        let picked: u32 = sel.iter().map(|&i| table.entries[i as usize].count).sum();
+        assert!(picked <= budget || sel.len() == 1);
+        let mut sorted = sel.clone();
+        sorted.sort_unstable();
+        assert_eq!(sorted, sel, "selection must be offset-sorted");
+    }
+
+    #[test]
+    fn gather_concatenates_selected_ranges() {
+        let payload = grid_payload();
+        let part = partition_payload(&payload, 2.0);
+        let table = &part.table;
+        let active: Vec<u32> = vec![0, 2];
+        let gathered = gather_active(&part.payload, table, &active);
+        let expect: usize = active
+            .iter()
+            .map(|&i| table.entries[i as usize].count as usize * POINT_STRIDE_FLOATS)
+            .sum();
+        assert_eq!(gathered.len(), expect);
+        let e0 = &table.entries[0];
+        let start = e0.offset as usize * POINT_STRIDE_FLOATS;
+        assert_eq!(
+            &gathered[0..POINT_STRIDE_FLOATS],
+            &part.payload[start..start + POINT_STRIDE_FLOATS]
+        );
     }
 }
