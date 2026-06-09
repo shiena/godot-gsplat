@@ -1,5 +1,5 @@
 use godot::classes::gltf_accessor::{GltfAccessorType, GltfComponentType};
-use godot::classes::{GltfAccessor, GltfBufferView, GltfDocument, GltfState};
+use godot::classes::{GltfAccessor, GltfBufferView, GltfDocument, GltfState, ResourceUid};
 use godot::global::Error;
 use godot::prelude::*;
 
@@ -529,10 +529,13 @@ pub fn decode_splat_payload(
 pub fn decode_first_splat_from_gltf(
     path: &str,
 ) -> Result<(VarDictionary, DecodedSplatData), String> {
+    // The inspector file picker stores an imported glTF as a UID; GLTFDocument
+    // needs a real res:// path to resolve the file and its external buffers.
+    let resolved = resolve_resource_path(path);
     let mut document = GltfDocument::new_gd();
     let state = GltfState::new_gd();
-    if document.append_from_file(path, &state) != Error::OK {
-        return Err(format!("Failed to read glTF '{path}'."));
+    if document.append_from_file(&resolved, &state) != Error::OK {
+        return Err(format!("Failed to read glTF '{resolved}'."));
     }
 
     let json = state.get_json();
@@ -543,6 +546,18 @@ pub fn decode_first_splat_from_gltf(
         .ok_or_else(|| "glTF contains no valid KHR_gaussian_splatting primitive.".to_string())?;
     let decoded = decode_splat_payload(&state, &metadata)?;
     Ok((metadata.to_dictionary(), decoded))
+}
+
+// Resolve a `uid://` reference to its res:// path; pass other paths through.
+fn resolve_resource_path(path: &str) -> GString {
+    if path.starts_with("uid://") {
+        let uid = ResourceUid::singleton();
+        let id = uid.text_to_id(path);
+        if id != -1 && uid.has_id(id) {
+            return uid.get_id_path(id);
+        }
+    }
+    GString::from(path)
 }
 
 fn validate_accessor_match(
