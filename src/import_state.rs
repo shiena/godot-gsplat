@@ -36,6 +36,10 @@ pub struct DecodedSplatData {
     pub payload: PackedByteArray,
     pub local_aabb: Aabb,
     pub chunk_table: Option<crate::chunking::ChunkTable>,
+    // Highest spherical-harmonics degree (0-3) present in the source glTF. Degrees
+    // 1-3 are appended after the 18 core floats, so the payload stride is
+    // POINT_STRIDE_FLOATS + (extra SH coeffs * 3).
+    pub sh_degree_available: i32,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -469,7 +473,13 @@ pub fn decode_splat_payload(
         return Err("Gaussian splat accessor lengths do not match POSITION count.".to_string());
     }
 
-    let mut payload_floats = Vec::with_capacity(point_count * POINT_STRIDE_FLOATS);
+    // Optional higher-degree SH (1-3), appended after the 18 core floats. The
+    // per-splat stride grows to POINT_STRIDE_FLOATS + sh_floats.
+    let (sh_extra, sh_floats, sh_degree_available) =
+        decode_higher_sh(state, &accessors, &buffer_views, &attributes, point_count)?;
+    let stride = POINT_STRIDE_FLOATS + sh_floats;
+
+    let mut payload_floats = Vec::with_capacity(point_count * stride);
     let mut min = Vector3::new(f32::INFINITY, f32::INFINITY, f32::INFINITY);
     let mut max = Vector3::new(f32::NEG_INFINITY, f32::NEG_INFINITY, f32::NEG_INFINITY);
 
@@ -510,13 +520,19 @@ pub fn decode_splat_payload(
             colors[color_offset + 2],
             colors[color_offset + 3],
         ]);
+        // Higher-degree SH for this splat (empty when the glTF has only degree 0).
+        let sh_off = point_index * sh_floats;
+        payload_floats.extend_from_slice(&sh_extra[sh_off..sh_off + sh_floats]);
     }
 
     // Reorder the payload into spatial grid chunks (importance-sorted within each)
     // so the runtime can stream/select nearby chunks (Phase C). Reordering is a pure
     // permutation, so the rendered set and the bounds are unchanged.
-    let partitioned =
-        crate::chunking::partition_payload(&payload_floats, crate::chunking::DEFAULT_CHUNK_SIZE);
+    let partitioned = crate::chunking::partition_payload(
+        &payload_floats,
+        crate::chunking::DEFAULT_CHUNK_SIZE,
+        stride,
+    );
     let payload = PackedFloat32Array::from(partitioned.payload).to_byte_array();
     let size = max - min;
     let local_aabb = Aabb::new(min, size);
@@ -527,7 +543,60 @@ pub fn decode_splat_payload(
         payload,
         local_aabb,
         chunk_table: Some(partitioned.table),
+        sh_degree_available,
     })
+}
+
+// Decode the optional higher-degree SH coefficients (degrees 1-3) when fully present.
+// Each coefficient is a VEC3 (rgb); degree d has (2d+1) coefficients. Degrees must be
+// contiguous (degree 2 requires degree 1, etc.). Returns a per-splat flat array (every
+// present coefficient's rgb, in degree-then-coeff order), the floats per splat, and the
+// highest fully-present degree (0 when only degree 0 exists).
+fn decode_higher_sh(
+    state: &Gd<GltfState>,
+    accessors: &Array<Gd<GltfAccessor>>,
+    buffer_views: &Array<Gd<GltfBufferView>>,
+    attributes: &VarDictionary,
+    point_count: usize,
+) -> Result<(Vec<f32>, usize, i32), String> {
+    let mut coeffs: Vec<Vec<f32>> = Vec::new();
+    let mut degree = 0_i32;
+    'degrees: for d in 1..=3 {
+        let coeff_count = 2 * d + 1;
+        let mut decoded: Vec<Vec<f32>> = Vec::with_capacity(coeff_count as usize);
+        for c in 0..coeff_count {
+            let name = format!("{BASE_EXTENSION}:SH_DEGREE_{d}_COEF_{c}");
+            let Some(index) = dict_i32(attributes, &name) else {
+                // This degree is incomplete; SH degrees are contiguous, so stop here.
+                break 'degrees;
+            };
+            let values = decode_float_accessor(
+                state,
+                accessors,
+                buffer_views,
+                index,
+                &name,
+                &[GltfAccessorType::VEC3],
+            )?;
+            if values.len() / 3 != point_count {
+                return Err(format!(
+                    "SH attribute {name} length does not match POSITION count."
+                ));
+            }
+            decoded.push(values);
+        }
+        coeffs.extend(decoded);
+        degree = d;
+    }
+
+    let floats_per_splat = coeffs.len() * 3;
+    let mut flat = Vec::with_capacity(point_count * floats_per_splat);
+    for p in 0..point_count {
+        for coeff in &coeffs {
+            flat.extend_from_slice(&coeff[p * 3..p * 3 + 3]);
+        }
+    }
+    Ok((flat, floats_per_splat, degree))
 }
 
 // Load a glTF file and decode its first valid gaussian-splat primitive. Lets a

@@ -22,6 +22,8 @@ pub struct GaussianSplatAsset {
     // Godot property, so it is not serialized into a baked .scn (Case B keeps using
     // the baked render set until disk streaming lands).
     chunk_table: Option<crate::chunking::ChunkTable>,
+    // Highest SH degree (0-3) present in the source glTF (Phase: higher-order SH).
+    sh_degree_available: i32,
 }
 
 #[godot_api]
@@ -35,6 +37,7 @@ impl GaussianSplatAsset {
         self.fallback_mode = FALLBACK_NONE.into();
         self.local_aabb = Aabb::default();
         self.chunk_table = None;
+        self.sh_degree_available = 0;
         self.base_mut().emit_changed();
     }
 
@@ -189,9 +192,16 @@ impl GaussianSplatAsset {
             return None;
         }
 
+        // The per-splat stride is POINT_STRIDE_FLOATS plus any appended higher-SH
+        // coefficients (recorded on the chunk table); validate against it.
+        let stride = self
+            .chunk_table
+            .as_ref()
+            .map(|table| table.stride.max(POINT_STRIDE_FLOATS))
+            .unwrap_or(POINT_STRIDE_FLOATS);
         let floats = self.payload.to_float32_array();
         let values = floats.as_slice();
-        if !values.len().is_multiple_of(POINT_STRIDE_FLOATS) {
+        if values.is_empty() || !values.len().is_multiple_of(stride) {
             return None;
         }
 
@@ -222,6 +232,7 @@ impl GaussianSplatAsset {
         self.payload_layout = decoded.payload_layout;
         self.local_aabb = decoded.local_aabb;
         self.chunk_table = decoded.chunk_table;
+        self.sh_degree_available = decoded.sh_degree_available;
         self.base_mut().emit_changed();
     }
 
@@ -229,6 +240,11 @@ impl GaussianSplatAsset {
     // with chunking. None for placeholder/legacy assets.
     pub fn chunk_table(&self) -> Option<&crate::chunking::ChunkTable> {
         self.chunk_table.as_ref()
+    }
+
+    // Highest SH degree (0-3) available in the decoded payload.
+    pub fn sh_degree_available(&self) -> i32 {
+        self.sh_degree_available
     }
 }
 

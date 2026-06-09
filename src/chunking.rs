@@ -39,6 +39,9 @@ pub struct ChunkTable {
     pub chunk_size: f32,
     pub grid_origin: [f32; 3],
     pub entries: Vec<ChunkEntry>,
+    // Floats per splat in the payload this table describes (POINT_STRIDE_FLOATS core
+    // plus any higher-SH coefficients appended at import).
+    pub stride: usize,
 }
 
 /// A reordered payload plus the table describing its chunk layout.
@@ -47,11 +50,13 @@ pub struct PartitionedPayload {
     pub table: ChunkTable,
 }
 
-/// Partition `payload` (flat, `POINT_STRIDE_FLOATS` floats per splat) into a uniform
-/// grid of `chunk_size` cells. Splats are reordered so each cell is contiguous and
-/// sorted by importance descending (deterministic; ties broken by original index).
-pub fn partition_payload(payload: &[f32], chunk_size: f32) -> PartitionedPayload {
-    let stride = POINT_STRIDE_FLOATS;
+/// Partition `payload` (flat, `stride` floats per splat) into a uniform grid of
+/// `chunk_size` cells. Splats are reordered so each cell is contiguous and sorted by
+/// importance descending (deterministic; ties broken by original index). The core
+/// fields (position/scale/color) used for importance/bounds live in the first
+/// POINT_STRIDE_FLOATS floats, so `stride` may be larger (appended higher-SH).
+pub fn partition_payload(payload: &[f32], chunk_size: f32, stride: usize) -> PartitionedPayload {
+    let stride = stride.max(POINT_STRIDE_FLOATS);
     let chunk_size = chunk_size.max(1.0e-4);
     let count = payload.len() / stride;
 
@@ -62,6 +67,7 @@ pub fn partition_payload(payload: &[f32], chunk_size: f32) -> PartitionedPayload
                 chunk_size,
                 grid_origin: [0.0; 3],
                 entries: Vec::new(),
+                stride,
             },
         };
     }
@@ -149,6 +155,7 @@ pub fn partition_payload(payload: &[f32], chunk_size: f32) -> PartitionedPayload
             chunk_size,
             grid_origin: origin,
             entries,
+            stride,
         },
     }
 }
@@ -241,7 +248,7 @@ pub fn select_chunks(table: &ChunkTable, cam: [f32; 3], budget: u32) -> Vec<(u32
 /// `(chunk_index, lod_count)` into one slice (the active render set). Out-of-range
 /// chunks are skipped; `lod_count` is clamped to the chunk's size.
 pub fn gather_active(payload: &[f32], table: &ChunkTable, active: &[(u32, u32)]) -> Vec<f32> {
-    let stride = POINT_STRIDE_FLOATS;
+    let stride = table.stride.max(POINT_STRIDE_FLOATS);
     let mut total = 0usize;
     for &(ci, lod) in active {
         if let Some(e) = table.entries.get(ci as usize) {
@@ -293,7 +300,7 @@ mod tests {
 
     #[test]
     fn empty_payload_yields_empty_table() {
-        let part = partition_payload(&[], 2.0);
+        let part = partition_payload(&[], 2.0, POINT_STRIDE_FLOATS);
         assert!(part.payload.is_empty());
         assert!(part.table.entries.is_empty());
     }
@@ -302,7 +309,7 @@ mod tests {
     fn ranges_are_contiguous_and_cover_all() {
         let payload = grid_payload();
         let n = payload.len() / POINT_STRIDE_FLOATS;
-        let part = partition_payload(&payload, 2.0);
+        let part = partition_payload(&payload, 2.0, POINT_STRIDE_FLOATS);
         assert!(part.table.entries.len() > 1, "expected multiple chunks");
         let mut expect = 0u32;
         let mut total = 0u32;
@@ -318,7 +325,7 @@ mod tests {
     #[test]
     fn output_is_a_permutation_of_input() {
         let payload = grid_payload();
-        let part = partition_payload(&payload, 2.0);
+        let part = partition_payload(&payload, 2.0, POINT_STRIDE_FLOATS);
         let key = |chunk: &[f32]| {
             (
                 chunk[POS_X].to_bits(),
@@ -342,7 +349,7 @@ mod tests {
         {
             payload.extend_from_slice(&make_splat([0.1 * i as f32, 0.0, 0.0], *scale, *alpha));
         }
-        let part = partition_payload(&payload, 100.0); // one big cell
+        let part = partition_payload(&payload, 100.0, POINT_STRIDE_FLOATS); // one big cell
         assert_eq!(part.table.entries.len(), 1);
         let count = part.table.entries[0].count as usize;
         let mut prev = f32::INFINITY;
@@ -357,7 +364,7 @@ mod tests {
     #[test]
     fn centers_lie_within_grown_chunk_aabb() {
         let payload = grid_payload();
-        let part = partition_payload(&payload, 2.0);
+        let part = partition_payload(&payload, 2.0, POINT_STRIDE_FLOATS);
         for e in &part.table.entries {
             for i in e.offset..e.offset + e.count {
                 let s = &part.payload
@@ -373,7 +380,7 @@ mod tests {
     #[test]
     fn select_fills_budget_and_is_offset_sorted() {
         let payload = grid_payload();
-        let part = partition_payload(&payload, 2.0);
+        let part = partition_payload(&payload, 2.0, POINT_STRIDE_FLOATS);
         let table = &part.table;
         let total: u32 = table.entries.iter().map(|e| e.count).sum();
 
@@ -397,7 +404,7 @@ mod tests {
     #[test]
     fn gather_concatenates_selected_ranges() {
         let payload = grid_payload();
-        let part = partition_payload(&payload, 2.0);
+        let part = partition_payload(&payload, 2.0, POINT_STRIDE_FLOATS);
         let table = &part.table;
         let active: Vec<(u32, u32)> = vec![(0, 1), (2, 1)];
         let gathered = gather_active(&part.payload, table, &active);
@@ -424,7 +431,7 @@ mod tests {
         for i in 0..10 {
             payload.extend_from_slice(&make_splat([0.01 * i as f32, 0.0, 0.0], 0.1, 0.5));
         }
-        let part = partition_payload(&payload, 100.0);
+        let part = partition_payload(&payload, 100.0, POINT_STRIDE_FLOATS);
         assert_eq!(part.table.entries.len(), 1);
         assert_eq!(
             select_chunks(&part.table, [0.0, 0.0, 0.0], 3),

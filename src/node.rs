@@ -1191,8 +1191,15 @@ impl GaussianSplatNode3D {
         // Chunked path: gather the currently selected chunks from the shared payload
         // (selection bounds the count). Legacy path (no chunk table): clone the asset
         // payload and uniformly decimate it to the budget.
-        let slice: Vec<f32> = if let Some(rt) = &self.chunk_runtime {
-            crate::chunking::gather_active(rt.payload.as_slice(), rt.table.as_ref(), &rt.active)
+        let (slice, stride): (Vec<f32>, usize) = if let Some(rt) = &self.chunk_runtime {
+            (
+                crate::chunking::gather_active(
+                    rt.payload.as_slice(),
+                    rt.table.as_ref(),
+                    &rt.active,
+                ),
+                rt.table.stride,
+            )
         } else {
             let values = {
                 let asset_ref = asset.bind();
@@ -1214,10 +1221,10 @@ impl GaussianSplatNode3D {
                     &values[pi * POINT_STRIDE_FLOATS..(pi + 1) * POINT_STRIDE_FLOATS],
                 );
             }
-            slice
+            (slice, POINT_STRIDE_FLOATS)
         };
 
-        pack_raw(&slice, scale_multiplier).map(raw_to_render)
+        pack_raw(&slice, scale_multiplier, stride).map(raw_to_render)
     }
 
     // Build the chunk-streaming runtime from the bound asset's chunk table, seeding
@@ -1345,7 +1352,7 @@ impl GaussianSplatNode3D {
                 std::thread::spawn(move || {
                     let slice =
                         crate::chunking::gather_active(payload.as_slice(), table.as_ref(), &active);
-                    if let Some(raw) = pack_raw(&slice, scale_multiplier) {
+                    if let Some(raw) = pack_raw(&slice, scale_multiplier, table.stride) {
                         let _ = tx.send(raw);
                     }
                 });
@@ -1843,12 +1850,14 @@ impl GaussianSplatNode3D {
     }
 }
 
-// Pack an already-gathered splat slice (POINT_STRIDE_FLOATS per splat) into plain
-// (Send) render data off the main thread: project each splat's covariance and lay
-// out the data-texture floats + sort positions + grown bounds. Shared by the
-// synchronous build path and the async chunk rebuild (Phase C2b).
-fn pack_raw(slice: &[f32], scale_multiplier: f32) -> Option<RawRenderData> {
-    let point_count = slice.len() / POINT_STRIDE_FLOATS;
+// Pack an already-gathered splat slice (`stride` floats per splat) into plain (Send)
+// render data off the main thread: project each splat's covariance and lay out the
+// data-texture floats + sort positions + grown bounds. Reads only the core fields,
+// which always live in the first POINT_STRIDE_FLOATS floats. Shared by the synchronous
+// build path and the async chunk rebuild (Phase C2b).
+fn pack_raw(slice: &[f32], scale_multiplier: f32, stride: usize) -> Option<RawRenderData> {
+    let stride = stride.max(POINT_STRIDE_FLOATS);
+    let point_count = slice.len() / stride;
     if point_count == 0 || point_count > (i32::MAX as usize / 4) {
         return None;
     }
@@ -1860,7 +1869,7 @@ fn pack_raw(slice: &[f32], scale_multiplier: f32) -> Option<RawRenderData> {
     let mut max = [f32::NEG_INFINITY; 3];
 
     for slot in 0..point_count {
-        let off = slot * POINT_STRIDE_FLOATS;
+        let off = slot * stride;
         let center = [slice[off], slice[off + 1], slice[off + 2]];
         let cov = covariance_upper_triangle(
             [
