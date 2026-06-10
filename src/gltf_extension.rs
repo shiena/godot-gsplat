@@ -148,8 +148,6 @@ impl IGltfDocumentExtension for GltfGsplatDocumentExtension {
         node.bind_mut().set_imported_transform(imported_transform);
 
         if let Some(raw_metadata) = raw_metadata {
-            node.bind_mut().set_import_metadata(raw_metadata.clone());
-
             let mut asset = GaussianSplatAsset::new_gd();
             asset.bind_mut().apply_import_metadata(raw_metadata.clone());
 

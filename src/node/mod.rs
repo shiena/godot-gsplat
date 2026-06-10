@@ -113,7 +113,6 @@ pub struct GaussianSplatNode3D {
     // count here to recover it after a scene reload.
     #[var(get, set, usage_flags = [STORAGE])]
     imported_point_count: PhantomVar<i32>,
-    metadata: ImportedSplatMetadata,
     is_bound: bool,
     transform_state: NodeTransformState,
     visibility_state: NodeVisibilityState,
@@ -285,7 +284,6 @@ impl GaussianSplatNode3D {
     #[func]
     pub fn unbind_asset(&mut self) {
         self.asset = None;
-        self.metadata = ImportedSplatMetadata::default();
         self.is_bound = false;
         self.clear_splat_multimesh();
         self.sync_node_name();
@@ -303,20 +301,23 @@ impl GaussianSplatNode3D {
 
     #[func]
     pub fn get_metadata_summary(&self) -> GString {
-        GString::from(self.metadata.summary().as_str())
-    }
-
-    #[func]
-    pub fn set_import_metadata(&mut self, metadata: VarDictionary) {
-        self.metadata = ImportedSplatMetadata::from_dictionary(metadata);
-        self.is_bound = true;
-        self.mark_backend_dirty("metadata");
-        self.sync_node_name();
+        GString::from(self.imported_metadata().summary().as_str())
     }
 
     #[func]
     pub fn export_import_metadata(&self) -> VarDictionary {
-        self.metadata.to_dictionary()
+        self.imported_metadata().to_dictionary()
+    }
+
+    // Import metadata is owned by the bound asset; the node derives it on demand
+    // instead of holding a runtime copy.
+    fn imported_metadata(&self) -> ImportedSplatMetadata {
+        self.asset
+            .as_ref()
+            .map(|asset| {
+                ImportedSplatMetadata::from_dictionary(asset.bind().export_import_metadata())
+            })
+            .unwrap_or_default()
     }
 
     #[func]
@@ -514,7 +515,10 @@ impl GaussianSplatNode3D {
             "backend_profile_hint",
             self.backend_state.profile_hint.as_str(),
         );
-        dict.set("metadata", &Variant::from(self.metadata.to_dictionary()));
+        dict.set(
+            "metadata",
+            &Variant::from(self.imported_metadata().to_dictionary()),
+        );
         dict
     }
 
@@ -556,7 +560,7 @@ impl GaussianSplatNode3D {
     #[func]
     pub fn stash_on_state(&self, state: Option<Gd<GltfState>>) {
         if let Some(mut state) = state {
-            let dict = self.metadata.to_dictionary();
+            let dict = self.imported_metadata().to_dictionary();
             state.set_additional_data(NODE_STATE_KEY, &Variant::from(dict));
         }
     }
@@ -567,8 +571,6 @@ impl GaussianSplatNode3D {
         if let Some(asset) = &self.asset {
             let asset = asset.clone();
             let asset_ref = asset.bind();
-            self.metadata =
-                ImportedSplatMetadata::from_dictionary(asset_ref.export_import_metadata());
             self.is_bound = true;
             self.visibility_state.asset_ready = true;
             self.backend_state.asset_point_count = asset_ref.get_point_count();
@@ -576,7 +578,6 @@ impl GaussianSplatNode3D {
             drop(asset_ref);
             self.clamp_preview_settings_to_asset();
         } else {
-            self.metadata = ImportedSplatMetadata::default();
             self.is_bound = false;
             self.visibility_state.asset_ready = false;
             self.backend_state.asset_point_count = 0;
@@ -641,14 +642,14 @@ impl GaussianSplatNode3D {
             .map(|backend_settings| {
                 backend_settings
                     .bind()
-                    .resolve_pipeline_for_metadata(&self.metadata)
+                    .resolve_pipeline_for_metadata(&self.imported_metadata())
             })
             .unwrap_or_else(|| "unconfigured".to_string())
     }
 
     fn sync_node_name(&mut self) {
         let name = if self.is_bound {
-            let summary = self.metadata.summary();
+            let summary = self.imported_metadata().summary();
             format!("GaussianSplatNode3D ({summary})")
         } else {
             "GaussianSplatNode3D".to_string()
