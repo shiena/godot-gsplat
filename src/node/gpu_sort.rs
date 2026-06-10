@@ -55,6 +55,9 @@ pub(super) struct SortGpu {
     pub(super) attempted: bool,
     pub(super) enabled_in_shader: bool,
     pub(super) dispatched_once: bool,
+    // Whether the last dispatch wrote a separate second-eye order (per-eye VR);
+    // decides what the material's sort_tex_b sampler must point at.
+    pub(super) per_eye_dispatched: bool,
     // Last view (camera_view * node_model) used for a sort; gates re-sorting.
     pub(super) last_view: Option<Transform3D>,
     // Inputs stashed when the splat render is (re)built.
@@ -86,6 +89,7 @@ impl Default for SortGpu {
             attempted: false,
             enabled_in_shader: false,
             dispatched_once: false,
+            per_eye_dispatched: false,
             last_view: None,
             positions: PackedByteArray::new(),
             splat_count: 0,
@@ -513,9 +517,21 @@ impl GaussianSplatNode3D {
         if enabled {
             if let Some(texture) = &self.backend.sort.texture {
                 material.set_shader_parameter("sort_tex", &Variant::from(texture.clone()));
-            }
-            if let Some(texture_b) = &self.backend.sort.texture_b {
-                material.set_shader_parameter("sort_tex_b", &Variant::from(texture_b.clone()));
+                // Head-center sorting dispatches one order shared by both eyes
+                // and never writes the second-eye texture — alias the primary
+                // order into sort_tex_b so multiview's VIEW_INDEX == 1 samples
+                // a valid order (it read undefined data before, leaving the
+                // right eye effectively empty under XR).
+                let texture_b = if self.backend.sort.per_eye_dispatched {
+                    self.backend
+                        .sort
+                        .texture_b
+                        .clone()
+                        .unwrap_or(texture.clone())
+                } else {
+                    texture.clone()
+                };
+                material.set_shader_parameter("sort_tex_b", &Variant::from(texture_b));
             }
             material.set_shader_parameter("sort_enabled", &Variant::from(1_i32));
         } else {

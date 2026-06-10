@@ -168,6 +168,16 @@ impl INode3D for GaussianSplatNode3D {
         if should_sort {
             self.dispatch_sort(&eyes);
             self.backend.sort.last_view = Some(primary);
+            // Track whether a separate second-eye order exists; when the mode
+            // flips (e.g. per-eye sorting toggled), re-point the material's
+            // sort_tex_b sampler at the right texture.
+            let per_eye = eyes.len() > 1;
+            if per_eye != self.backend.sort.per_eye_dispatched {
+                self.backend.sort.per_eye_dispatched = per_eye;
+                if self.backend.sort.enabled_in_shader {
+                    self.set_material_sort(true);
+                }
+            }
         }
         // Enable sorted sampling one frame after the first dispatch, so the sort
         // texture is registered and written before the material binds it.
