@@ -2,9 +2,23 @@
 name = "godot_gsplat"
 version = "0.1.0"
 edition = "2021"
+authors = ["KOGA Mitsuhiro <shiena.jp@gmail.com>"]
+repository = "https://github.com/shiena/godot-gsplat"
 
 [lib]
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 godot = { version = "0.5", features = ["api-4-5"] }
+
+[profile.dev]
+opt-level = 0
+debug = 1
+incremental = true
+codegen-units = 256
+
+[profile.release]
+opt-level = 3
+strip = true
+lto = true
+codegen-units = 1
