@@ -38,7 +38,7 @@ impl GaussianSplatNode3D {
             Some((table, payload, asset_ref.sh_degree_available()))
         });
         let Some((table, payload, sh_degree_available)) = decoded else {
-            self.chunk_runtime = None;
+            self.backend.chunks = None;
             return;
         };
         // Seed the active set with a budget-bounded selection around the cloud center
@@ -47,7 +47,7 @@ impl GaussianSplatNode3D {
         let center = crate::chunking::table_center(&table);
         let budget_u = if budget <= 0 { u32::MAX } else { budget as u32 };
         let active = crate::chunking::select_chunks(&table, center, budget_u);
-        self.chunk_runtime = Some(ChunkRuntime {
+        self.backend.chunks = Some(ChunkRuntime {
             table: Arc::new(table),
             payload: Arc::new(payload),
             sh_degree_available,
@@ -64,7 +64,8 @@ impl GaussianSplatNode3D {
     pub(super) fn update_chunk_selection(&mut self) {
         // Skip while a rebuild is in flight; the next gate-crossing picks up the latest.
         if self
-            .chunk_runtime
+            .backend
+            .chunks
             .as_ref()
             .map(|rt| rt.pending.is_some())
             .unwrap_or(false)
@@ -75,7 +76,7 @@ impl GaussianSplatNode3D {
             return;
         };
         let budget = self.active_budget();
-        let changed = match &self.chunk_runtime {
+        let changed = match &self.backend.chunks {
             Some(rt) => {
                 let threshold = (rt.table.chunk_size * 0.25).max(1.0e-3);
                 match rt.last_select_pos {
@@ -90,11 +91,12 @@ impl GaussianSplatNode3D {
         }
         let active = self.select_chunks(cam, budget);
         let differs = self
-            .chunk_runtime
+            .backend
+            .chunks
             .as_ref()
             .map(|rt| rt.active != active)
             .unwrap_or(false);
-        if let Some(rt) = self.chunk_runtime.as_mut() {
+        if let Some(rt) = self.backend.chunks.as_mut() {
             rt.last_select_pos = Some(cam);
             rt.last_budget = budget;
             if differs {
@@ -107,7 +109,7 @@ impl GaussianSplatNode3D {
     }
 
     pub(super) fn select_chunks(&self, cam_local: Vector3, budget: i32) -> Vec<(u32, u32)> {
-        let Some(rt) = &self.chunk_runtime else {
+        let Some(rt) = &self.backend.chunks else {
             return Vec::new();
         };
         let budget = if budget <= 0 { u32::MAX } else { budget as u32 };
@@ -135,7 +137,7 @@ impl GaussianSplatNode3D {
             .map(|settings| settings.bind().get_gaussian_scale_multiplier())
             .unwrap_or(1.0)
             .max(0.01);
-        let receiver = match &self.chunk_runtime {
+        let receiver = match &self.backend.chunks {
             Some(rt) if rt.pending.is_none() => {
                 let cap = self
                     .cloud_settings
@@ -159,7 +161,7 @@ impl GaussianSplatNode3D {
             _ => None,
         };
         if let Some(rx) = receiver {
-            if let Some(rt) = self.chunk_runtime.as_mut() {
+            if let Some(rt) = self.backend.chunks.as_mut() {
                 rt.pending = Some(rx);
             }
         }
@@ -169,7 +171,8 @@ impl GaussianSplatNode3D {
     // current render set until the worker delivers the new one, avoiding a hitch.
     pub(super) fn poll_chunk_rebuild(&mut self) {
         let result = match self
-            .chunk_runtime
+            .backend
+            .chunks
             .as_ref()
             .and_then(|rt| rt.pending.as_ref())
         {
@@ -178,14 +181,14 @@ impl GaussianSplatNode3D {
         };
         match result {
             Ok(raw) => {
-                if let Some(rt) = self.chunk_runtime.as_mut() {
+                if let Some(rt) = self.backend.chunks.as_mut() {
                     rt.pending = None;
                 }
                 self.apply_render_data(raw_to_render(raw));
             }
             Err(std::sync::mpsc::TryRecvError::Empty) => {}
             Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                if let Some(rt) = self.chunk_runtime.as_mut() {
+                if let Some(rt) = self.backend.chunks.as_mut() {
                     rt.pending = None;
                 }
             }

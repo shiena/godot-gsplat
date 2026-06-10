@@ -19,6 +19,16 @@ mod shaders;
 use chunk_streaming::ChunkRuntime;
 use gpu_sort::SortGpu;
 
+// All rendering-backend state owned by the node, kept apart from the scene-graph
+// state: the GPU depth sort and the chunk-streaming runtime. GPU resources are
+// freed explicitly via teardown_sort() on exit_tree (not Drop: freeing RIDs needs
+// the RenderingServer, which is not guaranteed to outlive the node at shutdown).
+#[derive(Default)]
+struct SplatRenderBackend {
+    sort: SortGpu,
+    chunks: Option<ChunkRuntime>,
+}
+
 #[derive(Clone, Debug, Default)]
 struct NodeTransformState {
     imported_transform: Transform3D,
@@ -109,8 +119,7 @@ pub struct GaussianSplatNode3D {
     visibility_state: NodeVisibilityState,
     backend_state: NodeBackendState,
     splat_multimesh: Option<Gd<MultiMeshInstance3D>>,
-    sort: SortGpu,
-    chunk_runtime: Option<ChunkRuntime>,
+    backend: SplatRenderBackend,
     // Backing storage for the `render_profile` export (PhantomVar holds no state).
     render_profile_value: RenderProfile,
     // True while a preset is being applied, so preset-driven writes to the
@@ -141,10 +150,10 @@ impl INode3D for GaussianSplatNode3D {
         // the sort, which the block below brings back up at the new active count.
         self.poll_chunk_rebuild();
         self.update_chunk_selection();
-        if !self.sort.ready && !self.sort.attempted {
+        if !self.backend.sort.ready && !self.backend.sort.attempted {
             self.try_enable_sort();
         }
-        if !self.sort.ready {
+        if !self.backend.sort.ready {
             return;
         }
         let eyes = self.current_sort_views();
@@ -153,22 +162,22 @@ impl INode3D for GaussianSplatNode3D {
         };
         // Re-sort only when the camera/node view changes meaningfully; a static
         // view keeps the last back-to-front order, saving per-frame GPU work.
-        let should_sort = match self.sort.last_view {
+        let should_sort = match self.backend.sort.last_view {
             Some(last) => self.sort_view_changed(last, primary),
             None => true,
         };
         if should_sort {
             self.dispatch_sort(&eyes);
-            self.sort.last_view = Some(primary);
+            self.backend.sort.last_view = Some(primary);
         }
         // Enable sorted sampling one frame after the first dispatch, so the sort
         // texture is registered and written before the material binds it.
-        if self.sort.last_view.is_some() && !self.sort.enabled_in_shader {
-            if self.sort.dispatched_once {
+        if self.backend.sort.last_view.is_some() && !self.backend.sort.enabled_in_shader {
+            if self.backend.sort.dispatched_once {
                 self.set_material_sort(true);
-                self.sort.enabled_in_shader = true;
+                self.backend.sort.enabled_in_shader = true;
             }
-            self.sort.dispatched_once = true;
+            self.backend.sort.dispatched_once = true;
         }
     }
 

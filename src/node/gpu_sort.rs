@@ -111,13 +111,13 @@ impl Default for SortGpu {
 impl GaussianSplatNode3D {
     // One-shot attempt to bring up the GPU sort once renderable data exists.
     pub(super) fn try_enable_sort(&mut self) {
-        self.sort.attempted = true;
-        if self.sort.positions.is_empty() {
+        self.backend.sort.attempted = true;
+        if self.backend.sort.positions.is_empty() {
             // Case B: no live asset (instanced from a pre-imported .scn) — recover
             // the splat centers from the serialized data texture.
             self.reconstruct_sort_inputs_from_material();
         }
-        if self.sort.splat_count > 0 && !self.sort.positions.is_empty() {
+        if self.backend.sort.splat_count > 0 && !self.backend.sort.positions.is_empty() {
             self.setup_sort();
         }
     }
@@ -174,16 +174,16 @@ impl GaussianSplatNode3D {
         }
 
         let size = max - min;
-        self.sort.positions = PackedFloat32Array::from(positions).to_byte_array();
-        self.sort.splat_count = splat_count;
-        self.sort.local_aabb = Aabb::new(min, size).grow(size.length() * 0.05 + 0.01);
+        self.backend.sort.positions = PackedFloat32Array::from(positions).to_byte_array();
+        self.backend.sort.splat_count = splat_count;
+        self.backend.sort.local_aabb = Aabb::new(min, size).grow(size.length() * 0.05 + 0.01);
     }
 
     // Build the main-RenderingDevice resources for the GPU counting sort. Runs on
     // the main thread (== render thread under single-threaded rendering).
     pub(super) fn setup_sort(&mut self) {
-        let count = self.sort.splat_count.max(0);
-        if count == 0 || self.sort.positions.is_empty() {
+        let count = self.backend.sort.splat_count.max(0);
+        if count == 0 || self.backend.sort.positions.is_empty() {
             return;
         }
 
@@ -194,8 +194,8 @@ impl GaussianSplatNode3D {
 
         // Positions storage buffer (vec4 per splat) + histogram/offset buffers.
         let pos_buf = device
-            .storage_buffer_create_ex(self.sort.positions.len() as u32)
-            .data(&self.sort.positions)
+            .storage_buffer_create_ex(self.backend.sort.positions.len() as u32)
+            .data(&self.backend.sort.positions)
             .done();
         let bucket_bytes = (SORT_NUM_BUCKETS as u32) * 4;
         let hist_buf = device.storage_buffer_create(bucket_bytes);
@@ -287,21 +287,21 @@ impl GaussianSplatNode3D {
         let mut texture_b = Texture2Drd::new_gd();
         texture_b.set_texture_rd_rid(sort_tex_rid_b);
 
-        self.sort.pos_buf = pos_buf;
-        self.sort.hist_buf = hist_buf;
-        self.sort.off_buf = off_buf;
-        self.sort.blocks_buf = blocks_buf;
-        self.sort.sort_tex_rid = sort_tex_rid;
-        self.sort.shaders = shaders;
-        self.sort.pipelines = pipelines;
-        self.sort.sets = sets;
-        self.sort.tex_width = tex_width;
-        self.sort.tex_height = tex_height;
-        self.sort.texture = Some(texture);
-        self.sort.sort_tex_rid_b = sort_tex_rid_b;
-        self.sort.scatter_set_b = scatter_set_b;
-        self.sort.texture_b = Some(texture_b);
-        self.sort.ready = true;
+        self.backend.sort.pos_buf = pos_buf;
+        self.backend.sort.hist_buf = hist_buf;
+        self.backend.sort.off_buf = off_buf;
+        self.backend.sort.blocks_buf = blocks_buf;
+        self.backend.sort.sort_tex_rid = sort_tex_rid;
+        self.backend.sort.shaders = shaders;
+        self.backend.sort.pipelines = pipelines;
+        self.backend.sort.sets = sets;
+        self.backend.sort.tex_width = tex_width;
+        self.backend.sort.tex_height = tex_height;
+        self.backend.sort.texture = Some(texture);
+        self.backend.sort.sort_tex_rid_b = sort_tex_rid_b;
+        self.backend.sort.scatter_set_b = scatter_set_b;
+        self.backend.sort.texture_b = Some(texture_b);
+        self.backend.sort.ready = true;
         // The material is pointed at the sort texture only after the first dispatch
         // (see process); binding the Texture2Drd the frame it is created would make
         // the renderer sample an unregistered texture for one frame.
@@ -368,7 +368,7 @@ impl GaussianSplatNode3D {
 
     // Whether the view moved/rotated enough to warrant a re-sort.
     pub(super) fn sort_view_changed(&self, last: Transform3D, current: Transform3D) -> bool {
-        let scale = self.sort.local_aabb.size.length().max(1.0e-3);
+        let scale = self.backend.sort.local_aabb.size.length().max(1.0e-3);
         if (current.origin - last.origin).length() > scale * SORT_RESORT_POS_FRACTION {
             return true;
         }
@@ -386,29 +386,29 @@ impl GaussianSplatNode3D {
         // the second sort texture; all others target the primary one.
         let mut passes: Vec<(PackedByteArray, Rid)> = Vec::with_capacity(eyes.len());
         for &(combined, eye) in eyes {
-            let (depth_min, depth_inv_range) = depth_range(combined, self.sort.local_aabb);
+            let (depth_min, depth_inv_range) = depth_range(combined, self.backend.sort.local_aabb);
             let push_constant = build_sort_push_constant(
                 combined,
                 depth_min,
                 depth_inv_range,
-                self.sort.splat_count,
-                self.sort.tex_width,
+                self.backend.sort.splat_count,
+                self.backend.sort.tex_width,
             );
             let scatter_set = if eye == 1 {
-                self.sort.scatter_set_b
+                self.backend.sort.scatter_set_b
             } else {
-                self.sort.sets[ST_SCATTER]
+                self.backend.sort.sets[ST_SCATTER]
             };
             passes.push((push_constant, scatter_set));
         }
 
-        let count = self.sort.splat_count.max(0) as u32;
+        let count = self.backend.sort.splat_count.max(0) as u32;
         let groups = count.div_ceil(SORT_LOCAL_SIZE);
         let bucket_bytes = (SORT_NUM_BUCKETS as u32) * 4;
         let scan_blocks = SORT_NUM_BLOCKS as u32;
-        let hist_buf = self.sort.hist_buf;
-        let pipelines = self.sort.pipelines;
-        let sets = self.sort.sets;
+        let hist_buf = self.backend.sort.hist_buf;
+        let pipelines = self.backend.sort.pipelines;
+        let sets = self.backend.sort.sets;
 
         let callable = Callable::from_fn("gsplat_sort_dispatch", move |_args: &[&Variant]| {
             let server = RenderingServer::singleton();
@@ -461,27 +461,28 @@ impl GaussianSplatNode3D {
     }
 
     pub(super) fn teardown_sort(&mut self) {
-        let has_resources = self.sort.pos_buf.is_valid()
-            || self.sort.shaders[ST_COUNT].is_valid()
-            || self.sort.sort_tex_rid.is_valid();
+        let has_resources = self.backend.sort.pos_buf.is_valid()
+            || self.backend.sort.shaders[ST_COUNT].is_valid()
+            || self.backend.sort.sort_tex_rid.is_valid();
         if has_resources {
             let server = RenderingServer::singleton();
             if let Some(mut device) = server.get_rendering_device() {
                 let buffers = [
-                    self.sort.sort_tex_rid,
-                    self.sort.sort_tex_rid_b,
-                    self.sort.pos_buf,
-                    self.sort.hist_buf,
-                    self.sort.off_buf,
-                    self.sort.blocks_buf,
+                    self.backend.sort.sort_tex_rid,
+                    self.backend.sort.sort_tex_rid_b,
+                    self.backend.sort.pos_buf,
+                    self.backend.sort.hist_buf,
+                    self.backend.sort.off_buf,
+                    self.backend.sort.blocks_buf,
                 ];
                 for rid in self
+                    .backend
                     .sort
                     .sets
                     .into_iter()
-                    .chain([self.sort.scatter_set_b])
-                    .chain(self.sort.pipelines)
-                    .chain(self.sort.shaders)
+                    .chain([self.backend.sort.scatter_set_b])
+                    .chain(self.backend.sort.pipelines)
+                    .chain(self.backend.sort.shaders)
                     .chain(buffers)
                 {
                     if rid.is_valid() {
@@ -493,13 +494,13 @@ impl GaussianSplatNode3D {
 
         // Reset GPU state but keep the stashed inputs so a later tree re-entry can
         // rebuild the sort.
-        let positions = std::mem::take(&mut self.sort.positions);
-        let splat_count = self.sort.splat_count;
-        let local_aabb = self.sort.local_aabb;
-        self.sort = SortGpu::default();
-        self.sort.positions = positions;
-        self.sort.splat_count = splat_count;
-        self.sort.local_aabb = local_aabb;
+        let positions = std::mem::take(&mut self.backend.sort.positions);
+        let splat_count = self.backend.sort.splat_count;
+        let local_aabb = self.backend.sort.local_aabb;
+        self.backend.sort = SortGpu::default();
+        self.backend.sort.positions = positions;
+        self.backend.sort.splat_count = splat_count;
+        self.backend.sort.local_aabb = local_aabb;
 
         // Stop the shader from sampling a freed sort texture.
         self.set_material_sort(false);
@@ -510,10 +511,10 @@ impl GaussianSplatNode3D {
             return;
         };
         if enabled {
-            if let Some(texture) = &self.sort.texture {
+            if let Some(texture) = &self.backend.sort.texture {
                 material.set_shader_parameter("sort_tex", &Variant::from(texture.clone()));
             }
-            if let Some(texture_b) = &self.sort.texture_b {
+            if let Some(texture_b) = &self.backend.sort.texture_b {
                 material.set_shader_parameter("sort_tex_b", &Variant::from(texture_b.clone()));
             }
             material.set_shader_parameter("sort_enabled", &Variant::from(1_i32));

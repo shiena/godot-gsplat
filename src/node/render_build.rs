@@ -205,10 +205,10 @@ impl GaussianSplatNode3D {
         // Stash GPU sort inputs (Step 2). A rebuild invalidates any prior sort
         // (the material above already starts with sort_enabled = 0).
         self.teardown_sort();
-        self.sort.positions = render.positions_ssbo;
-        self.sort.splat_count = render.splat_count;
-        self.sort.local_aabb = render.aabb;
-        self.sort.attempted = false;
+        self.backend.sort.positions = render.positions_ssbo;
+        self.backend.sort.splat_count = render.splat_count;
+        self.backend.sort.local_aabb = render.aabb;
+        self.backend.sort.attempted = false;
     }
 
     pub(super) fn build_splat_render_data(
@@ -225,7 +225,7 @@ impl GaussianSplatNode3D {
         // (selection bounds the count). Legacy path (no chunk table): clone the asset
         // payload and uniformly decimate it to the budget.
         let (slice, stride, sh_degree): (Vec<f32>, usize, i32) =
-            if let Some(rt) = &self.chunk_runtime {
+            if let Some(rt) = &self.backend.chunks {
                 let cap = cloud_settings
                     .map(|settings| settings.bind().get_sh_degree())
                     .unwrap_or(0);
