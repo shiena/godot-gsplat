@@ -6,7 +6,7 @@ use crate::asset::GaussianSplatAsset;
 use crate::import_options::PreviewImportOptions;
 use crate::import_state::{
     decode_splat_payload, inspect_gsplat_nodes, BASE_EXTENSION, COMPRESSION_EXTENSION,
-    GLTF_STATE_KEY, NODE_STATE_KEY,
+    GLTF_STATE_KEY, NODE_ASSET_KEY, NODE_STATE_KEY,
 };
 use crate::node::GaussianSplatNode3D;
 
@@ -84,7 +84,13 @@ impl IGltfDocumentExtension for GltfGsplatDocumentExtension {
 
             let dictionary = metadata.to_dictionary();
             entries.push(&Variant::from(dictionary.clone()));
-            gltf_node.set_additional_data(NODE_STATE_KEY, &Variant::from(dictionary));
+            gltf_node.set_additional_data(NODE_STATE_KEY, &Variant::from(dictionary.clone()));
+            // Decode the splat payload once here and stash the prepared asset on
+            // the GLTF node; generate_scene_node() only binds it. This keeps node
+            // generation cheap and the extension free of work that depends on
+            // anything but the GLTFState.
+            let asset = build_node_asset(Some(&state), &metadata, &dictionary);
+            gltf_node.set_additional_data(NODE_ASSET_KEY, &Variant::from(asset));
             summaries.push(metadata.summary().as_str());
 
             if !metadata.is_valid() {
@@ -131,43 +137,40 @@ impl IGltfDocumentExtension for GltfGsplatDocumentExtension {
     ) -> Option<Gd<Node3D>> {
         let gltf_node = gltf_node?;
         let imported_transform = gltf_node.get_xform();
-        let mut raw_metadata = gltf_node
-            .get_additional_data(NODE_STATE_KEY)
-            .try_to::<VarDictionary>()
+
+        // Common path: bind the asset prepared in import_post_parse. Fallback:
+        // when the node's additional data did not survive, rebuild it from the
+        // metadata stashed on the GLTFState (matched by mesh index).
+        let mut asset = gltf_node
+            .get_additional_data(NODE_ASSET_KEY)
+            .try_to::<Gd<GaussianSplatAsset>>()
             .ok();
-        if raw_metadata.is_none() {
-            raw_metadata = state
-                .as_ref()
-                .and_then(|state| metadata_from_state(state, gltf_node.get_mesh()));
+        if asset.is_none() {
+            let raw_metadata = gltf_node
+                .get_additional_data(NODE_STATE_KEY)
+                .try_to::<VarDictionary>()
+                .ok()
+                .or_else(|| {
+                    state
+                        .as_ref()
+                        .and_then(|state| metadata_from_state(state, gltf_node.get_mesh()))
+                });
+            if let Some(raw_metadata) = raw_metadata {
+                let metadata = crate::import_state::ImportedSplatMetadata::from_dictionary(
+                    raw_metadata.clone(),
+                );
+                asset = Some(build_node_asset(state.as_ref(), &metadata, &raw_metadata));
+            }
         }
-        let preview_options = state
-            .as_ref()
-            .and_then(PreviewImportOptions::from_saved_import_file);
 
         let mut node = GaussianSplatNode3D::new_alloc();
         node.bind_mut().set_imported_transform(imported_transform);
 
-        if let Some(raw_metadata) = raw_metadata {
-            let mut asset = GaussianSplatAsset::new_gd();
-            asset.bind_mut().apply_import_metadata(raw_metadata.clone());
-
-            let metadata = asset.bind().export_import_metadata();
-            let metadata = crate::import_state::ImportedSplatMetadata::from_dictionary(metadata);
-
-            if let Some(state) = state.as_ref() {
-                match decode_splat_payload(state, &metadata) {
-                    Ok(decoded) => {
-                        asset.bind_mut().apply_decoded_data(decoded);
-                    }
-                    Err(message) => {
-                        godot_error!("{message}");
-                        asset.bind_mut().initialize_from_import(raw_metadata);
-                    }
-                }
-            } else {
-                asset.bind_mut().initialize_from_import(raw_metadata);
-            }
+        if let Some(asset) = asset {
             node.bind_mut().bind_asset(Some(asset));
+            let preview_options = state
+                .as_ref()
+                .and_then(PreviewImportOptions::from_saved_import_file);
             if let Some(preview_options) = preview_options {
                 let mut as_node = node.clone().upcast::<Node>();
                 preview_options.apply_to_node(&mut as_node);
@@ -176,6 +179,36 @@ impl IGltfDocumentExtension for GltfGsplatDocumentExtension {
 
         Some(node.upcast())
     }
+}
+
+// Build a GaussianSplatAsset for one splat node: apply the import metadata and
+// decode the payload from the GLTF state (falling back to a payload-less
+// placeholder when decoding is impossible).
+fn build_node_asset(
+    state: Option<&Gd<GltfState>>,
+    metadata: &crate::import_state::ImportedSplatMetadata,
+    raw_metadata: &VarDictionary,
+) -> Gd<GaussianSplatAsset> {
+    let mut asset = GaussianSplatAsset::new_gd();
+    asset.bind_mut().apply_import_metadata(raw_metadata.clone());
+    if let Some(state) = state {
+        match decode_splat_payload(state, metadata) {
+            Ok(decoded) => {
+                asset.bind_mut().apply_decoded_data(decoded);
+            }
+            Err(message) => {
+                godot_error!("{message}");
+                asset
+                    .bind_mut()
+                    .initialize_from_import(raw_metadata.clone());
+            }
+        }
+    } else {
+        asset
+            .bind_mut()
+            .initialize_from_import(raw_metadata.clone());
+    }
+    asset
 }
 
 fn metadata_from_state(state: &Gd<GltfState>, mesh_index: i32) -> Option<VarDictionary> {

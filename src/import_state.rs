@@ -7,6 +7,7 @@ pub const BASE_EXTENSION: &str = "KHR_gaussian_splatting";
 pub const COMPRESSION_EXTENSION: &str = "KHR_gaussian_splatting_compression_spz_2";
 pub const GLTF_STATE_KEY: &str = "godot_gsplat.import_state";
 pub const NODE_STATE_KEY: &str = "godot_gsplat.node_state";
+pub const NODE_ASSET_KEY: &str = "godot_gsplat.node_asset";
 pub const PAYLOAD_LAYOUT_V1: &str = "gsplat.import.placeholder.v1";
 pub const PAYLOAD_LAYOUT_FLOAT32_V1: &str = "gsplat.interleaved.float32.v1";
 pub const FALLBACK_NONE: &str = "none";
