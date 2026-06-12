@@ -24,18 +24,25 @@ use crate::cloud_settings::GaussianSplatCloudSettings;
 use crate::import_state::{ImportedSplatMetadata, NODE_STATE_KEY, POINT_STRIDE_FLOATS};
 
 // Texture-driven anisotropic Gaussian splat shader (Step 1 render path). Per-splat
-// data (center, packed 3D covariance upper triangle, color) lives in `data_tex`,
+// data (center, per-axis scale, rotation quaternion, color) lives in `data_tex`,
 // four RGBA-float texels per splat. The geometry is a single quad rendered via
 // MultiMesh (one instance per splat); the instance index (INSTANCE_ID) is the
 // slot, UV = quad corner in [-2, 2]. Each slot resolves to a splat id via
 // `sort_tex` when `sort_enabled`,
 // otherwise slot == id (unsorted, matching the Phase 1 look). The resolved splat's
-// covariance is projected to screen space with the perspective Jacobian and the
-// corner is stretched along the projected ellipse axes, so the on-screen footprint
-// is an oriented ellipse; splats whose footprint is entirely outside the viewport
-// are frustum-culled (pushed offscreen) to skip their overdraw. Alpha is an
-// isotropic Gaussian in the stretched corner space, which equals the anisotropic
-// Gaussian on screen.
+// ellipsoid is projected to a screen-space ellipse *without* the affine/Jacobian
+// approximation: the center and the three rotated/scaled semi-axes are projected to
+// clip space, a projected quadric/conic is formed, and the ellipse is recovered by
+// eigen-decomposition (exact, stable for the near-camera / wide-FOV views that
+// matter for VR). The corner is stretched along the ellipse axes, so the on-screen
+// footprint is an oriented ellipse; splats whose footprint is entirely outside the
+// viewport are frustum-culled (pushed offscreen) to skip their overdraw. Alpha is
+// an isotropic Gaussian in the stretched corner space, which equals the anisotropic
+// Gaussian on screen, with energy-preserving antialiasing on sub-pixel footprints.
+// Per-corner depth is the Gaussian peak along the view ray (ray vs ellipsoid),
+// written to POSITION.z so splats intersect opaque geometry correctly while keeping
+// early-z. The exact-projection / AA / ray-depth math is adapted from
+// VRChatGaussianSplatting (MIT, Mykhailo Moroz): Shaders/GSMath.cginc + GS.cginc.
 // NOTE: with `sort_enabled == 0` splats are not depth-sorted, so blending order is
 // only approximate; the GPU compute sort (Step 2) drives `sort_tex` for the correct
 // back-to-front order.
@@ -89,6 +96,16 @@ vec3 eval_sh(vec3 base_color, int sh_base, int w, vec3 d, int degree) {
     return max(c, vec3(0.0));
 }
 
+const float DIV_EPS = 1e-6;
+const float SPLAT_MIN_STD_PX = 0.5;     // AA: minimum on-screen Gaussian std (px)
+const float SPLAT_MAX_STD_PX = 1024.0;  // overdraw guard: clamp huge footprints (px)
+
+// Rotate vector v by quaternion q (xyzw).
+vec3 q_rotate(vec3 v, vec4 q) {
+    vec3 t = 2.0 * cross(q.xyz, v);
+    return v + q.w * t + cross(q.xyz, t);
+}
+
 void vertex() {
     v_corner = UV;
     int slot = int(INSTANCE_ID);
@@ -123,65 +140,127 @@ void vertex() {
         vec3 cam = INV_VIEW_MATRIX[3].xyz;
         v_color.rgb = eval_sh(v_color.rgb, base + 4, w, normalize(center_world - cam), sh_degree);
     }
-    // Reconstruct the symmetric local-space 3D covariance from its upper triangle.
-    mat3 cov3d = mat3(
-        vec3(t1.x, t1.y, t1.z),
-        vec3(t1.y, t1.w, t2.x),
-        vec3(t1.z, t2.x, t2.y));
+    // --- Exact ellipsoid -> screen-ellipse projection (no affine/Jacobian
+    // approximation). Project the center and the three rotated/scaled semi-axes to
+    // clip space, build the projected quadric/conic, and recover the ellipse by
+    // eigen-decomposition. Adapted from VRChatGaussianSplatting GSMath.cginc.
+    vec3 scale = vec3(t0.w, t1.x, t1.y);
+    vec4 quat = vec4(t1.z, t1.w, t2.x, t2.y);
+    mat4 mvp = PROJECTION_MATRIX * VIEW_MATRIX * MODEL_MATRIX;
+    vec4 center_clip = mvp * vec4(center, 1.0);
 
-    vec4 center_view = VIEW_MATRIX * MODEL_MATRIX * vec4(center, 1.0);
-    vec4 center_clip = PROJECTION_MATRIX * center_view;
+    vec3 ax0 = q_rotate(vec3(scale.x, 0.0, 0.0), quat);
+    vec3 ax1 = q_rotate(vec3(0.0, scale.y, 0.0), quat);
+    vec3 ax2 = q_rotate(vec3(0.0, 0.0, scale.z), quat);
 
-    float z = center_view.z;
-    if (z > -0.01) {
-        // Behind or too close to the camera: push offscreen so the quad clips.
-        POSITION = vec4(0.0, 0.0, 100.0, 1.0);
-    } else {
-        // Local covariance -> view space (upper-left 3x3 of view * model).
-        mat3 view_linear = mat3(VIEW_MATRIX[0].xyz, VIEW_MATRIX[1].xyz, VIEW_MATRIX[2].xyz);
-        mat3 model_linear = mat3(MODEL_MATRIX[0].xyz, MODEL_MATRIX[1].xyz, MODEL_MATRIX[2].xyz);
-        mat3 W = view_linear * model_linear;
-        mat3 cov_view = W * cov3d * transpose(W);
-
-        // Jacobian of the perspective projection (focal lengths in pixels). The
-        // perspective terms go in the third column (column-major construction).
-        vec2 vp = VIEWPORT_SIZE;
-        float fx = PROJECTION_MATRIX[0][0] * vp.x * 0.5;
-        float fy = PROJECTION_MATRIX[1][1] * vp.y * 0.5;
-        mat3 jacobian = mat3(
-            vec3(fx / z, 0.0, 0.0),
-            vec3(0.0, fy / z, 0.0),
-            vec3(-(fx * center_view.x) / (z * z), -(fy * center_view.y) / (z * z), 0.0));
-        mat3 cov2d = jacobian * cov_view * transpose(jacobian);
-
-        // Dilate slightly so sub-pixel splats stay visible (anti-aliasing).
-        float a = cov2d[0][0] + 0.3;
-        float b = cov2d[0][1];
-        float d = cov2d[1][1] + 0.3;
-
-        // Eigenvalues -> screen-space major/minor axes (pixels).
-        float mid = 0.5 * (a + d);
-        float disc = sqrt(max(mid * mid - (a * d - b * b), 0.0));
-        float lambda1 = mid + disc;
-        float lambda2 = max(mid - disc, 0.0);
-        vec2 axis_dir = normalize(vec2(b, lambda1 - a) + vec2(1e-6, 0.0));
-        vec2 major_axis = min(sqrt(2.0 * lambda1), 1024.0) * axis_dir;
-        vec2 minor_axis = min(sqrt(2.0 * lambda2), 1024.0) * vec2(axis_dir.y, -axis_dir.x);
-
-        // Frustum cull: if the footprint lies entirely outside the viewport in X
-        // or Y, push the splat offscreen so its quad clips (skips the overdraw).
-        // The quad corner reaches +/-2, so the footprint radius is 2 * major axis.
-        vec2 ndc = center_clip.xy / center_clip.w;
-        vec2 margin = vec2(4.0 * length(major_axis)) / vp;
-        if (ndc.x - margin.x > 1.0 || ndc.x + margin.x < -1.0
-            || ndc.y - margin.y > 1.0 || ndc.y + margin.y < -1.0) {
-            POSITION = vec4(0.0, 0.0, 100.0, 1.0);
+    bool valid = center_clip.w > DIV_EPS;
+    vec2 ell_center = vec2(0.0);
+    vec2 ell_axis = vec2(1.0, 0.0);
+    vec2 ell_size = vec2(0.0);
+    if (valid) {
+        vec2 cndc = center_clip.xy / center_clip.w;
+        vec4 ac0 = mvp * vec4(ax0, 0.0);
+        vec4 ac1 = mvp * vec4(ax1, 0.0);
+        vec4 ac2 = mvp * vec4(ax2, 0.0);
+        vec3 HX = vec3(ac0.x - cndc.x * ac0.w, ac1.x - cndc.x * ac1.w, ac2.x - cndc.x * ac2.w);
+        vec3 HY = vec3(ac0.y - cndc.y * ac0.w, ac1.y - cndc.y * ac1.w, ac2.y - cndc.y * ac2.w);
+        vec3 HW = vec3(ac0.w, ac1.w, ac2.w);
+        float c00 = dot(HX, HX);
+        float c01 = dot(HX, HY);
+        float c11 = dot(HY, HY);
+        float c02 = dot(HX, HW);
+        float c12 = dot(HY, HW);
+        float c22 = dot(HW, HW) - center_clip.w * center_clip.w;
+        if (c22 > 0.0) { c00 = -c00; c01 = -c01; c11 = -c11; c02 = -c02; c12 = -c12; c22 = -c22; }
+        if (abs(c22) <= DIV_EPS) {
+            valid = false;
         } else {
-            // Expand the quad corner along the projected ellipse axes, in clip space.
-            vec2 screen_offset = v_corner.x * major_axis + v_corner.y * minor_axis;
-            vec2 clip_offset = (screen_offset / vp) * 2.0 * center_clip.w;
-            POSITION = center_clip + vec4(clip_offset, 0.0, 0.0);
+            float invC22 = 1.0 / c22;
+            float invS = -invC22;
+            vec2 localCenter = vec2(c02, c12) * invC22;
+            float covXX = (c00 - c02 * c02 * invC22) * invS;
+            float covXY = (c01 - c02 * c12 * invC22) * invS;
+            float covYY = (c11 - c12 * c12 * invC22) * invS;
+            float trace = covXX + covYY;
+            float diff = covXX - covYY;
+            float discr = sqrt(max(diff * diff + 4.0 * covXY * covXY, 0.0));
+            float lMaj = 0.5 * (trace + discr);
+            float lMin = 0.5 * (trace - discr);
+            if (lMaj <= 0.0 || lMin <= 0.0) {
+                valid = false;
+            } else {
+                ell_axis = (abs(covXY) + abs(lMaj - covXX) > DIV_EPS)
+                    ? normalize(vec2(covXY, lMaj - covXX)) : vec2(1.0, 0.0);
+                ell_center = cndc + localCenter;
+                ell_size = sqrt(vec2(lMaj, lMin));
+            }
         }
+    }
+
+    // Reject non-finite / degenerate results (NaN fails the > comparisons).
+    if (!(ell_size.x > 0.0) || !(ell_size.y > 0.0)
+        || !(abs(ell_center.x) < 1.0e4) || !(abs(ell_center.y) < 1.0e4)) {
+        valid = false;
+    }
+
+    // --- Energy-preserving antialiasing: clamp the footprint to a minimum screen
+    // size and dim alpha by the area ratio so sub-pixel splats stay visible without
+    // over-brightening. Replaces the fixed covariance dilation. (GS.cginc.)
+    vec2 half_px = VIEWPORT_SIZE * 0.5;            // 1 NDC unit == half_px pixels
+    vec2 size_px = ell_size * half_px;
+    vec2 size_aa = max(size_px, vec2(SPLAT_MIN_STD_PX));
+    float area_scale = (size_px.x * size_px.y) / max(size_aa.x * size_aa.y, DIV_EPS);
+    v_color.a *= area_scale;
+    size_aa = min(size_aa, vec2(SPLAT_MAX_STD_PX));
+    ell_size = size_aa / half_px;
+
+    // Frustum cull: if the footprint is entirely off-viewport, collapse the quad.
+    float reach = 2.0 * 1.41421356 * max(ell_size.x, ell_size.y);  // |UV|<=2, sqrt(2) sigma map
+    if (!valid
+        || ell_center.x - reach > 1.0 || ell_center.x + reach < -1.0
+        || ell_center.y - reach > 1.0 || ell_center.y + reach < -1.0) {
+        POSITION = vec4(2.0, 2.0, 2.0, 1.0);   // degenerate / clipped
+    } else {
+        // Stretch the quad corner along the ellipse axes. The sqrt(2) maps UV (in
+        // [-2,2]) to standard-deviation units so the fragment's exp(-|UV|^2) equals
+        // the true anisotropic Gaussian exp(-0.5 * mahalanobis^2).
+        mat2 rot = mat2(vec2(ell_axis.x, ell_axis.y), vec2(-ell_axis.y, ell_axis.x));
+        vec2 ndc = ell_center + rot * (v_corner * ell_size * 1.41421356);
+
+        // Per-corner depth: depth of the Gaussian peak along the view ray through
+        // this corner (ray vs ellipsoid, metric closest approach). Writes
+        // POSITION.z only (keeps early-z; no fragment DEPTH). Falls back to the
+        // splat-center depth. (GS.cginc GSTryGetRaySplatDepth.)
+        float depth = center_clip.z / center_clip.w;
+        vec3 cam_w = INV_VIEW_MATRIX[3].xyz;
+        vec3 center_w = (MODEL_MATRIX * vec4(center, 1.0)).xyz;
+        vec3 a0w = (MODEL_MATRIX * vec4(ax0, 0.0)).xyz;
+        vec3 a1w = (MODEL_MATRIX * vec4(ax1, 0.0)).xyz;
+        vec3 a2w = (MODEL_MATRIX * vec4(ax2, 0.0)).xyz;
+        // Inverse of A = [a0w a1w a2w] via cofactor rows (maps world -> unit space).
+        vec3 cof0 = cross(a1w, a2w);
+        vec3 cof1 = cross(a2w, a0w);
+        vec3 cof2 = cross(a0w, a1w);
+        float det = dot(a0w, cof0);
+        if (abs(det) > DIV_EPS) {
+            vec4 vdir = INV_PROJECTION_MATRIX * vec4(ndc, 1.0, 1.0);
+            vec3 dir_w = normalize(mat3(INV_VIEW_MATRIX) * (vdir.xyz / vdir.w));
+            float inv_det = 1.0 / det;
+            vec3 oc = cam_w - center_w;
+            vec3 m = vec3(dot(cof0, oc), dot(cof1, oc), dot(cof2, oc)) * inv_det;
+            vec3 d = vec3(dot(cof0, dir_w), dot(cof1, dir_w), dot(cof2, dir_w)) * inv_det;
+            float dd = dot(d, d);
+            if (dd > DIV_EPS) {
+                float t = -dot(m, d) / dd;
+                if (t > DIV_EPS) {
+                    vec4 hit_clip = PROJECTION_MATRIX * VIEW_MATRIX * vec4(cam_w + dir_w * t, 1.0);
+                    if (hit_clip.w > DIV_EPS) {
+                        depth = clamp(hit_clip.z / hit_clip.w, 0.0, 1.0);
+                    }
+                }
+            }
+        }
+        POSITION = vec4(ndc, depth, 1.0);
     }
 }
 
@@ -2007,29 +2086,45 @@ fn pack_raw(
     for slot in 0..point_count {
         let off = slot * stride;
         let center = [slice[off], slice[off + 1], slice[off + 2]];
-        let cov = covariance_upper_triangle(
-            [
-                slice[off + 3],
-                slice[off + 4],
-                slice[off + 5],
-                slice[off + 6],
-            ],
-            [
-                slice[off + 7] * scale_multiplier,
-                slice[off + 8] * scale_multiplier,
-                slice[off + 9] * scale_multiplier,
-            ],
+        // Normalize the rotation quaternion (xyzw); fall back to identity if degenerate.
+        let (mut qx, mut qy, mut qz, mut qw) = (
+            slice[off + 3],
+            slice[off + 4],
+            slice[off + 5],
+            slice[off + 6],
         );
+        let qlen = (qx * qx + qy * qy + qz * qz + qw * qw).sqrt();
+        if qlen > 1.0e-12 {
+            let inv = 1.0 / qlen;
+            qx *= inv;
+            qy *= inv;
+            qz *= inv;
+            qw *= inv;
+        } else {
+            qx = 0.0;
+            qy = 0.0;
+            qz = 0.0;
+            qw = 1.0;
+        }
+        let sx = slice[off + 7] * scale_multiplier;
+        let sy = slice[off + 8] * scale_multiplier;
+        let sz = slice[off + 9] * scale_multiplier;
         let base = slot * texels_per_splat * 4;
+        // Layout per splat (4 RGBA-float texels), read back by SPLAT_TEXTURE_SHADER:
+        //   texel0 = center.xyz, scale.x
+        //   texel1 = scale.y, scale.z, quat.x, quat.y
+        //   texel2 = quat.z, quat.w, 0, 0
+        //   texel3 = color.rgba
         data[base] = center[0];
         data[base + 1] = center[1];
         data[base + 2] = center[2];
-        data[base + 4] = cov[0];
-        data[base + 5] = cov[1];
-        data[base + 6] = cov[2];
-        data[base + 7] = cov[3];
-        data[base + 8] = cov[4];
-        data[base + 9] = cov[5];
+        data[base + 3] = sx;
+        data[base + 4] = sy;
+        data[base + 5] = sz;
+        data[base + 6] = qx;
+        data[base + 7] = qy;
+        data[base + 8] = qz;
+        data[base + 9] = qw;
         data[base + 12] = slice[off + 14];
         data[base + 13] = slice[off + 15];
         data[base + 14] = slice[off + 16];
@@ -2076,51 +2171,6 @@ fn raw_to_render(raw: RawRenderData) -> SplatRenderData {
         ),
         sh_degree: raw.sh_degree,
     }
-}
-
-// Build the upper triangle [xx, xy, xz, yy, yz, zz] of the 3D covariance
-// Sigma = R * S^2 * R^T from a normalized rotation quaternion (xyzw) and the
-// per-axis scale (linear standard deviation).
-fn covariance_upper_triangle(quat: [f32; 4], scale: [f32; 3]) -> [f32; 6] {
-    let [qx, qy, qz, qw] = quat;
-    let [sx, sy, sz] = scale;
-
-    // Rotation matrix columns from the quaternion.
-    let r = [
-        [
-            1.0 - 2.0 * (qy * qy + qz * qz),
-            2.0 * (qx * qy + qw * qz),
-            2.0 * (qx * qz - qw * qy),
-        ],
-        [
-            2.0 * (qx * qy - qw * qz),
-            1.0 - 2.0 * (qx * qx + qz * qz),
-            2.0 * (qy * qz + qw * qx),
-        ],
-        [
-            2.0 * (qx * qz + qw * qy),
-            2.0 * (qy * qz - qw * qx),
-            1.0 - 2.0 * (qx * qx + qy * qy),
-        ],
-    ];
-
-    // M = R * diag(scale); columns of R scaled by the matching axis scale.
-    let m = [
-        [r[0][0] * sx, r[1][0] * sy, r[2][0] * sz],
-        [r[0][1] * sx, r[1][1] * sy, r[2][1] * sz],
-        [r[0][2] * sx, r[1][2] * sy, r[2][2] * sz],
-    ];
-
-    // Sigma = M * M^T (symmetric).
-    let dot = |a: usize, b: usize| m[a][0] * m[b][0] + m[a][1] * m[b][1] + m[a][2] * m[b][2];
-    [
-        dot(0, 0),
-        dot(0, 1),
-        dot(0, 2),
-        dot(1, 1),
-        dot(1, 2),
-        dot(2, 2),
-    ]
 }
 
 // Compile one GLSL compute shader on the given device, returning its shader RID.
