@@ -1,0 +1,14 @@
+[gd_scene format=3 uid="uid://53jmr3rsbsgk"]
+
+[ext_resource type="Script" uid="uid://0d4q27nps5kd" path="res://demo/minimal_demo.gd" id="1_0a2m0"]
+[ext_resource type="Script" uid="uid://bxb8ywy3qsuyd" path="res://demo/orbit_camera.gd" id="2_orbit"]
+
+[node name="MinimalDemo" type="Node3D" unique_id=383747317]
+script = ExtResource("1_0a2m0")
+splat_render_profile = 3
+splat_depth_mode_override = "center"
+
+[node name="OrbitCamera" type="Camera3D" parent="." unique_id=718758821]
+script = ExtResource("2_orbit")
+orbit_speed = 10.0
+distance_ratio = 0.1

@@ -1,0 +1,19 @@
+[configuration]
+entry_symbol = "gdext_rust_init"
+compatibility_minimum = "4.5"
+reloadable = true
+
+[libraries]
+windows.debug.x86_64 = "res://target/debug/godot_gsplat.dll"
+windows.release.x86_64 = "res://target/release/godot_gsplat.dll"
+linux.debug.x86_64 = "res://target/debug/libgodot_gsplat.so"
+linux.release.x86_64 = "res://target/release/libgodot_gsplat.so"
+macos.debug.arm64 = "res://target/debug/libgodot_gsplat.dylib"
+macos.release.arm64 = "res://target/release/libgodot_gsplat.dylib"
+macos.debug.x86_64 = "res://target/debug/libgodot_gsplat.dylib"
+macos.release.x86_64 = "res://target/release/libgodot_gsplat.dylib"
+; On-device (Quest) testing always uses the release .so — an unoptimized
+; debug build is far too slow for splat decoding/packing on mobile.
+; Build with: cargo ndk -t arm64-v8a build --release
+android.debug.arm64 = "res://target/aarch64-linux-android/release/libgodot_gsplat.so"
+android.release.arm64 = "res://target/aarch64-linux-android/release/libgodot_gsplat.so"
