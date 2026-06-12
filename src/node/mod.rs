@@ -506,6 +506,15 @@ impl GaussianSplatNode3D {
         self.backend_state.revision
     }
 
+    // Whether the splat material currently samples the GPU sort order. False
+    // while the sort is (re)building — splats render unsorted and blend
+    // incorrectly then — and stays false on platforms without a
+    // RenderingDevice. Lets loading UI wait for a stable image.
+    #[func]
+    pub fn is_depth_sorted(&self) -> bool {
+        self.backend.sort.enabled_in_shader
+    }
+
     #[func]
     pub fn export_runtime_state(&self) -> VarDictionary {
         let mut dict = VarDictionary::new();
