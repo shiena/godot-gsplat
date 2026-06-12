@@ -1,0 +1,24 @@
+# Rust
+/target/
+Cargo.lock
+
+# Godot
+.godot/
+*.import
+demo/addons/
+
+# Build artifacts
+*.dll
+*.so
+*.dylib
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
