@@ -2,7 +2,7 @@ use godot::classes::GltfState;
 use godot::prelude::*;
 
 use crate::import_state::{
-    ImportedSplatMetadata, FALLBACK_NONE, GLTF_STATE_KEY, PAYLOAD_LAYOUT_V1,
+    DecodedSplatData, ImportedSplatMetadata, FALLBACK_NONE, GLTF_STATE_KEY, PAYLOAD_LAYOUT_V1,
 };
 
 #[derive(GodotClass)]
@@ -46,6 +46,21 @@ impl GaussianSplatAsset {
         self.apply_import_metadata(metadata);
         self.payload = build_placeholder_payload(&self.metadata);
         self.local_aabb = Aabb::default();
+        self.base_mut().emit_changed();
+    }
+
+    #[func]
+    pub fn initialize_from_decoded(
+        &mut self,
+        metadata: VarDictionary,
+        payload: PackedByteArray,
+        payload_layout: GString,
+        local_aabb: Aabb,
+    ) {
+        self.apply_import_metadata(metadata);
+        self.payload = payload;
+        self.payload_layout = payload_layout;
+        self.local_aabb = local_aabb;
         self.base_mut().emit_changed();
     }
 
@@ -123,6 +138,14 @@ impl GaussianSplatAsset {
             let dict = self.metadata.to_dictionary();
             state.set_additional_data(GLTF_STATE_KEY, &Variant::from(dict));
         }
+    }
+
+    pub fn apply_decoded_data(&mut self, decoded: DecodedSplatData) {
+        self.point_count = decoded.point_count.max(0);
+        self.payload = decoded.payload;
+        self.payload_layout = decoded.payload_layout;
+        self.local_aabb = decoded.local_aabb;
+        self.base_mut().emit_changed();
     }
 }
 
