@@ -6,12 +6,11 @@ pub struct GaussianSplatCloudSettings {
     #[base]
     base: Base<Resource>,
 
-    debug_point_size: f32,
-    debug_visible: bool,
-    debug_fallback_enabled: bool,
+    splat_visible: bool,
+    render_enabled: bool,
     gaussian_scale_multiplier: f32,
-    max_debug_splat_radius: f32,
-    max_debug_splats: i32,
+    max_preview_splat_radius: f32,
+    max_preview_splats: i32,
     // Spherical-harmonics degree (0-3) to evaluate for view-dependent color. Capped
     // at the degree the source glTF actually provides.
     sh_degree: i32,
@@ -22,15 +21,14 @@ impl IResource for GaussianSplatCloudSettings {
     fn init(base: Base<Resource>) -> Self {
         Self {
             base,
-            debug_point_size: 24.0,
-            debug_visible: true,
-            debug_fallback_enabled: true,
+            splat_visible: true,
+            render_enabled: true,
             gaussian_scale_multiplier: 1.0,
-            max_debug_splat_radius: 0.02,
+            max_preview_splat_radius: 0.02,
             // i32::MAX = "show every splat"; the node clamps it to the asset's
             // point count once an asset is bound, so a raw glTF loaded at runtime
             // (no .import) previews all of its points.
-            max_debug_splats: i32::MAX,
+            max_preview_splats: i32::MAX,
             sh_degree: 3,
         }
     }
@@ -39,35 +37,24 @@ impl IResource for GaussianSplatCloudSettings {
 #[godot_api]
 impl GaussianSplatCloudSettings {
     #[func]
-    pub fn get_debug_point_size(&self) -> f32 {
-        self.debug_point_size
+    pub fn is_splat_visible(&self) -> bool {
+        self.splat_visible
     }
 
     #[func]
-    pub fn set_debug_point_size(&mut self, debug_point_size: f32) {
-        self.debug_point_size = debug_point_size.max(1.0);
+    pub fn set_splat_visible(&mut self, splat_visible: bool) {
+        self.splat_visible = splat_visible;
         self.base_mut().emit_changed();
     }
 
     #[func]
-    pub fn is_debug_visible(&self) -> bool {
-        self.debug_visible
+    pub fn is_render_enabled(&self) -> bool {
+        self.render_enabled
     }
 
     #[func]
-    pub fn set_debug_visible(&mut self, debug_visible: bool) {
-        self.debug_visible = debug_visible;
-        self.base_mut().emit_changed();
-    }
-
-    #[func]
-    pub fn is_debug_fallback_enabled(&self) -> bool {
-        self.debug_fallback_enabled
-    }
-
-    #[func]
-    pub fn set_debug_fallback_enabled(&mut self, debug_fallback_enabled: bool) {
-        self.debug_fallback_enabled = debug_fallback_enabled;
+    pub fn set_render_enabled(&mut self, render_enabled: bool) {
+        self.render_enabled = render_enabled;
         self.base_mut().emit_changed();
     }
 
@@ -83,24 +70,24 @@ impl GaussianSplatCloudSettings {
     }
 
     #[func]
-    pub fn get_max_debug_splat_radius(&self) -> f32 {
-        self.max_debug_splat_radius
+    pub fn get_max_preview_splat_radius(&self) -> f32 {
+        self.max_preview_splat_radius
     }
 
     #[func]
-    pub fn set_max_debug_splat_radius(&mut self, max_debug_splat_radius: f32) {
-        self.max_debug_splat_radius = max_debug_splat_radius.max(0.001);
+    pub fn set_max_preview_splat_radius(&mut self, max_preview_splat_radius: f32) {
+        self.max_preview_splat_radius = max_preview_splat_radius.max(0.001);
         self.base_mut().emit_changed();
     }
 
     #[func]
-    pub fn get_max_debug_splats(&self) -> i32 {
-        self.max_debug_splats
+    pub fn get_max_preview_splats(&self) -> i32 {
+        self.max_preview_splats
     }
 
     #[func]
-    pub fn set_max_debug_splats(&mut self, max_debug_splats: i32) {
-        self.max_debug_splats = max_debug_splats.max(0);
+    pub fn set_max_preview_splats(&mut self, max_preview_splats: i32) {
+        self.max_preview_splats = max_preview_splats.max(0);
         self.base_mut().emit_changed();
     }
 
@@ -116,13 +103,12 @@ impl GaussianSplatCloudSettings {
     }
 
     #[func]
-    pub fn apply_debug_defaults(&mut self) {
-        self.debug_point_size = 24.0;
-        self.debug_visible = true;
-        self.debug_fallback_enabled = true;
+    pub fn apply_defaults(&mut self) {
+        self.splat_visible = true;
+        self.render_enabled = true;
         self.gaussian_scale_multiplier = 1.0;
-        self.max_debug_splat_radius = 0.02;
-        self.max_debug_splats = i32::MAX;
+        self.max_preview_splat_radius = 0.02;
+        self.max_preview_splats = i32::MAX;
         self.sh_degree = 3;
         self.base_mut().emit_changed();
     }

@@ -572,7 +572,7 @@ pub struct GaussianSplatNode3D {
     transform_state: NodeTransformState,
     visibility_state: NodeVisibilityState,
     backend_state: NodeBackendState,
-    debug_mesh_instance: Option<Gd<MultiMeshInstance3D>>,
+    splat_multimesh: Option<Gd<MultiMeshInstance3D>>,
     sort: SortGpu,
     chunk_runtime: Option<ChunkRuntime>,
     // Backing storage for the `render_profile` export (PhantomVar holds no state).
@@ -742,7 +742,7 @@ impl GaussianSplatNode3D {
         self.asset = None;
         self.metadata = ImportedSplatMetadata::default();
         self.is_bound = false;
-        self.clear_debug_mesh();
+        self.clear_splat_multimesh();
         self.sync_node_name();
     }
 
@@ -794,7 +794,7 @@ impl GaussianSplatNode3D {
         self.cloud_settings = cloud_settings;
         self.ensure_cloud_settings();
         self.mark_backend_dirty("cloud_settings");
-        self.rebuild_debug_mesh();
+        self.rebuild_splat_multimesh();
     }
 
     #[func]
@@ -806,7 +806,7 @@ impl GaussianSplatNode3D {
     pub fn get_preview_max_splats(&self) -> i32 {
         self.cloud_settings
             .as_ref()
-            .map(|settings| settings.bind().get_max_debug_splats())
+            .map(|settings| settings.bind().get_max_preview_splats())
             .unwrap_or(i32::MAX)
     }
 
@@ -819,10 +819,10 @@ impl GaussianSplatNode3D {
         self.ensure_cloud_settings();
         let max_splats = self.clamp_preview_max_splats(max_splats);
         if let Some(settings) = &mut self.cloud_settings {
-            settings.bind_mut().set_max_debug_splats(max_splats);
+            settings.bind_mut().set_max_preview_splats(max_splats);
         }
         self.mark_backend_dirty("preview_max_splats");
-        self.rebuild_debug_mesh();
+        self.rebuild_splat_multimesh();
     }
 
     #[func]
@@ -844,14 +844,14 @@ impl GaussianSplatNode3D {
             settings.bind_mut().set_sh_degree(sh_degree);
         }
         self.mark_backend_dirty("sh_degree");
-        self.rebuild_debug_mesh();
+        self.rebuild_splat_multimesh();
     }
 
     #[func]
     pub fn get_preview_max_splat_radius(&self) -> f32 {
         self.cloud_settings
             .as_ref()
-            .map(|settings| settings.bind().get_max_debug_splat_radius())
+            .map(|settings| settings.bind().get_max_preview_splat_radius())
             .unwrap_or(0.02)
     }
 
@@ -861,10 +861,10 @@ impl GaussianSplatNode3D {
         if let Some(settings) = &mut self.cloud_settings {
             settings
                 .bind_mut()
-                .set_max_debug_splat_radius(max_splat_radius);
+                .set_max_preview_splat_radius(max_splat_radius);
         }
         self.mark_backend_dirty("preview_max_splat_radius");
-        self.rebuild_debug_mesh();
+        self.rebuild_splat_multimesh();
     }
 
     #[func]
@@ -884,7 +884,7 @@ impl GaussianSplatNode3D {
                 .set_gaussian_scale_multiplier(scale_multiplier);
         }
         self.mark_backend_dirty("preview_scale_multiplier");
-        self.rebuild_debug_mesh();
+        self.rebuild_splat_multimesh();
     }
 
     #[func]
@@ -1039,7 +1039,7 @@ impl GaussianSplatNode3D {
         }
         self.mark_backend_dirty("asset");
         self.refresh_chunk_runtime();
-        self.rebuild_debug_mesh();
+        self.rebuild_splat_multimesh();
         self.sync_runtime_state();
         self.sync_node_name();
     }
@@ -1077,7 +1077,7 @@ impl GaussianSplatNode3D {
     fn clamp_preview_settings_to_asset(&mut self) {
         let max_splats = self.clamp_preview_max_splats(self.get_preview_max_splats());
         if let Some(settings) = &mut self.cloud_settings {
-            settings.bind_mut().set_max_debug_splats(max_splats);
+            settings.bind_mut().set_max_preview_splats(max_splats);
         }
     }
 
@@ -1111,42 +1111,42 @@ impl GaussianSplatNode3D {
         self.base_mut().set_name(name.as_str());
     }
 
-    fn ensure_debug_mesh_instance(&mut self) {
-        if self.debug_mesh_instance.is_some() {
+    fn ensure_splat_multimesh(&mut self) {
+        if self.splat_multimesh.is_some() {
             return;
         }
 
         let mut mesh_instance = MultiMeshInstance3D::new_alloc();
-        mesh_instance.set_name("DebugPointCloud");
+        mesh_instance.set_name("SplatMultiMesh");
         self.base_mut()
             .add_child(&mesh_instance.clone().upcast::<Node>());
-        self.debug_mesh_instance = Some(mesh_instance);
+        self.splat_multimesh = Some(mesh_instance);
     }
 
-    fn clear_debug_mesh(&mut self) {
-        if let Some(mesh_instance) = &mut self.debug_mesh_instance {
+    fn clear_splat_multimesh(&mut self) {
+        if let Some(mesh_instance) = &mut self.splat_multimesh {
             mesh_instance.set_visible(false);
         }
     }
 
-    fn rebuild_debug_mesh(&mut self) {
+    fn rebuild_splat_multimesh(&mut self) {
         let Some(asset) = self.asset.clone() else {
-            self.clear_debug_mesh();
+            self.clear_splat_multimesh();
             return;
         };
         let cloud_settings = self.cloud_settings.clone();
 
         if !cloud_settings
             .as_ref()
-            .map(|settings| settings.bind().is_debug_fallback_enabled())
+            .map(|settings| settings.bind().is_render_enabled())
             .unwrap_or(false)
         {
-            self.clear_debug_mesh();
+            self.clear_splat_multimesh();
             return;
         }
 
         let Some(render) = self.build_splat_render_data(&asset, cloud_settings.as_ref()) else {
-            self.clear_debug_mesh();
+            self.clear_splat_multimesh();
             return;
         };
 
@@ -1167,16 +1167,16 @@ impl GaussianSplatNode3D {
             ImageFormat::RGBAF,
             &render.data_bytes,
         ) else {
-            self.clear_debug_mesh();
+            self.clear_splat_multimesh();
             return;
         };
         let Some(data_texture) = ImageTexture::create_from_image(&image) else {
-            self.clear_debug_mesh();
+            self.clear_splat_multimesh();
             return;
         };
 
-        self.ensure_debug_mesh_instance();
-        let Some(mesh_instance) = &mut self.debug_mesh_instance else {
+        self.ensure_splat_multimesh();
+        let Some(mesh_instance) = &mut self.splat_multimesh else {
             return;
         };
 
@@ -1258,7 +1258,7 @@ impl GaussianSplatNode3D {
         mesh_instance.set_visible(
             cloud_settings
                 .as_ref()
-                .map(|settings| settings.bind().is_debug_visible())
+                .map(|settings| settings.bind().is_splat_visible())
                 .unwrap_or(true),
         );
 
@@ -1305,7 +1305,7 @@ impl GaussianSplatNode3D {
                 };
                 let source_point_count = values.len() / POINT_STRIDE_FLOATS;
                 let max_splats = cloud_settings
-                    .map(|settings| settings.bind().get_max_debug_splats().max(0) as usize)
+                    .map(|settings| settings.bind().get_max_preview_splats().max(0) as usize)
                     .unwrap_or(usize::MAX);
                 let point_count = source_point_count.min(max_splats);
                 if point_count == 0 {
@@ -1419,7 +1419,7 @@ impl GaussianSplatNode3D {
     fn active_budget(&self) -> i32 {
         self.cloud_settings
             .as_ref()
-            .map(|settings| settings.bind().get_max_debug_splats().max(0))
+            .map(|settings| settings.bind().get_max_preview_splats().max(0))
             .unwrap_or(i32::MAX)
     }
 
@@ -1513,14 +1513,14 @@ impl GaussianSplatNode3D {
     // from a pre-imported .scn (the field itself is not serialized). A baked mesh
     // means there is renderable data even without a live asset.
     fn adopt_serialized_render(&mut self) {
-        if self.debug_mesh_instance.is_some() {
+        if self.splat_multimesh.is_some() {
             return;
         }
         for child in self.base().get_children().iter_shared() {
             if let Ok(mesh_instance) = child.try_cast::<MultiMeshInstance3D>() {
                 if mesh_instance.get_multimesh().is_some() {
                     self.visibility_state.asset_ready = true;
-                    self.debug_mesh_instance = Some(mesh_instance);
+                    self.splat_multimesh = Some(mesh_instance);
                     return;
                 }
             }
@@ -1940,7 +1940,7 @@ impl GaussianSplatNode3D {
     }
 
     fn splat_material(&self) -> Option<Gd<ShaderMaterial>> {
-        self.debug_mesh_instance
+        self.splat_multimesh
             .as_ref()
             .and_then(|mesh_instance| mesh_instance.get_material_override())
             .and_then(|material| material.try_cast::<ShaderMaterial>().ok())
