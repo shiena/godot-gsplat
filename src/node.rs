@@ -18,7 +18,6 @@ use crate::backend::{
 };
 use crate::cloud_settings::GaussianSplatCloudSettings;
 use crate::import_state::{ImportedSplatMetadata, NODE_STATE_KEY, POINT_STRIDE_FLOATS};
-use crate::render_packet::GaussianSplatRenderPacket;
 
 // Texture-driven anisotropic Gaussian splat shader (Step 1 render path). Per-splat
 // data (center, packed 3D covariance upper triangle, color) lives in `data_tex`,
@@ -449,7 +448,6 @@ pub struct GaussianSplatNode3D {
     asset: Option<Gd<GaussianSplatAsset>>,
     cloud_settings: Option<Gd<GaussianSplatCloudSettings>>,
     backend_settings: Option<Gd<GaussianSplatBackendSettings>>,
-    render_packet: Option<Gd<GaussianSplatRenderPacket>>,
     #[var(get, set)]
     #[export]
     render_profile: PhantomVar<RenderProfile>,
@@ -587,7 +585,6 @@ impl GaussianSplatNode3D {
         self.asset = None;
         self.metadata = ImportedSplatMetadata::default();
         self.is_bound = false;
-        self.clear_render_packet();
         self.clear_debug_mesh();
         self.sync_node_name();
     }
@@ -742,17 +739,11 @@ impl GaussianSplatNode3D {
         self.ensure_backend_settings();
         self.backend_state.profile_hint = self.resolve_backend_pipeline();
         self.mark_backend_dirty("backend_settings");
-        self.refresh_render_packet();
     }
 
     #[func]
     pub fn get_backend_settings(&self) -> Option<Gd<GaussianSplatBackendSettings>> {
         self.backend_settings.clone()
-    }
-
-    #[func]
-    pub fn get_render_packet(&self) -> Option<Gd<GaussianSplatRenderPacket>> {
-        self.render_packet.clone()
     }
 
     #[func]
@@ -826,10 +817,6 @@ impl GaussianSplatNode3D {
                 &Variant::from(asset_ref.get_fallback_mode()),
             );
         }
-        if let Some(render_packet) = &self.render_packet {
-            let packet_ref = render_packet.bind();
-            dict.set("render_packet", &Variant::from(packet_ref.export_packet()));
-        }
         dict.set("preview_max_splats", self.get_preview_max_splats() as i64);
         dict.set(
             "preview_max_splat_radius",
@@ -853,7 +840,6 @@ impl GaussianSplatNode3D {
     fn refresh_from_asset(&mut self) {
         self.ensure_cloud_settings();
         self.ensure_backend_settings();
-        self.ensure_render_packet();
         if let Some(asset) = &self.asset {
             let asset = asset.clone();
             let asset_ref = asset.bind();
@@ -873,7 +859,6 @@ impl GaussianSplatNode3D {
             self.backend_state.profile_hint.clear();
         }
         self.mark_backend_dirty("asset");
-        self.refresh_render_packet();
         self.rebuild_debug_mesh();
         self.sync_runtime_state();
         self.sync_node_name();
@@ -909,12 +894,6 @@ impl GaussianSplatNode3D {
         }
     }
 
-    fn ensure_render_packet(&mut self) {
-        if self.render_packet.is_none() {
-            self.render_packet = Some(GaussianSplatRenderPacket::new_gd());
-        }
-    }
-
     fn clamp_preview_settings_to_asset(&mut self) {
         let max_splats = self.clamp_preview_max_splats(self.get_preview_max_splats());
         if let Some(settings) = &mut self.cloud_settings {
@@ -929,29 +908,6 @@ impl GaussianSplatNode3D {
             .map(|asset| asset.bind().get_point_count())
             .unwrap_or(0);
         max_splats.max(0).min(asset_point_count)
-    }
-
-    fn clear_render_packet(&mut self) {
-        if let Some(render_packet) = &mut self.render_packet {
-            render_packet.bind_mut().clear();
-        }
-    }
-
-    fn refresh_render_packet(&mut self) {
-        let Some(asset) = &self.asset else {
-            self.clear_render_packet();
-            return;
-        };
-        let Some(render_packet) = &mut self.render_packet else {
-            return;
-        };
-
-        let pipeline = self.backend_state.profile_hint.clone();
-        render_packet.bind_mut().prepare_from_asset(
-            asset,
-            pipeline.as_str(),
-            self.backend_state.revision,
-        );
     }
 
     fn resolve_backend_pipeline(&self) -> String {
