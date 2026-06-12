@@ -1,11 +1,12 @@
 use godot::classes::image::Format as ImageFormat;
 use godot::classes::mesh::{ArrayType, PrimitiveType};
+use godot::classes::multi_mesh::TransformFormat;
 use godot::classes::rendering_device::{
     DataFormat, ShaderLanguage, ShaderStage, TextureUsageBits, UniformType,
 };
 use godot::classes::GltfState;
 use godot::classes::{
-    ArrayMesh, Engine, Image, ImageTexture, MeshInstance3D, Node3D, RdShaderSource,
+    ArrayMesh, Engine, Image, ImageTexture, MultiMesh, MultiMeshInstance3D, Node3D, RdShaderSource,
     RdTextureFormat, RdTextureView, RdUniform, RenderingDevice, RenderingServer, Shader,
     ShaderMaterial, Texture2D, Texture2Drd, Viewport, XrServer,
 };
@@ -21,9 +22,10 @@ use crate::import_state::{ImportedSplatMetadata, NODE_STATE_KEY, POINT_STRIDE_FL
 
 // Texture-driven anisotropic Gaussian splat shader (Step 1 render path). Per-splat
 // data (center, packed 3D covariance upper triangle, color) lives in `data_tex`,
-// four RGBA-float texels per splat. The mesh is a static "slot" mesh: four
-// vertices per splat at the origin, UV = quad corner in [-2, 2], UV2.x = slot
-// index. Each slot resolves to a splat id via `sort_tex` when `sort_enabled`,
+// four RGBA-float texels per splat. The geometry is a single quad rendered via
+// MultiMesh (one instance per splat); the instance index (INSTANCE_ID) is the
+// slot, UV = quad corner in [-2, 2]. Each slot resolves to a splat id via
+// `sort_tex` when `sort_enabled`,
 // otherwise slot == id (unsorted, matching the Phase 1 look). The resolved splat's
 // covariance is projected to screen space with the perspective Jacobian and the
 // corner is stretched along the projected ellipse axes, so the on-screen footprint
@@ -47,7 +49,7 @@ varying vec4 v_color;
 
 void vertex() {
     v_corner = UV;
-    int slot = int(UV2.x + 0.5);
+    int slot = int(INSTANCE_ID);
     int splat_id = slot;
     if (sort_enabled > 0) {
         // VIEW_INDEX selects the per-eye sort order under multiview (VR). It is
@@ -143,15 +145,11 @@ void fragment() {
 const SPLAT_DATA_TEX_WIDTH: i32 = 4096;
 
 // CPU-built render data for the texture-driven splat path: the per-splat data
-// texture bytes plus the static slot mesh arrays.
+// texture bytes plus the per-splat sort-seed positions.
 struct SplatRenderData {
     data_bytes: PackedByteArray,
     tex_width: i32,
     tex_height: i32,
-    positions: PackedVector3Array,
-    uvs: PackedVector2Array,
-    uv2: PackedVector2Array,
-    indices: PackedInt32Array,
     // Local-space splat centers as vec4(x, y, z, 1) in slot order, used to seed
     // the GPU sort's positions storage buffer (Step 2).
     positions_ssbo: PackedByteArray,
@@ -474,7 +472,7 @@ pub struct GaussianSplatNode3D {
     transform_state: NodeTransformState,
     visibility_state: NodeVisibilityState,
     backend_state: NodeBackendState,
-    debug_mesh_instance: Option<Gd<MeshInstance3D>>,
+    debug_mesh_instance: Option<Gd<MultiMeshInstance3D>>,
     sort: SortGpu,
     // Backing storage for the `render_profile` export (PhantomVar holds no state).
     render_profile_value: RenderProfile,
@@ -976,7 +974,7 @@ impl GaussianSplatNode3D {
             return;
         }
 
-        let mut mesh_instance = MeshInstance3D::new_alloc();
+        let mut mesh_instance = MultiMeshInstance3D::new_alloc();
         mesh_instance.set_name("DebugPointCloud");
         self.base_mut()
             .add_child(&mesh_instance.clone().upcast::<Node>());
@@ -1031,31 +1029,63 @@ impl GaussianSplatNode3D {
             return;
         };
 
-        // Static slot mesh: four origin vertices per splat, expanded in the shader.
+        // Single quad rendered via MultiMesh, one instance per splat. The shader
+        // expands each instance's quad from `data_tex`, indexed by INSTANCE_ID.
+        let corners = [
+            Vector2::new(-2.0, -2.0),
+            Vector2::new(2.0, -2.0),
+            Vector2::new(2.0, 2.0),
+            Vector2::new(-2.0, 2.0),
+        ];
+        let quad_positions: Vec<Vector3> = corners
+            .iter()
+            .map(|c| Vector3::new(c.x, c.y, 0.0))
+            .collect();
+        let quad_uvs: Vec<Vector2> = corners.to_vec();
+        let quad_indices: Vec<i32> = vec![0, 1, 2, 0, 2, 3];
+
         let mut arrays = VarArray::new();
         for _ in 0..ArrayType::MAX.ord() {
             arrays.push(&Variant::nil());
         }
         arrays.set(
             ArrayType::VERTEX.ord() as usize,
-            &Variant::from(render.positions),
+            &Variant::from(PackedVector3Array::from(quad_positions)),
         );
-        arrays.set(ArrayType::TEX_UV.ord() as usize, &Variant::from(render.uvs));
         arrays.set(
-            ArrayType::TEX_UV2.ord() as usize,
-            &Variant::from(render.uv2),
+            ArrayType::TEX_UV.ord() as usize,
+            &Variant::from(PackedVector2Array::from(quad_uvs)),
         );
         arrays.set(
             ArrayType::INDEX.ord() as usize,
-            &Variant::from(render.indices),
+            &Variant::from(PackedInt32Array::from(quad_indices)),
         );
 
         let mut mesh = ArrayMesh::new_gd();
         mesh.add_surface_from_arrays_ex(PrimitiveType::TRIANGLES, &arrays)
             .done();
-        // Vertices sit at the origin and are expanded in the shader, so the mesh
-        // needs an explicit AABB covering the splat cloud to avoid frustum culling.
-        mesh.set_custom_aabb(render.aabb);
+
+        // One identity transform per splat: the shader positions each splat from
+        // the data texture, not from the instance transform, so transforms stay
+        // identity and the instance index is the slot.
+        let identity = [
+            1.0_f32, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0,
+        ];
+        let mut buffer = Vec::with_capacity(render.splat_count.max(0) as usize * 12);
+        for _ in 0..render.splat_count {
+            buffer.extend_from_slice(&identity);
+        }
+
+        let mut multimesh = MultiMesh::new_gd();
+        multimesh.set_transform_format(TransformFormat::TRANSFORM_3D);
+        multimesh.set_mesh(&mesh.upcast::<godot::classes::Mesh>());
+        multimesh.set_instance_count(render.splat_count);
+        multimesh.set_buffer(&PackedFloat32Array::from(buffer));
+        // The unit quad's own bounds do not cover the cloud and identity instance
+        // transforms keep them at the origin, so give the MultiMesh an explicit
+        // AABB. This drives `get_aabb()` for the editor import-preview auto-framing
+        // (and the demo orbit camera); runtime culling uses the instance override.
+        multimesh.set_custom_aabb(render.aabb);
 
         let mut shader = Shader::new_gd();
         shader.set_code(SPLAT_TEXTURE_SHADER);
@@ -1067,10 +1097,12 @@ impl GaussianSplatNode3D {
         // Step 1 renders unsorted (slot == id); the compute sort (Step 2) flips this on.
         material.set_shader_parameter("sort_enabled", &Variant::from(0_i32));
 
-        let mesh_resource = mesh.upcast::<godot::classes::Mesh>();
         let material_resource = material.upcast::<godot::classes::Material>();
-        mesh_instance.set_mesh(&mesh_resource);
+        mesh_instance.set_multimesh(&multimesh);
         mesh_instance.set_material_override(&material_resource);
+        // The unit quad's own bounds do not cover the cloud, so set an explicit
+        // AABB for frustum culling and the editor import-preview auto-framing.
+        mesh_instance.set_custom_aabb(render.aabb);
         mesh_instance.set_visible(
             cloud_settings
                 .as_ref()
@@ -1118,20 +1150,6 @@ impl GaussianSplatNode3D {
         let tex_height = (point_count * 4).div_ceil(tex_width).max(1);
         let mut data = vec![0.0_f32; tex_width * tex_height * 4];
 
-        // Quad corners in [-2, 2]; the vertex shader stretches them along the
-        // projected ellipse axes, so the corner doubles as the Gaussian sample
-        // coordinate (alpha = exp(-dot(corner, corner))).
-        let corners = [
-            Vector2::new(-2.0, -2.0),
-            Vector2::new(2.0, -2.0),
-            Vector2::new(2.0, 2.0),
-            Vector2::new(-2.0, 2.0),
-        ];
-
-        let mut positions = Vec::with_capacity(point_count * 4);
-        let mut uvs = Vec::with_capacity(point_count * 4);
-        let mut uv2 = Vec::with_capacity(point_count * 4);
-        let mut indices = Vec::with_capacity(point_count * 6);
         let mut positions_ssbo = Vec::with_capacity(point_count * 4);
 
         let mut min = Vector3::new(f32::INFINITY, f32::INFINITY, f32::INFINITY);
@@ -1179,21 +1197,6 @@ impl GaussianSplatNode3D {
             max.z = max.z.max(center.z);
 
             positions_ssbo.extend_from_slice(&[center.x, center.y, center.z, 1.0]);
-
-            // The shader positions each splat from the data texture, not from
-            // VERTEX, so the vertex value is otherwise unused. Place it at the
-            // splat center anyway so the mesh's vertex AABB covers the cloud — the
-            // editor's import-preview auto-framing uses that AABB (it ignores
-            // `custom_aabb`), and origin vertices would frame an empty point.
-            let slot_coord = Vector2::new(slot as f32, 0.0);
-            for corner in corners {
-                positions.push(center);
-                uvs.push(corner);
-                uv2.push(slot_coord);
-            }
-
-            let quad = (slot * 4) as i32;
-            indices.extend_from_slice(&[quad, quad + 1, quad + 2, quad, quad + 2, quad + 3]);
         }
 
         let size = max - min;
@@ -1204,10 +1207,6 @@ impl GaussianSplatNode3D {
             data_bytes: PackedFloat32Array::from(data).to_byte_array(),
             tex_width: tex_width as i32,
             tex_height: tex_height as i32,
-            positions: PackedVector3Array::from(positions),
-            uvs: PackedVector2Array::from(uvs),
-            uv2: PackedVector2Array::from(uv2),
-            indices: PackedInt32Array::from(indices),
             positions_ssbo: PackedFloat32Array::from(positions_ssbo).to_byte_array(),
             splat_count: point_count as i32,
             aabb,
@@ -1222,8 +1221,8 @@ impl GaussianSplatNode3D {
             return;
         }
         for child in self.base().get_children().iter_shared() {
-            if let Ok(mesh_instance) = child.try_cast::<MeshInstance3D>() {
-                if mesh_instance.get_mesh().is_some() {
+            if let Ok(mesh_instance) = child.try_cast::<MultiMeshInstance3D>() {
+                if mesh_instance.get_multimesh().is_some() {
                     self.visibility_state.asset_ready = true;
                     self.debug_mesh_instance = Some(mesh_instance);
                     return;
