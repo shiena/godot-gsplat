@@ -7,6 +7,7 @@ use crate::asset::GaussianSplatAsset;
 use crate::backend::{GaussianSplatBackendSettings, BACKEND_PROFILE_DESKTOP};
 use crate::cloud_settings::GaussianSplatCloudSettings;
 use crate::import_state::{ImportedSplatMetadata, NODE_STATE_KEY, POINT_STRIDE_FLOATS};
+use crate::preview_mesh::GaussianSplatPreviewMeshInstance3D;
 use crate::render_packet::GaussianSplatRenderPacket;
 
 const GAUSSIAN_BILLBOARD_SHADER: &str = r#"
@@ -485,11 +486,11 @@ impl GaussianSplatNode3D {
             return;
         }
 
-        let mut mesh_instance = MeshInstance3D::new_alloc();
+        let mut mesh_instance = GaussianSplatPreviewMeshInstance3D::new_alloc();
         mesh_instance.set_name("DebugPointCloud");
         self.base_mut()
             .add_child(&mesh_instance.clone().upcast::<Node>());
-        self.debug_mesh_instance = Some(mesh_instance);
+        self.debug_mesh_instance = Some(mesh_instance.upcast::<MeshInstance3D>());
     }
 
     fn clear_debug_mesh(&mut self) {
