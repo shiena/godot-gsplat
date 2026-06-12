@@ -4,7 +4,7 @@ use godot::global::Error;
 use godot::prelude::*;
 
 pub const BASE_EXTENSION: &str = "KHR_gaussian_splatting";
-pub const COMPRESSION_EXTENSION: &str = "khr_gaussian_splatting_compression_spz";
+pub const COMPRESSION_EXTENSION: &str = "KHR_gaussian_splatting_compression_spz_2";
 pub const GLTF_STATE_KEY: &str = "godot_gsplat.import_state";
 pub const NODE_STATE_KEY: &str = "godot_gsplat.node_state";
 pub const PAYLOAD_LAYOUT_V1: &str = "gsplat.import.placeholder.v1";
