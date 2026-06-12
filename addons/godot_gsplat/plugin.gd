@@ -5,6 +5,7 @@ const EXTENSION_CLASS_NAME := "GltfGsplatDocumentExtension"
 const SCENE_POST_IMPORT_PLUGIN_CLASS_NAME := "GsplatScenePostImportPlugin"
 const EXTENSION_LIBRARY_PATH := "res://godot_gsplat.gdextension"
 const OPTION_PREVIEW_MAX_SPLATS := "gsplat/preview_max_splats"
+const PENDING_PREVIEW_CLAMPS_PATH := "user://godot_gsplat_pending_preview_clamps.cfg"
 
 var _gltf_extension: Object
 var _scene_post_import_plugin: Object
@@ -79,7 +80,7 @@ func _unregister_filesystem_hooks() -> void:
 	_resource_filesystem = null
 
 func _on_resources_reimported(resources: PackedStringArray) -> void:
-	call_deferred("_clamp_reimported_preview_limits", resources)
+	_clamp_reimported_preview_limits(resources)
 
 func _clamp_reimported_preview_limits(resources: PackedStringArray) -> void:
 	for resource_path in resources:
@@ -99,11 +100,13 @@ func _clamp_import_preview_limit(source_path: String) -> void:
 		return
 
 	var saved_limit := int(config.get_value("params", OPTION_PREVIEW_MAX_SPLATS, 10000))
-	var point_count := _read_imported_point_count(source_path)
-	if point_count < 0:
+	var clamped_limit := _read_pending_preview_limit(source_path)
+	if clamped_limit < 0:
+		clamped_limit = _read_imported_point_count(source_path)
+	if clamped_limit < 0:
 		return
 
-	var clamped_limit := clampi(saved_limit, 0, point_count)
+	clamped_limit = clampi(saved_limit, 0, clamped_limit)
 	if clamped_limit == saved_limit:
 		return
 
@@ -113,6 +116,20 @@ func _clamp_import_preview_limit(source_path: String) -> void:
 		push_warning("Failed to save clamped Gaussian splat preview limit for '%s': %s" % [source_path, save_status])
 		return
 	print("[godot-gsplat] Clamped %s from %s to %s." % [OPTION_PREVIEW_MAX_SPLATS, saved_limit, clamped_limit])
+
+func _read_pending_preview_limit(source_path: String) -> int:
+	var config := ConfigFile.new()
+	if config.load(PENDING_PREVIEW_CLAMPS_PATH) != OK:
+		return -1
+	if not config.has_section_key("files", source_path):
+		return -1
+
+	var clamped_limit := int(config.get_value("files", source_path, -1))
+	config.set_value("files", source_path, null)
+	var save_status := config.save(PENDING_PREVIEW_CLAMPS_PATH)
+	if save_status != OK:
+		push_warning("Failed to clear pending Gaussian splat preview limit for '%s': %s" % [source_path, save_status])
+	return clamped_limit
 
 func _read_imported_point_count(source_path: String) -> int:
 	var packed_scene := ResourceLoader.load(source_path)

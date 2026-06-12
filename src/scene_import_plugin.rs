@@ -135,13 +135,13 @@ impl GsplatScenePostImportPlugin {
     }
 
     fn add_general_preview_options(&mut self) {
-        self.add_i32_option(OPTION_PREVIEW_MAX_SPLATS, 10_000, "0,5000000,1");
+        self.add_i32_option(OPTION_PREVIEW_MAX_SPLATS, 10_000, "0,1,or_greater");
         self.add_f32_option(OPTION_PREVIEW_MAX_SPLAT_RADIUS, 0.02, "0.001,1.0,0.001");
         self.add_f32_option(OPTION_PREVIEW_SCALE_MULTIPLIER, 1.0, "0.01,64.0,0.01");
     }
 
     fn add_internal_preview_options(&mut self) {
-        self.add_i32_option(INTERNAL_OPTION_PREVIEW_MAX_SPLATS, 10_000, "0,5000000,1");
+        self.add_i32_option(INTERNAL_OPTION_PREVIEW_MAX_SPLATS, 10_000, "0,1,or_greater");
         self.add_f32_option(
             INTERNAL_OPTION_PREVIEW_MAX_SPLAT_RADIUS,
             0.02,

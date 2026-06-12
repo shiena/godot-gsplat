@@ -17,6 +17,7 @@ const OPTION_PREVIEW_SCALE_MULTIPLIER: &str = "gsplat/preview_scale_multiplier";
 const INTERNAL_OPTION_PREVIEW_MAX_SPLATS: &str = "gsplat_preview/preview_max_splats";
 const INTERNAL_OPTION_PREVIEW_MAX_SPLAT_RADIUS: &str = "gsplat_preview/preview_max_splat_radius";
 const INTERNAL_OPTION_PREVIEW_SCALE_MULTIPLIER: &str = "gsplat_preview/preview_scale_multiplier";
+const PENDING_PREVIEW_CLAMPS_PATH: &str = "user://godot_gsplat_pending_preview_clamps.cfg";
 
 #[derive(GodotClass)]
 #[class(tool, init, base=GltfDocumentExtension)]
@@ -180,7 +181,7 @@ impl IGltfDocumentExtension for GltfGsplatDocumentExtension {
             node.bind_mut().bind_asset(Some(asset));
             if let Some(preview_options) = preview_options {
                 apply_preview_options_to_node(&mut node, &preview_options);
-                persist_clamped_preview_max_splats(&preview_options, &node);
+                record_pending_preview_max_splats_clamp(&preview_options, &node);
             }
         }
 
@@ -390,7 +391,7 @@ fn apply_preview_options_to_node(
     }
 }
 
-fn persist_clamped_preview_max_splats(
+fn record_pending_preview_max_splats_clamp(
     options: &SavedPreviewImportOptions,
     node: &Gd<GaussianSplatNode3D>,
 ) {
@@ -403,18 +404,23 @@ fn persist_clamped_preview_max_splats(
     }
 
     let mut config = ConfigFile::new_gd();
-    if config.load(options.import_path.as_str()) != Error::OK {
-        return;
-    }
+    let _ = config.load(PENDING_PREVIEW_CLAMPS_PATH);
     config.set_value(
-        "params",
-        OPTION_PREVIEW_MAX_SPLATS,
+        "files",
+        import_path_to_source_path(options.import_path.as_str()).as_str(),
         &Variant::from(clamped_max_splats),
     );
-    if config.save(options.import_path.as_str()) != Error::OK {
+    if config.save(PENDING_PREVIEW_CLAMPS_PATH) != Error::OK {
         godot_warn!(
-            "Failed to save clamped Gaussian splat preview limit to '{}'.",
-            options.import_path
+            "Failed to record pending Gaussian splat preview limit clamp for '{}'.",
+            options.import_path,
         );
     }
+}
+
+fn import_path_to_source_path(import_path: &str) -> String {
+    import_path
+        .strip_suffix(".import")
+        .unwrap_or(import_path)
+        .to_string()
 }
