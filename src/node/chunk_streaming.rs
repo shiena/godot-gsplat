@@ -24,6 +24,9 @@ pub(super) struct ChunkRuntime {
     pub(super) last_budget: i32,
     // In-flight async render-set rebuild (Phase C2b); None when idle.
     pub(super) pending: Option<std::sync::mpsc::Receiver<RawRenderData>>,
+    // A rebuild was requested while one was in flight (e.g. a settings change);
+    // re-kick it as soon as the running one lands so the change is not lost.
+    pub(super) rebuild_queued: bool,
 }
 
 impl GaussianSplatNode3D {
@@ -55,6 +58,7 @@ impl GaussianSplatNode3D {
             last_select_pos: None,
             last_budget: budget,
             pending: None,
+            rebuild_queued: false,
         });
     }
 
@@ -137,6 +141,14 @@ impl GaussianSplatNode3D {
             .map(|settings| settings.bind().get_gaussian_scale_multiplier())
             .unwrap_or(1.0)
             .max(0.01);
+        // While one is in flight, queue a re-kick instead of dropping the request
+        // so settings changes made meanwhile still land.
+        if let Some(rt) = self.backend.chunks.as_mut() {
+            if rt.pending.is_some() {
+                rt.rebuild_queued = true;
+                return;
+            }
+        }
         let receiver = match &self.backend.chunks {
             Some(rt) if rt.pending.is_none() => {
                 // No bound cloud settings means class defaults: full SH degree.
@@ -186,13 +198,27 @@ impl GaussianSplatNode3D {
                     rt.pending = None;
                 }
                 self.apply_render_data(raw_to_render(raw));
+                self.kick_queued_rebuild();
             }
             Err(std::sync::mpsc::TryRecvError::Empty) => {}
             Err(std::sync::mpsc::TryRecvError::Disconnected) => {
                 if let Some(rt) = self.backend.chunks.as_mut() {
                     rt.pending = None;
                 }
+                self.kick_queued_rebuild();
             }
+        }
+    }
+
+    fn kick_queued_rebuild(&mut self) {
+        let queued = self
+            .backend
+            .chunks
+            .as_mut()
+            .map(|rt| std::mem::take(&mut rt.rebuild_queued))
+            .unwrap_or(false);
+        if queued {
+            self.begin_chunk_rebuild();
         }
     }
 }

@@ -9,7 +9,10 @@ repository = "https://github.com/shiena/godot-gsplat"
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-godot = { version = "0.5", features = ["api-4-5"] }
+# experimental-threads: the glTF import callbacks must be callable from a
+# background loader thread (see demo/minimal_demo.gd), and the chunk-rebuild
+# worker logs through the Godot binding off the main thread.
+godot = { version = "0.5", features = ["api-4-5", "experimental-threads"] }
 
 [profile.dev]
 opt-level = 0

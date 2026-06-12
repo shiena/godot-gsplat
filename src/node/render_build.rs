@@ -6,7 +6,7 @@ use godot::classes::image::Format as ImageFormat;
 use godot::classes::mesh::{ArrayType, PrimitiveType};
 use godot::classes::multi_mesh::TransformFormat;
 use godot::classes::{
-    ArrayMesh, Image, ImageTexture, MultiMesh, MultiMeshInstance3D, Shader, ShaderMaterial,
+    ArrayMesh, Engine, Image, ImageTexture, MultiMesh, MultiMeshInstance3D, Shader, ShaderMaterial,
 };
 use godot::prelude::*;
 
@@ -20,6 +20,11 @@ use super::GaussianSplatNode3D;
 // Width (in RGBA-float texels) of the per-splat data texture. Each splat occupies
 // four consecutive texels, so a row holds SPLAT_DATA_TEX_WIDTH / 4 splats.
 const SPLAT_DATA_TEX_WIDTH: i32 = 4096;
+
+// Largest active set still built synchronously at runtime (~0.3 s of gather +
+// pack on a desktop core). Bigger sets go through the async chunk-rebuild
+// worker instead of blocking the main thread.
+const SYNC_BUILD_MAX_SPLATS: usize = 500_000;
 
 // CPU-built render data for the texture-driven splat path: the per-splat data
 // texture bytes plus the per-splat sort-seed positions.
@@ -84,6 +89,22 @@ impl GaussianSplatNode3D {
         {
             self.clear_splat_multimesh();
             return;
+        }
+
+        // Large runtime (re)builds go through the async worker so a multi-
+        // million-splat gather + pack does not block the main thread; the
+        // current render (if any) stays up until the worker delivers via
+        // poll_chunk_rebuild(). The editor always builds synchronously: the
+        // import pipeline packs the baked SplatMultiMesh into the .scn right
+        // after scene generation, so it must exist immediately.
+        if !Engine::singleton().is_editor_hint() {
+            if let Some(rt) = &self.backend.chunks {
+                let selected: u32 = rt.active.iter().map(|&(_, count)| count).sum();
+                if selected as usize > SYNC_BUILD_MAX_SPLATS {
+                    self.begin_chunk_rebuild();
+                    return;
+                }
+            }
         }
 
         let Some(render) = self.build_splat_render_data(&asset, cloud_settings.as_ref()) else {
