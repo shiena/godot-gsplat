@@ -1648,42 +1648,26 @@ impl GaussianSplatNode3D {
         let mut min = Vector3::new(f32::INFINITY, f32::INFINITY, f32::INFINITY);
         let mut max = Vector3::new(f32::NEG_INFINITY, f32::NEG_INFINITY, f32::NEG_INFINITY);
 
-        if image.get_format() == ImageFormat::RGBAF {
-            // Fast path: read the raw float bytes (16 floats per splat).
-            let floats = image.get_data().to_float32_array();
-            let values = floats.as_slice();
-            if values.len() < count * 16 {
-                return;
-            }
-            for i in 0..count {
-                let base = i * 16;
-                let center = Vector3::new(values[base], values[base + 1], values[base + 2]);
-                positions.extend_from_slice(&[center.x, center.y, center.z, 1.0]);
-                min.x = min.x.min(center.x);
-                min.y = min.y.min(center.y);
-                min.z = min.z.min(center.z);
-                max.x = max.x.max(center.x);
-                max.y = max.y.max(center.y);
-                max.z = max.z.max(center.z);
-            }
-        } else {
-            // Format-agnostic fallback.
-            let width = image.get_width();
-            if width <= 0 {
-                return;
-            }
-            for i in 0..count {
-                let texel = (i * 4) as i32;
-                let pixel = image.get_pixel(texel % width, texel / width);
-                let center = Vector3::new(pixel.r, pixel.g, pixel.b);
-                positions.extend_from_slice(&[center.x, center.y, center.z, 1.0]);
-                min.x = min.x.min(center.x);
-                min.y = min.y.min(center.y);
-                min.z = min.z.min(center.z);
-                max.x = max.x.max(center.x);
-                max.y = max.y.max(center.y);
-                max.z = max.z.max(center.z);
-            }
+        // apply_render_data() always builds the data texture as RGBAF; any other
+        // format means the material was replaced externally — skip sorting then.
+        if image.get_format() != ImageFormat::RGBAF {
+            return;
+        }
+        let floats = image.get_data().to_float32_array();
+        let values = floats.as_slice();
+        if values.len() < count * 16 {
+            return;
+        }
+        for i in 0..count {
+            let base = i * 16;
+            let center = Vector3::new(values[base], values[base + 1], values[base + 2]);
+            positions.extend_from_slice(&[center.x, center.y, center.z, 1.0]);
+            min.x = min.x.min(center.x);
+            min.y = min.y.min(center.y);
+            min.z = min.z.min(center.z);
+            max.x = max.x.max(center.x);
+            max.y = max.y.max(center.y);
+            max.z = max.z.max(center.z);
         }
 
         let size = max - min;

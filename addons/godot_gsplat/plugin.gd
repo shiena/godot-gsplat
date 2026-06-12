@@ -1,9 +1,8 @@
 @tool
 extends EditorPlugin
 
-const EXTENSION_CLASS_NAME := "GltfGsplatDocumentExtension"
+const GltfRegistration := preload("res://addons/godot_gsplat/runtime/gltf_registration.gd")
 const SCENE_POST_IMPORT_PLUGIN_CLASS_NAME := "GsplatScenePostImportPlugin"
-const EXTENSION_LIBRARY_PATH := "res://godot_gsplat.gdextension"
 const OPTION_PREVIEW_MAX_SPLATS := "gsplat/preview_max_splats"
 const GAUSSIAN_SPLAT_NODE_CLASS_NAME := "GaussianSplatNode3D"
 const SOURCE_GLTF_PROPERTY := "source_gltf"
@@ -27,20 +26,15 @@ func _exit_tree() -> void:
 func _register_gltf_extension() -> void:
 	if _gltf_extension != null:
 		return
-	if not _ensure_extension_library_loaded():
-		return
-	if not ClassDB.class_exists(EXTENSION_CLASS_NAME):
-		push_warning("GDExtension class '%s' is not available yet." % EXTENSION_CLASS_NAME)
-		return
 
-	_gltf_extension = ClassDB.instantiate(EXTENSION_CLASS_NAME)
-	GLTFDocument.register_gltf_document_extension(_gltf_extension, true)
-	print("[godot-gsplat] Registered GLTF document extension.")
+	_gltf_extension = GltfRegistration.register_gltf_extension()
+	if _gltf_extension != null:
+		print("[godot-gsplat] Registered GLTF document extension.")
 
 func _register_scene_post_import_plugin() -> void:
 	if _scene_post_import_plugin != null:
 		return
-	if not _ensure_extension_library_loaded():
+	if not GltfRegistration.ensure_extension_library_loaded():
 		return
 	if not ClassDB.class_exists(SCENE_POST_IMPORT_PLUGIN_CLASS_NAME):
 		push_warning("GDExtension class '%s' is not available yet." % SCENE_POST_IMPORT_PLUGIN_CLASS_NAME)
@@ -62,7 +56,7 @@ func _unregister_gltf_extension() -> void:
 	if _gltf_extension == null:
 		return
 
-	GLTFDocument.unregister_gltf_document_extension(_gltf_extension)
+	GltfRegistration.unregister_gltf_extension(_gltf_extension)
 	_gltf_extension = null
 	print("[godot-gsplat] Unregistered GLTF document extension.")
 
@@ -262,16 +256,3 @@ func _find_first_splat_point_count(node: Node) -> int:
 			return point_count
 
 	return -1
-
-func _ensure_extension_library_loaded() -> bool:
-	if GDExtensionManager.is_extension_loaded(EXTENSION_LIBRARY_PATH):
-		return true
-
-	var status: int = GDExtensionManager.load_extension(EXTENSION_LIBRARY_PATH)
-	if status == GDExtensionManager.LOAD_STATUS_OK:
-		return true
-	if status == GDExtensionManager.LOAD_STATUS_ALREADY_LOADED:
-		return true
-
-	push_warning("Failed to load GDExtension library: %s" % [status])
-	return false
