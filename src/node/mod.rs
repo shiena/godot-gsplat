@@ -276,8 +276,6 @@ impl GaussianSplatNode3D {
     #[func]
     pub fn bind_asset(&mut self, asset: Option<Gd<GaussianSplatAsset>>) {
         self.asset = asset;
-        self.ensure_cloud_settings();
-        self.ensure_backend_settings();
         self.refresh_from_asset();
     }
 
@@ -338,7 +336,6 @@ impl GaussianSplatNode3D {
     #[func]
     pub fn bind_cloud_settings(&mut self, cloud_settings: Option<Gd<GaussianSplatCloudSettings>>) {
         self.cloud_settings = cloud_settings;
-        self.ensure_cloud_settings();
         self.mark_backend_dirty("cloud_settings");
         self.rebuild_splat_multimesh();
     }
@@ -461,7 +458,6 @@ impl GaussianSplatNode3D {
         backend_settings: Option<Gd<GaussianSplatBackendSettings>>,
     ) {
         self.backend_settings = backend_settings;
-        self.ensure_backend_settings();
         self.backend_state.profile_hint = self.resolve_backend_pipeline();
         self.mark_backend_dirty("backend_settings");
     }
@@ -566,8 +562,6 @@ impl GaussianSplatNode3D {
     }
 
     fn refresh_from_asset(&mut self) {
-        self.ensure_cloud_settings();
-        self.ensure_backend_settings();
         if let Some(asset) = &self.asset {
             let asset = asset.clone();
             let asset_ref = asset.bind();
@@ -604,13 +598,12 @@ impl GaussianSplatNode3D {
         }
     }
 
+    // Settings resources are created lazily on first write (the user touched
+    // them); reads fall back to the class defaults so an unconfigured node
+    // renders with default settings and keeps its scene file clean.
     fn ensure_backend_settings(&mut self) {
         if self.backend_settings.is_none() {
-            let mut backend_settings = GaussianSplatBackendSettings::new_gd();
-            backend_settings
-                .bind_mut()
-                .set_target_hint(BACKEND_PROFILE_DESKTOP.into());
-            self.backend_settings = Some(backend_settings);
+            self.backend_settings = Some(GaussianSplatBackendSettings::new_gd());
         }
     }
 
@@ -637,14 +630,17 @@ impl GaussianSplatNode3D {
     }
 
     fn resolve_backend_pipeline(&self) -> String {
-        self.backend_settings
-            .as_ref()
-            .map(|backend_settings| {
-                backend_settings
-                    .bind()
-                    .resolve_pipeline_for_metadata(&self.imported_metadata())
-            })
-            .unwrap_or_else(|| "unconfigured".to_string())
+        let metadata = self.imported_metadata();
+        match &self.backend_settings {
+            Some(backend_settings) => backend_settings
+                .bind()
+                .resolve_pipeline_for_metadata(&metadata),
+            // No bound settings: resolve with the class defaults (automatic
+            // profile, desktop target) without materializing a resource.
+            None => GaussianSplatBackendSettings::new_gd()
+                .bind()
+                .resolve_pipeline_for_metadata(&metadata),
+        }
     }
 
     fn sync_node_name(&mut self) {

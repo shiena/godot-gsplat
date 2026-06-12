@@ -139,11 +139,12 @@ impl GaussianSplatNode3D {
             .max(0.01);
         let receiver = match &self.backend.chunks {
             Some(rt) if rt.pending.is_none() => {
+                // No bound cloud settings means class defaults: full SH degree.
                 let cap = self
                     .cloud_settings
                     .as_ref()
                     .map(|settings| settings.bind().get_sh_degree())
-                    .unwrap_or(0);
+                    .unwrap_or(3);
                 let sh_degree = cap.clamp(0, 3).min(rt.sh_degree_available);
                 let payload = Arc::clone(&rt.payload);
                 let table = Arc::clone(&rt.table);

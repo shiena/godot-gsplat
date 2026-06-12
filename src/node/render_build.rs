@@ -76,10 +76,11 @@ impl GaussianSplatNode3D {
         };
         let cloud_settings = self.cloud_settings.clone();
 
+        // No bound cloud settings means class defaults: rendering enabled.
         if !cloud_settings
             .as_ref()
             .map(|settings| settings.bind().is_render_enabled())
-            .unwrap_or(false)
+            .unwrap_or(true)
         {
             self.clear_splat_multimesh();
             return;
@@ -226,9 +227,10 @@ impl GaussianSplatNode3D {
         // payload and uniformly decimate it to the budget.
         let (slice, stride, sh_degree): (Vec<f32>, usize, i32) =
             if let Some(rt) = &self.backend.chunks {
+                // No bound cloud settings means class defaults: full SH degree.
                 let cap = cloud_settings
                     .map(|settings| settings.bind().get_sh_degree())
-                    .unwrap_or(0);
+                    .unwrap_or(3);
                 (
                     crate::chunking::gather_active(
                         rt.payload.as_slice(),
