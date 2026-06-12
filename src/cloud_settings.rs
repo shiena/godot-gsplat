@@ -93,7 +93,7 @@ impl GaussianSplatCloudSettings {
 
     #[func]
     pub fn set_max_debug_splats(&mut self, max_debug_splats: i32) {
-        self.max_debug_splats = max_debug_splats.max(1);
+        self.max_debug_splats = max_debug_splats.max(0);
         self.base_mut().emit_changed();
     }
 

@@ -77,10 +77,13 @@ pub struct GaussianSplatNode3D {
     backend_settings: Option<Gd<GaussianSplatBackendSettings>>,
     render_packet: Option<Gd<GaussianSplatRenderPacket>>,
     #[var(get, set)]
+    #[export]
     preview_max_splats: PhantomVar<i32>,
     #[var(get, set)]
+    #[export]
     preview_max_splat_radius: PhantomVar<f32>,
     #[var(get, set)]
+    #[export]
     preview_scale_multiplier: PhantomVar<f32>,
     metadata: ImportedSplatMetadata,
     is_bound: bool,
@@ -175,6 +178,7 @@ impl GaussianSplatNode3D {
     #[func]
     pub fn set_preview_max_splats(&mut self, max_splats: i32) {
         self.ensure_cloud_settings();
+        let max_splats = self.clamp_preview_max_splats(max_splats);
         if let Some(settings) = &mut self.cloud_settings {
             settings.bind_mut().set_max_debug_splats(max_splats);
         }
@@ -352,6 +356,8 @@ impl GaussianSplatNode3D {
             self.visibility_state.asset_ready = true;
             self.backend_state.asset_point_count = asset_ref.get_point_count();
             self.backend_state.profile_hint = self.resolve_backend_pipeline();
+            drop(asset_ref);
+            self.clamp_preview_settings_to_asset();
         } else {
             self.metadata = ImportedSplatMetadata::default();
             self.is_bound = false;
@@ -400,6 +406,22 @@ impl GaussianSplatNode3D {
         if self.render_packet.is_none() {
             self.render_packet = Some(GaussianSplatRenderPacket::new_gd());
         }
+    }
+
+    fn clamp_preview_settings_to_asset(&mut self) {
+        let max_splats = self.clamp_preview_max_splats(self.get_preview_max_splats());
+        if let Some(settings) = &mut self.cloud_settings {
+            settings.bind_mut().set_max_debug_splats(max_splats);
+        }
+    }
+
+    fn clamp_preview_max_splats(&self, max_splats: i32) -> i32 {
+        let asset_point_count = self
+            .asset
+            .as_ref()
+            .map(|asset| asset.bind().get_point_count())
+            .unwrap_or(0);
+        max_splats.max(0).min(asset_point_count)
     }
 
     fn clear_render_packet(&mut self) {
@@ -547,7 +569,7 @@ impl GaussianSplatNode3D {
 
         let source_point_count = values.len() / POINT_STRIDE_FLOATS;
         let max_splats = cloud_settings
-            .map(|settings| settings.bind().get_max_debug_splats().max(1) as usize)
+            .map(|settings| settings.bind().get_max_debug_splats().max(0) as usize)
             .unwrap_or(500_000);
         let point_count = source_point_count.min(max_splats);
         if point_count == 0 || point_count > (i32::MAX as usize / 4) {
