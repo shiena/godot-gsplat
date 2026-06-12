@@ -76,6 +76,12 @@ pub struct GaussianSplatNode3D {
     cloud_settings: Option<Gd<GaussianSplatCloudSettings>>,
     backend_settings: Option<Gd<GaussianSplatBackendSettings>>,
     render_packet: Option<Gd<GaussianSplatRenderPacket>>,
+    #[var(get, set)]
+    preview_max_splats: PhantomVar<i32>,
+    #[var(get, set)]
+    preview_max_splat_radius: PhantomVar<f32>,
+    #[var(get, set)]
+    preview_scale_multiplier: PhantomVar<f32>,
     metadata: ImportedSplatMetadata,
     is_bound: bool,
     transform_state: NodeTransformState,
@@ -156,6 +162,64 @@ impl GaussianSplatNode3D {
     #[func]
     pub fn get_cloud_settings(&self) -> Option<Gd<GaussianSplatCloudSettings>> {
         self.cloud_settings.clone()
+    }
+
+    #[func]
+    pub fn get_preview_max_splats(&self) -> i32 {
+        self.cloud_settings
+            .as_ref()
+            .map(|settings| settings.bind().get_max_debug_splats())
+            .unwrap_or(10_000)
+    }
+
+    #[func]
+    pub fn set_preview_max_splats(&mut self, max_splats: i32) {
+        self.ensure_cloud_settings();
+        if let Some(settings) = &mut self.cloud_settings {
+            settings.bind_mut().set_max_debug_splats(max_splats);
+        }
+        self.mark_backend_dirty("preview_max_splats");
+        self.rebuild_debug_mesh();
+    }
+
+    #[func]
+    pub fn get_preview_max_splat_radius(&self) -> f32 {
+        self.cloud_settings
+            .as_ref()
+            .map(|settings| settings.bind().get_max_debug_splat_radius())
+            .unwrap_or(0.02)
+    }
+
+    #[func]
+    pub fn set_preview_max_splat_radius(&mut self, max_splat_radius: f32) {
+        self.ensure_cloud_settings();
+        if let Some(settings) = &mut self.cloud_settings {
+            settings
+                .bind_mut()
+                .set_max_debug_splat_radius(max_splat_radius);
+        }
+        self.mark_backend_dirty("preview_max_splat_radius");
+        self.rebuild_debug_mesh();
+    }
+
+    #[func]
+    pub fn get_preview_scale_multiplier(&self) -> f32 {
+        self.cloud_settings
+            .as_ref()
+            .map(|settings| settings.bind().get_gaussian_scale_multiplier())
+            .unwrap_or(1.0)
+    }
+
+    #[func]
+    pub fn set_preview_scale_multiplier(&mut self, scale_multiplier: f32) {
+        self.ensure_cloud_settings();
+        if let Some(settings) = &mut self.cloud_settings {
+            settings
+                .bind_mut()
+                .set_gaussian_scale_multiplier(scale_multiplier);
+        }
+        self.mark_backend_dirty("preview_scale_multiplier");
+        self.rebuild_debug_mesh();
     }
 
     #[func]
@@ -255,6 +319,15 @@ impl GaussianSplatNode3D {
             let packet_ref = render_packet.bind();
             dict.set("render_packet", &Variant::from(packet_ref.export_packet()));
         }
+        dict.set("preview_max_splats", self.get_preview_max_splats() as i64);
+        dict.set(
+            "preview_max_splat_radius",
+            self.get_preview_max_splat_radius(),
+        );
+        dict.set(
+            "preview_scale_multiplier",
+            self.get_preview_scale_multiplier(),
+        );
         dict
     }
 
@@ -480,6 +553,7 @@ impl GaussianSplatNode3D {
         if point_count == 0 || point_count > (i32::MAX as usize / 4) {
             return None;
         }
+        let sample_stride = source_point_count.div_ceil(point_count);
 
         let scale_multiplier = cloud_settings
             .map(|settings| settings.bind().get_gaussian_scale_multiplier())
@@ -502,7 +576,8 @@ impl GaussianSplatNode3D {
         let mut colors = Vec::with_capacity(point_count * 4);
         let mut indices = Vec::with_capacity(point_count * 6);
 
-        for point_index in 0..point_count {
+        for output_index in 0..point_count {
+            let point_index = (output_index * sample_stride).min(source_point_count - 1);
             let offset = point_index * POINT_STRIDE_FLOATS;
             let center = Vector3::new(values[offset], values[offset + 1], values[offset + 2]);
             let radius = values[offset + 7]
@@ -526,7 +601,7 @@ impl GaussianSplatNode3D {
                 colors.push(color);
             }
 
-            let base = (point_index * 4) as i32;
+            let base = (output_index * 4) as i32;
             indices.extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
         }
 
