@@ -26,7 +26,7 @@ const REQUIRED_ATTRIBUTES: [&str; 5] = [
     OPACITY_ATTRIBUTE,
     SH0_ATTRIBUTE,
 ];
-const POINT_STRIDE_FLOATS: usize = 18;
+pub const POINT_STRIDE_FLOATS: usize = 18;
 
 #[derive(Clone, Debug)]
 pub struct DecodedSplatData {

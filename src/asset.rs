@@ -2,7 +2,8 @@ use godot::classes::GltfState;
 use godot::prelude::*;
 
 use crate::import_state::{
-    DecodedSplatData, ImportedSplatMetadata, FALLBACK_NONE, GLTF_STATE_KEY, PAYLOAD_LAYOUT_V1,
+    DecodedSplatData, ImportedSplatMetadata, FALLBACK_NONE, GLTF_STATE_KEY,
+    PAYLOAD_LAYOUT_FLOAT32_V1, PAYLOAD_LAYOUT_V1, POINT_STRIDE_FLOATS,
 };
 
 #[derive(GodotClass)]
@@ -120,6 +121,57 @@ impl GaussianSplatAsset {
     #[func]
     pub fn get_local_aabb(&self) -> Aabb {
         self.local_aabb
+    }
+
+    #[func]
+    pub fn extract_point_positions(&self) -> PackedVector3Array {
+        if self.payload_layout != PAYLOAD_LAYOUT_FLOAT32_V1 {
+            return PackedVector3Array::new();
+        }
+
+        let floats = self.payload.to_float32_array();
+        let values = floats.as_slice();
+        if !values.len().is_multiple_of(POINT_STRIDE_FLOATS) {
+            return PackedVector3Array::new();
+        }
+
+        let point_count = values.len() / POINT_STRIDE_FLOATS;
+        let mut positions = Vec::with_capacity(point_count);
+        for point_index in 0..point_count {
+            let offset = point_index * POINT_STRIDE_FLOATS;
+            positions.push(Vector3::new(
+                values[offset],
+                values[offset + 1],
+                values[offset + 2],
+            ));
+        }
+        PackedVector3Array::from(positions)
+    }
+
+    #[func]
+    pub fn extract_point_colors(&self) -> PackedColorArray {
+        if self.payload_layout != PAYLOAD_LAYOUT_FLOAT32_V1 {
+            return PackedColorArray::new();
+        }
+
+        let floats = self.payload.to_float32_array();
+        let values = floats.as_slice();
+        if !values.len().is_multiple_of(POINT_STRIDE_FLOATS) {
+            return PackedColorArray::new();
+        }
+
+        let point_count = values.len() / POINT_STRIDE_FLOATS;
+        let mut colors = Vec::with_capacity(point_count);
+        for point_index in 0..point_count {
+            let offset = point_index * POINT_STRIDE_FLOATS + 14;
+            colors.push(Color::from_rgba(
+                values[offset],
+                values[offset + 1],
+                values[offset + 2],
+                values[offset + 3],
+            ));
+        }
+        PackedColorArray::from(colors)
     }
 
     #[func]

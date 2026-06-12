@@ -1,4 +1,7 @@
+use godot::classes::base_material_3d::{Flags as BaseMaterialFlags, ShadingMode, Transparency};
+use godot::classes::mesh::{ArrayType, PrimitiveType};
 use godot::classes::GltfState;
+use godot::classes::{ArrayMesh, MeshInstance3D, StandardMaterial3D};
 use godot::prelude::*;
 
 use crate::asset::GaussianSplatAsset;
@@ -46,11 +49,13 @@ pub struct GaussianSplatNode3D {
     transform_state: NodeTransformState,
     visibility_state: NodeVisibilityState,
     backend_state: NodeBackendState,
+    debug_mesh_instance: Option<Gd<MeshInstance3D>>,
 }
 
 #[godot_api]
 impl INode3D for GaussianSplatNode3D {
     fn ready(&mut self) {
+        self.ensure_debug_mesh_instance();
         self.sync_runtime_state();
         self.sync_node_name();
     }
@@ -70,6 +75,7 @@ impl GaussianSplatNode3D {
         self.asset = None;
         self.metadata = ImportedSplatMetadata::default();
         self.is_bound = false;
+        self.clear_debug_mesh();
         self.sync_node_name();
     }
 
@@ -222,6 +228,7 @@ impl GaussianSplatNode3D {
             self.backend_state.asset_point_count = 0;
             self.backend_state.profile_hint.clear();
         }
+        self.rebuild_debug_mesh();
         self.mark_backend_dirty("asset");
         self.sync_runtime_state();
         self.sync_node_name();
@@ -270,5 +277,73 @@ impl GaussianSplatNode3D {
             "GaussianSplatNode3D".to_string()
         };
         self.base_mut().set_name(name.as_str());
+    }
+
+    fn ensure_debug_mesh_instance(&mut self) {
+        if self.debug_mesh_instance.is_some() {
+            return;
+        }
+
+        let mut mesh_instance = MeshInstance3D::new_alloc();
+        mesh_instance.set_name("DebugPointCloud");
+        self.base_mut()
+            .add_child(&mesh_instance.clone().upcast::<Node>());
+        self.debug_mesh_instance = Some(mesh_instance);
+    }
+
+    fn clear_debug_mesh(&mut self) {
+        if let Some(mesh_instance) = &mut self.debug_mesh_instance {
+            mesh_instance.set_visible(false);
+        }
+    }
+
+    fn rebuild_debug_mesh(&mut self) {
+        self.ensure_debug_mesh_instance();
+
+        let Some(mesh_instance) = &mut self.debug_mesh_instance else {
+            return;
+        };
+        let Some(asset) = &self.asset else {
+            self.clear_debug_mesh();
+            return;
+        };
+
+        let (positions, colors) = {
+            let asset_ref = asset.bind();
+            (
+                asset_ref.extract_point_positions(),
+                asset_ref.extract_point_colors(),
+            )
+        };
+        if positions.is_empty() {
+            self.clear_debug_mesh();
+            return;
+        }
+
+        let mut arrays = VarArray::new();
+        for _ in 0..ArrayType::MAX.ord() {
+            arrays.push(&Variant::nil());
+        }
+        arrays.set(ArrayType::VERTEX.ord() as usize, &Variant::from(positions));
+        if !colors.is_empty() {
+            arrays.set(ArrayType::COLOR.ord() as usize, &Variant::from(colors));
+        }
+
+        let mut mesh = ArrayMesh::new_gd();
+        mesh.add_surface_from_arrays(PrimitiveType::POINTS, &arrays);
+
+        let mut material = StandardMaterial3D::new_gd();
+        material.set_shading_mode(ShadingMode::UNSHADED);
+        material.set_transparency(Transparency::ALPHA);
+        material.set_point_size(24.0);
+        material.set_flag(BaseMaterialFlags::USE_POINT_SIZE, true);
+        material.set_flag(BaseMaterialFlags::ALBEDO_FROM_VERTEX_COLOR, true);
+        material.set_flag(BaseMaterialFlags::SRGB_VERTEX_COLOR, true);
+
+        let mesh_resource = mesh.upcast::<godot::classes::Mesh>();
+        let material_resource = material.upcast::<godot::classes::Material>();
+        mesh_instance.set_mesh(&mesh_resource);
+        mesh_instance.set_material_override(&material_resource);
+        mesh_instance.set_visible(true);
     }
 }
