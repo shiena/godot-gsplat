@@ -1,22 +1,14 @@
-use godot::classes::{
-    ConfigFile, GltfDocumentExtension, GltfNode, GltfState, IGltfDocumentExtension,
-};
+use godot::classes::{GltfDocumentExtension, GltfNode, GltfState, IGltfDocumentExtension, Node};
 use godot::global::Error;
 use godot::prelude::*;
 
 use crate::asset::GaussianSplatAsset;
+use crate::import_options::PreviewImportOptions;
 use crate::import_state::{
     decode_splat_payload, inspect_gsplat_nodes, BASE_EXTENSION, COMPRESSION_EXTENSION,
     GLTF_STATE_KEY, NODE_STATE_KEY,
 };
 use crate::node::GaussianSplatNode3D;
-
-const OPTION_PREVIEW_MAX_SPLATS: &str = "gsplat/preview_max_splats";
-const OPTION_PREVIEW_MAX_SPLAT_RADIUS: &str = "gsplat/preview_max_splat_radius";
-const OPTION_PREVIEW_SCALE_MULTIPLIER: &str = "gsplat/preview_scale_multiplier";
-const INTERNAL_OPTION_PREVIEW_MAX_SPLATS: &str = "gsplat_preview/preview_max_splats";
-const INTERNAL_OPTION_PREVIEW_MAX_SPLAT_RADIUS: &str = "gsplat_preview/preview_max_splat_radius";
-const INTERNAL_OPTION_PREVIEW_SCALE_MULTIPLIER: &str = "gsplat_preview/preview_scale_multiplier";
 
 #[derive(GodotClass)]
 #[class(tool, init, base=GltfDocumentExtension)]
@@ -150,7 +142,7 @@ impl IGltfDocumentExtension for GltfGsplatDocumentExtension {
         }
         let preview_options = state
             .as_ref()
-            .and_then(preview_options_from_saved_import_file);
+            .and_then(PreviewImportOptions::from_saved_import_file);
 
         let mut node = GaussianSplatNode3D::new_alloc();
         node.bind_mut().set_imported_transform(imported_transform);
@@ -179,7 +171,8 @@ impl IGltfDocumentExtension for GltfGsplatDocumentExtension {
             }
             node.bind_mut().bind_asset(Some(asset));
             if let Some(preview_options) = preview_options {
-                apply_preview_options_to_node(&mut node, &preview_options);
+                let mut as_node = node.clone().upcast::<Node>();
+                preview_options.apply_to_node(&mut as_node);
             }
         }
 
@@ -206,181 +199,4 @@ fn metadata_from_state(state: &Gd<GltfState>, mesh_index: i32) -> Option<VarDict
     }
 
     None
-}
-
-#[derive(Clone, Debug)]
-struct SavedPreviewImportOptions {
-    max_splats: Option<i32>,
-    max_splat_radius: Option<f32>,
-    scale_multiplier: Option<f32>,
-}
-
-fn preview_options_from_saved_import_file(
-    state: &Gd<GltfState>,
-) -> Option<SavedPreviewImportOptions> {
-    let filename = state.get_filename().to_string();
-    if filename.is_empty() {
-        return None;
-    }
-
-    let mut config = ConfigFile::new_gd();
-    let mut loaded = false;
-    for import_path in import_path_candidates(state, filename.as_str()) {
-        if config.load(import_path.as_str()) == Error::OK {
-            loaded = true;
-            break;
-        }
-    }
-    if !loaded {
-        return None;
-    }
-
-    let mut options = SavedPreviewImportOptions {
-        max_splats: config_i32(&config, OPTION_PREVIEW_MAX_SPLATS),
-        max_splat_radius: config_f32(&config, OPTION_PREVIEW_MAX_SPLAT_RADIUS),
-        scale_multiplier: config_f32(&config, OPTION_PREVIEW_SCALE_MULTIPLIER),
-    };
-
-    if let Some(subresources) = config_value(&config, "_subresources") {
-        apply_saved_options_from_subresources(&mut options, &subresources);
-    }
-
-    if options.max_splats.is_some()
-        || options.max_splat_radius.is_some()
-        || options.scale_multiplier.is_some()
-    {
-        Some(options)
-    } else {
-        None
-    }
-}
-
-fn import_path_candidates(state: &Gd<GltfState>, filename: &str) -> Vec<String> {
-    let base_path = state.get_base_path().to_string();
-    let mut paths = Vec::new();
-
-    if filename.ends_with(".gltf") || filename.ends_with(".glb") {
-        paths.push(join_import_path(base_path.as_str(), filename, ""));
-    } else {
-        paths.push(join_import_path(base_path.as_str(), filename, ".gltf"));
-        paths.push(join_import_path(base_path.as_str(), filename, ".glb"));
-    }
-    paths.push(format!("{filename}.import"));
-
-    paths
-}
-
-fn join_import_path(base_path: &str, filename: &str, extension: &str) -> String {
-    let import_file = format!("{filename}{extension}.import");
-    if base_path.is_empty() {
-        import_file
-    } else if base_path.ends_with('/') {
-        format!("{base_path}{import_file}")
-    } else {
-        format!("{base_path}/{import_file}")
-    }
-}
-
-fn config_value(config: &ConfigFile, key: &str) -> Option<Variant> {
-    if config.has_section_key("params", key) {
-        Some(config.get_value("params", key))
-    } else {
-        None
-    }
-}
-
-fn config_i32(config: &ConfigFile, key: &str) -> Option<i32> {
-    config_value(config, key).and_then(|value| variant_to_i32(&value))
-}
-
-fn config_f32(config: &ConfigFile, key: &str) -> Option<f32> {
-    config_value(config, key).and_then(|value| variant_to_f32(&value))
-}
-
-fn apply_saved_options_from_subresources(
-    options: &mut SavedPreviewImportOptions,
-    subresources: &Variant,
-) {
-    if let Some(max_splats) = find_i32_option(subresources, INTERNAL_OPTION_PREVIEW_MAX_SPLATS)
-        .or_else(|| find_i32_option(subresources, OPTION_PREVIEW_MAX_SPLATS))
-    {
-        options.max_splats = Some(max_splats);
-    }
-    if let Some(max_splat_radius) =
-        find_f32_option(subresources, INTERNAL_OPTION_PREVIEW_MAX_SPLAT_RADIUS)
-            .or_else(|| find_f32_option(subresources, OPTION_PREVIEW_MAX_SPLAT_RADIUS))
-    {
-        options.max_splat_radius = Some(max_splat_radius);
-    }
-    if let Some(scale_multiplier) =
-        find_f32_option(subresources, INTERNAL_OPTION_PREVIEW_SCALE_MULTIPLIER)
-            .or_else(|| find_f32_option(subresources, OPTION_PREVIEW_SCALE_MULTIPLIER))
-    {
-        options.scale_multiplier = Some(scale_multiplier);
-    }
-}
-
-fn find_i32_option(value: &Variant, name: &str) -> Option<i32> {
-    find_option(value, name).and_then(|value| variant_to_i32(&value))
-}
-
-fn find_f32_option(value: &Variant, name: &str) -> Option<f32> {
-    find_option(value, name).and_then(|value| variant_to_f32(&value))
-}
-
-fn find_option(value: &Variant, name: &str) -> Option<Variant> {
-    if let Ok(dictionary) = value.try_to::<VarDictionary>() {
-        if let Some(option_value) = dictionary.get(name) {
-            return Some(option_value);
-        }
-
-        for nested_value in dictionary.values_array().iter_shared() {
-            if let Some(option_value) = find_option(&nested_value, name) {
-                return Some(option_value);
-            }
-        }
-    }
-
-    if let Ok(array) = value.try_to::<VarArray>() {
-        for nested_value in array.iter_shared() {
-            if let Some(option_value) = find_option(&nested_value, name) {
-                return Some(option_value);
-            }
-        }
-    }
-
-    None
-}
-
-fn variant_to_i32(value: &Variant) -> Option<i32> {
-    value.try_to::<i32>().ok().or_else(|| {
-        value
-            .try_to::<i64>()
-            .ok()
-            .map(|value| value.clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32)
-    })
-}
-
-fn variant_to_f32(value: &Variant) -> Option<f32> {
-    value
-        .try_to::<f32>()
-        .ok()
-        .or_else(|| value.try_to::<f64>().ok().map(|value| value as f32))
-}
-
-fn apply_preview_options_to_node(
-    node: &mut Gd<GaussianSplatNode3D>,
-    options: &SavedPreviewImportOptions,
-) {
-    if let Some(max_splats) = options.max_splats {
-        node.bind_mut().set_preview_max_splats(max_splats);
-    }
-    if let Some(max_splat_radius) = options.max_splat_radius {
-        node.bind_mut()
-            .set_preview_max_splat_radius(max_splat_radius);
-    }
-    if let Some(scale_multiplier) = options.scale_multiplier {
-        node.bind_mut()
-            .set_preview_scale_multiplier(scale_multiplier);
-    }
 }

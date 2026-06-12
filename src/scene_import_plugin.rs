@@ -6,22 +6,17 @@ use godot::classes::{
 use godot::prelude::*;
 use godot::register::info::PropertyHint;
 
-const OPTION_PREVIEW_MAX_SPLATS: &str = "gsplat/preview_max_splats";
-const OPTION_PREVIEW_MAX_SPLAT_RADIUS: &str = "gsplat/preview_max_splat_radius";
-const OPTION_PREVIEW_SCALE_MULTIPLIER: &str = "gsplat/preview_scale_multiplier";
-const INTERNAL_OPTION_PREVIEW_MAX_SPLATS: &str = "gsplat_preview/preview_max_splats";
-const INTERNAL_OPTION_PREVIEW_MAX_SPLAT_RADIUS: &str = "gsplat_preview/preview_max_splat_radius";
-const INTERNAL_OPTION_PREVIEW_SCALE_MULTIPLIER: &str = "gsplat_preview/preview_scale_multiplier";
+use crate::import_options::{
+    variant_to_f32, variant_to_i32, PreviewImportOptions, INTERNAL_OPTION_PREVIEW_MAX_SPLATS,
+    INTERNAL_OPTION_PREVIEW_MAX_SPLAT_RADIUS, INTERNAL_OPTION_PREVIEW_SCALE_MULTIPLIER,
+    OPTION_PREVIEW_MAX_SPLATS, OPTION_PREVIEW_MAX_SPLAT_RADIUS, OPTION_PREVIEW_SCALE_MULTIPLIER,
+    PREVIEW_MAX_SPLATS_DEFAULT,
+};
 
 // Point counts are i32 throughout the pipeline, so i32::MAX is the real ceiling.
 // A previous unbounded `or_greater` range let the inspector accept values that
 // overflowed i64, raising a parse error and saving 0.
 const PREVIEW_MAX_SPLATS_HINT: &str = "0,2147483647,1";
-
-// Default preview limit. i32::MAX means "show every splat": it clamps to the
-// asset's actual point count on load, so a freshly imported glTF previews all of
-// its points. Users can still lower it in the import dialog.
-const PREVIEW_MAX_SPLATS_DEFAULT: i32 = i32::MAX;
 
 #[derive(GodotClass)]
 #[class(tool, base=EditorScenePostImportPlugin)]
@@ -113,9 +108,9 @@ impl IEditorScenePostImportPlugin for GsplatScenePostImportPlugin {
 
         let options = self.cached_options.unwrap_or_else(|| self.read_options());
         if let Some(node) = node {
-            apply_preview_options_to_tree(node, &options);
+            options.apply_to_tree(node);
         } else if let Some(base_node) = base_node {
-            apply_preview_options_to_tree(base_node, &options);
+            options.apply_to_tree(base_node);
         }
     }
 
@@ -128,7 +123,7 @@ impl IEditorScenePostImportPlugin for GsplatScenePostImportPlugin {
             .cached_options
             .take()
             .unwrap_or_else(|| self.read_options());
-        apply_preview_options_to_tree(scene, &options);
+        options.apply_to_tree(scene);
     }
 }
 
@@ -140,7 +135,7 @@ impl GsplatScenePostImportPlugin {
     fn read_options_with_subresources(&self) -> PreviewImportOptions {
         let mut options = self.read_options();
         let subresources = self.base().get_option_value("_subresources");
-        apply_options_from_subresources(&mut options, &subresources);
+        options.merge_subresources(&subresources);
         options
     }
 
@@ -174,13 +169,13 @@ impl GsplatScenePostImportPlugin {
 
     fn read_options_from_plugin(plugin: &EditorScenePostImportPlugin) -> PreviewImportOptions {
         PreviewImportOptions {
-            max_splats: option_i32(
+            max_splats: Some(option_i32(
                 plugin,
                 OPTION_PREVIEW_MAX_SPLATS,
                 PREVIEW_MAX_SPLATS_DEFAULT,
-            ),
-            max_splat_radius: option_f32(plugin, OPTION_PREVIEW_MAX_SPLAT_RADIUS, 0.02),
-            scale_multiplier: option_f32(plugin, OPTION_PREVIEW_SCALE_MULTIPLIER, 1.0),
+            )),
+            max_splat_radius: Some(option_f32(plugin, OPTION_PREVIEW_MAX_SPLAT_RADIUS, 0.02)),
+            scale_multiplier: Some(option_f32(plugin, OPTION_PREVIEW_SCALE_MULTIPLIER, 1.0)),
         }
     }
 
@@ -199,13 +194,6 @@ impl GsplatScenePostImportPlugin {
             .hint_string(hint_string)
             .done();
     }
-}
-
-#[derive(Clone, Copy, Debug)]
-struct PreviewImportOptions {
-    max_splats: i32,
-    max_splat_radius: f32,
-    scale_multiplier: f32,
 }
 
 fn should_add_options_for_path(path: GString) -> bool {
@@ -236,101 +224,9 @@ fn is_internal_preview_option(option: &str) -> bool {
 }
 
 fn option_i32(plugin: &EditorScenePostImportPlugin, name: &str, fallback: i32) -> i32 {
-    variant_to_i32(plugin.get_option_value(name)).unwrap_or(fallback)
+    variant_to_i32(&plugin.get_option_value(name)).unwrap_or(fallback)
 }
 
 fn option_f32(plugin: &EditorScenePostImportPlugin, name: &str, fallback: f32) -> f32 {
-    plugin
-        .get_option_value(name)
-        .try_to::<f32>()
-        .unwrap_or(fallback)
-}
-
-fn apply_options_from_subresources(options: &mut PreviewImportOptions, subresources: &Variant) {
-    if let Some(max_splats) = find_i32_option(subresources, INTERNAL_OPTION_PREVIEW_MAX_SPLATS)
-        .or_else(|| find_i32_option(subresources, OPTION_PREVIEW_MAX_SPLATS))
-    {
-        options.max_splats = max_splats;
-    }
-    if let Some(max_splat_radius) =
-        find_f32_option(subresources, INTERNAL_OPTION_PREVIEW_MAX_SPLAT_RADIUS)
-            .or_else(|| find_f32_option(subresources, OPTION_PREVIEW_MAX_SPLAT_RADIUS))
-    {
-        options.max_splat_radius = max_splat_radius;
-    }
-    if let Some(scale_multiplier) =
-        find_f32_option(subresources, INTERNAL_OPTION_PREVIEW_SCALE_MULTIPLIER)
-            .or_else(|| find_f32_option(subresources, OPTION_PREVIEW_SCALE_MULTIPLIER))
-    {
-        options.scale_multiplier = scale_multiplier;
-    }
-}
-
-fn find_i32_option(value: &Variant, name: &str) -> Option<i32> {
-    find_option(value, name).and_then(variant_to_i32)
-}
-
-fn find_f32_option(value: &Variant, name: &str) -> Option<f32> {
-    find_option(value, name).and_then(|value| value.try_to::<f32>().ok())
-}
-
-fn find_option(value: &Variant, name: &str) -> Option<Variant> {
-    if let Ok(dictionary) = value.try_to::<VarDictionary>() {
-        if let Some(option_value) = dictionary.get(name) {
-            return Some(option_value);
-        }
-
-        for nested_value in dictionary.values_array().iter_shared() {
-            if let Some(option_value) = find_option(&nested_value, name) {
-                return Some(option_value);
-            }
-        }
-    }
-
-    if let Ok(array) = value.try_to::<VarArray>() {
-        for nested_value in array.iter_shared() {
-            if let Some(option_value) = find_option(&nested_value, name) {
-                return Some(option_value);
-            }
-        }
-    }
-
-    None
-}
-
-fn variant_to_i32(value: Variant) -> Option<i32> {
-    value.try_to::<i32>().ok().or_else(|| {
-        value
-            .try_to::<i64>()
-            .ok()
-            .map(|value| value.clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32)
-    })
-}
-
-fn apply_preview_options_to_tree(mut node: Gd<Node>, options: &PreviewImportOptions) {
-    apply_preview_options_to_node(&mut node, options);
-    for child in node.get_children().iter_shared() {
-        if let Ok(child) = child.try_cast::<Node>() {
-            apply_preview_options_to_tree(child, options);
-        }
-    }
-}
-
-fn apply_preview_options_to_node(node: &mut Gd<Node>, options: &PreviewImportOptions) {
-    if !node.is_class("GaussianSplatNode3D") {
-        return;
-    }
-
-    node.call(
-        "set_preview_max_splats",
-        &[Variant::from(options.max_splats)],
-    );
-    node.call(
-        "set_preview_max_splat_radius",
-        &[Variant::from(options.max_splat_radius)],
-    );
-    node.call(
-        "set_preview_scale_multiplier",
-        &[Variant::from(options.scale_multiplier)],
-    );
+    variant_to_f32(&plugin.get_option_value(name)).unwrap_or(fallback)
 }

@@ -6,6 +6,7 @@ mod backend;
 mod chunking;
 mod cloud_settings;
 mod gltf_extension;
+mod import_options;
 mod import_state;
 mod node;
 mod scene_import_plugin;
