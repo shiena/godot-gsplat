@@ -7,6 +7,7 @@ mod cloud_settings;
 mod gltf_extension;
 mod import_state;
 mod node;
+mod render_manager;
 mod render_packet;
 
 struct GodotGsplatExtension;
@@ -23,4 +24,5 @@ pub use backend::GaussianSplatBackendSettings;
 pub use cloud_settings::GaussianSplatCloudSettings;
 pub use gltf_extension::GltfGsplatDocumentExtension;
 pub use node::GaussianSplatNode3D;
+pub use render_manager::GaussianSplatRenderManager;
 pub use render_packet::GaussianSplatRenderPacket;
