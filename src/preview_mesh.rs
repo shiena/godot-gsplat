@@ -16,14 +16,8 @@ pub struct GaussianSplatPreviewMeshInstance3D {
     #[var(get, set)]
     #[export]
     preview_scale_multiplier: PhantomVar<f32>,
-    #[var(
-        no_set,
-        get = get_show_all_preview_splats_button,
-        usage_flags = [EDITOR],
-        hint = TOOL_BUTTON,
-        hint_string = "Show All Preview Splats"
-    )]
-    show_all_preview_splats_button: PhantomVar<Callable>,
+    #[var(get, set, usage_flags = [EDITOR])]
+    show_all_preview_splats_action: PhantomVar<bool>,
 }
 
 #[godot_api]
@@ -70,8 +64,15 @@ impl GaussianSplatPreviewMeshInstance3D {
     }
 
     #[func]
-    pub fn get_show_all_preview_splats_button(&self) -> Callable {
-        self.base().callable("show_all_preview_splats")
+    pub fn get_show_all_preview_splats_action(&self) -> bool {
+        false
+    }
+
+    #[func]
+    pub fn set_show_all_preview_splats_action(&mut self, enabled: bool) {
+        if enabled {
+            self.show_all_preview_splats();
+        }
     }
 
     fn call_parent_i32(&self, method: &str, fallback: i32) -> i32 {

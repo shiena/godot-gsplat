@@ -86,8 +86,8 @@ pub struct GaussianSplatNode3D {
     #[var(get, set)]
     #[export]
     preview_scale_multiplier: PhantomVar<f32>,
-    #[export_tool_button(fn = Self::show_all_preview_splats, name = "Show All Preview Splats")]
-    show_all_preview_splats_button: PhantomVar<Callable>,
+    #[var(get, set, usage_flags = [EDITOR])]
+    show_all_preview_splats_action: PhantomVar<bool>,
     metadata: ImportedSplatMetadata,
     is_bound: bool,
     transform_state: NodeTransformState,
@@ -237,6 +237,18 @@ impl GaussianSplatNode3D {
             .map(|asset| asset.bind().get_point_count())
             .unwrap_or(0);
         self.set_preview_max_splats(asset_point_count);
+    }
+
+    #[func]
+    pub fn get_show_all_preview_splats_action(&self) -> bool {
+        false
+    }
+
+    #[func]
+    pub fn set_show_all_preview_splats_action(&mut self, enabled: bool) {
+        if enabled {
+            self.show_all_preview_splats();
+        }
     }
 
     #[func]
