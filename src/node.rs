@@ -188,7 +188,7 @@ impl GaussianSplatNode3D {
         self.cloud_settings
             .as_ref()
             .map(|settings| settings.bind().get_max_debug_splats())
-            .unwrap_or(10_000)
+            .unwrap_or(i32::MAX)
     }
 
     #[func]

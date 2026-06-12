@@ -24,7 +24,10 @@ impl IResource for GaussianSplatCloudSettings {
             debug_fallback_enabled: true,
             gaussian_scale_multiplier: 1.0,
             max_debug_splat_radius: 0.02,
-            max_debug_splats: 10_000,
+            // i32::MAX = "show every splat"; the node clamps it to the asset's
+            // point count once an asset is bound, so a raw glTF loaded at runtime
+            // (no .import) previews all of its points.
+            max_debug_splats: i32::MAX,
         }
     }
 }
@@ -104,7 +107,7 @@ impl GaussianSplatCloudSettings {
         self.debug_fallback_enabled = true;
         self.gaussian_scale_multiplier = 1.0;
         self.max_debug_splat_radius = 0.02;
-        self.max_debug_splats = 10_000;
+        self.max_debug_splats = i32::MAX;
         self.base_mut().emit_changed();
     }
 }

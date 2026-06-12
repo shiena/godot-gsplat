@@ -18,6 +18,11 @@ const INTERNAL_OPTION_PREVIEW_SCALE_MULTIPLIER: &str = "gsplat_preview/preview_s
 // overflowed i64, raising a parse error and saving 0.
 const PREVIEW_MAX_SPLATS_HINT: &str = "0,2147483647,1";
 
+// Default preview limit. i32::MAX means "show every splat": it clamps to the
+// asset's actual point count on load, so a freshly imported glTF previews all of
+// its points. Users can still lower it in the import dialog.
+const PREVIEW_MAX_SPLATS_DEFAULT: i32 = i32::MAX;
+
 #[derive(GodotClass)]
 #[class(tool, base=EditorScenePostImportPlugin)]
 pub struct GsplatScenePostImportPlugin {
@@ -140,7 +145,11 @@ impl GsplatScenePostImportPlugin {
     }
 
     fn add_general_preview_options(&mut self) {
-        self.add_i32_option(OPTION_PREVIEW_MAX_SPLATS, 10_000, PREVIEW_MAX_SPLATS_HINT);
+        self.add_i32_option(
+            OPTION_PREVIEW_MAX_SPLATS,
+            PREVIEW_MAX_SPLATS_DEFAULT,
+            PREVIEW_MAX_SPLATS_HINT,
+        );
         self.add_f32_option(OPTION_PREVIEW_MAX_SPLAT_RADIUS, 0.02, "0.001,1.0,0.001");
         self.add_f32_option(OPTION_PREVIEW_SCALE_MULTIPLIER, 1.0, "0.01,64.0,0.01");
     }
@@ -148,7 +157,7 @@ impl GsplatScenePostImportPlugin {
     fn add_internal_preview_options(&mut self) {
         self.add_i32_option(
             INTERNAL_OPTION_PREVIEW_MAX_SPLATS,
-            10_000,
+            PREVIEW_MAX_SPLATS_DEFAULT,
             PREVIEW_MAX_SPLATS_HINT,
         );
         self.add_f32_option(
@@ -165,7 +174,7 @@ impl GsplatScenePostImportPlugin {
 
     fn read_options_from_plugin(plugin: &EditorScenePostImportPlugin) -> PreviewImportOptions {
         PreviewImportOptions {
-            max_splats: option_i32(plugin, OPTION_PREVIEW_MAX_SPLATS, 10_000),
+            max_splats: option_i32(plugin, OPTION_PREVIEW_MAX_SPLATS, PREVIEW_MAX_SPLATS_DEFAULT),
             max_splat_radius: option_f32(plugin, OPTION_PREVIEW_MAX_SPLAT_RADIUS, 0.02),
             scale_multiplier: option_f32(plugin, OPTION_PREVIEW_SCALE_MULTIPLIER, 1.0),
         }
