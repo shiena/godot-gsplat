@@ -85,6 +85,8 @@ pub struct GaussianSplatNode3D {
     #[var(get, set)]
     #[export]
     preview_scale_multiplier: PhantomVar<f32>,
+    #[export_tool_button(fn = Self::show_all_preview_splats, name = "Show All Preview Splats")]
+    show_all_preview_splats_button: PhantomVar<Callable>,
     metadata: ImportedSplatMetadata,
     is_bound: bool,
     transform_state: NodeTransformState,
@@ -224,6 +226,16 @@ impl GaussianSplatNode3D {
         }
         self.mark_backend_dirty("preview_scale_multiplier");
         self.rebuild_debug_mesh();
+    }
+
+    #[func]
+    pub fn show_all_preview_splats(&mut self) {
+        let asset_point_count = self
+            .asset
+            .as_ref()
+            .map(|asset| asset.bind().get_point_count())
+            .unwrap_or(0);
+        self.set_preview_max_splats(asset_point_count);
     }
 
     #[func]
