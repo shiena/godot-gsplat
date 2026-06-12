@@ -1,0 +1,386 @@
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Release version (e.g., v0.1.0)'
+        required: true
+        type: string
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      commit_sha: ${{ steps.commit.outputs.sha }}
+      version: ${{ steps.normalize.outputs.version }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: Normalize version
+        id: normalize
+        run: |
+          # Normalize input: ensure single 'v' prefix (1.0.0 or v1.0.0 -> v1.0.0)
+          VERSION="${{ inputs.version }}"
+          VERSION="v${VERSION#v}"
+          echo "version=${VERSION}" >> $GITHUB_OUTPUT
+          echo "Normalized version: ${VERSION}"
+
+      - name: Validate version
+        run: |
+          INPUT_VERSION="${{ steps.normalize.outputs.version }}"
+          # Strip leading 'v' for comparison
+          INPUT_VERSION="${INPUT_VERSION#v}"
+
+          # Check if tag already exists (prevents duplicate release)
+          if git rev-parse "refs/tags/${{ steps.normalize.outputs.version }}" >/dev/null 2>&1; then
+            echo "::error::Tag ${{ steps.normalize.outputs.version }} already exists. Delete it first to re-release."
+            exit 1
+          fi
+
+          # Get latest tag (sorted by version)
+          LATEST_TAG=$(git tag -l 'v*' | sort -V | tail -n1)
+          if [ -z "$LATEST_TAG" ]; then
+            echo "No existing tags found. Proceeding with release."
+            exit 0
+          fi
+
+          LATEST_VERSION="${LATEST_TAG#v}"
+          echo "Input version: $INPUT_VERSION"
+          echo "Latest version: $LATEST_VERSION"
+
+          # Compare versions using sort -V (allow >= for re-release after tag deletion)
+          HIGHER=$(printf '%s\n%s' "$LATEST_VERSION" "$INPUT_VERSION" | sort -V | tail -n1)
+          if [ "$HIGHER" != "$INPUT_VERSION" ]; then
+            echo "::error::Input version ($INPUT_VERSION) must be greater than or equal to latest version ($LATEST_VERSION)"
+            exit 1
+          fi
+
+          echo "Version check passed: $INPUT_VERSION >= $LATEST_VERSION"
+
+      - name: Update versions
+        run: |
+          # Strip leading 'v' from normalized version (v0.1.0 -> 0.1.0) for plugin.cfg / Cargo.toml
+          VERSION="${{ steps.normalize.outputs.version }}"
+          VERSION="${VERSION#v}"
+
+          # Update plugin.cfg
+          sed -i "s/^version=\".*\"/version=\"${VERSION}\"/" addons/godot_gsplat/plugin.cfg
+          echo "Updated plugin.cfg:"
+          cat addons/godot_gsplat/plugin.cfg
+
+          # Update Cargo.toml
+          sed -i "s/^version = \".*\"/version = \"${VERSION}\"/" Cargo.toml
+          echo "Updated Cargo.toml:"
+          grep "^version" Cargo.toml
+
+      - name: Commit version update (no push yet)
+        id: commit
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add addons/godot_gsplat/plugin.cfg Cargo.toml
+          if git diff --cached --quiet; then
+            echo "No version changes needed (version already set)"
+          else
+            git commit -m "chore: bump version to ${{ steps.normalize.outputs.version }}"
+          fi
+          echo "sha=$(git rev-parse HEAD)" >> $GITHUB_OUTPUT
+
+      - name: Upload commit as artifact
+        uses: actions/upload-artifact@v6
+        with:
+          name: version-commit
+          path: |
+            addons/godot_gsplat/plugin.cfg
+            Cargo.toml
+
+  build-linux-windows:
+    needs: [prepare]
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+            artifact_name: libgodot_gsplat.so
+          - target: x86_64-pc-windows-gnu
+            os: ubuntu-latest
+            artifact_name: godot_gsplat.dll
+            cross: true
+            cross_pkg: gcc-mingw-w64-x86-64
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Download and apply version updates
+        uses: actions/download-artifact@v7
+        with:
+          name: version-commit
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install cross-compiler
+        if: matrix.cross
+        run: sudo apt-get update && sudo apt-get install -y ${{ matrix.cross_pkg }}
+
+      - name: Build
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v6
+        with:
+          name: ${{ matrix.target }}
+          path: target/${{ matrix.target }}/release/${{ matrix.artifact_name }}
+
+  build-macos:
+    needs: [prepare]
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        include:
+          - target: x86_64-apple-darwin
+            os: macos-15-intel
+            artifact_name: libgodot_gsplat.dylib
+          - target: aarch64-apple-darwin
+            os: macos-latest
+            artifact_name: libgodot_gsplat.dylib
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Download and apply version updates
+        uses: actions/download-artifact@v7
+        with:
+          name: version-commit
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Build
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v6
+        with:
+          name: ${{ matrix.target }}
+          path: target/${{ matrix.target }}/release/${{ matrix.artifact_name }}
+
+  build-android:
+    needs: [prepare]
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Download and apply version updates
+        uses: actions/download-artifact@v7
+        with:
+          name: version-commit
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android,x86_64-linux-android
+
+      - name: Install cargo-ndk
+        run: cargo install cargo-ndk
+
+      - name: Build (arm64-v8a + x86_64)
+        run: |
+          # GitHub-hosted runners expose the NDK via these OS env vars; cargo-ndk
+          # auto-detects from ANDROID_NDK_HOME. Fall back to the *_LATEST_HOME alias.
+          export ANDROID_NDK_HOME="${ANDROID_NDK_HOME:-${ANDROID_NDK_LATEST_HOME:-$ANDROID_NDK_ROOT}}"
+          echo "Using NDK: $ANDROID_NDK_HOME"
+          cargo ndk -t arm64-v8a -t x86_64 -o ./jniLibs build --release
+          ls -laR ./jniLibs
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v6
+        with:
+          name: android
+          path: jniLibs/
+
+  build-ios:
+    needs: [prepare]
+    runs-on: macos-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Download and apply version updates
+        uses: actions/download-artifact@v7
+        with:
+          name: version-commit
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-ios
+
+      - name: Build (aarch64-apple-ios)
+        run: cargo build --release --target aarch64-apple-ios
+
+      - name: Assemble .framework
+        run: |
+          # iOS GDExtension support in gdext is experimental; the dynamic library
+          # is wrapped in a .framework with an rpath-relative install name + Info.plist.
+          # Stage it under dist/ so upload-artifact keeps the .framework wrapper dir.
+          mkdir -p dist
+          FW="dist/libgodot_gsplat.ios.framework"
+          mkdir -p "$FW"
+          cp target/aarch64-apple-ios/release/libgodot_gsplat.dylib "$FW/libgodot_gsplat.dylib"
+          install_name_tool -id "@rpath/libgodot_gsplat.ios.framework/libgodot_gsplat.dylib" "$FW/libgodot_gsplat.dylib"
+          printf '%s\n' \
+            '<?xml version="1.0" encoding="UTF-8"?>' \
+            '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">' \
+            '<plist version="1.0">' \
+            '<dict>' \
+            '  <key>CFBundleDevelopmentRegion</key><string>en</string>' \
+            '  <key>CFBundleExecutable</key><string>libgodot_gsplat.dylib</string>' \
+            '  <key>CFBundleIdentifier</key><string>org.godotengine.godotgsplat</string>' \
+            '  <key>CFBundleInfoDictionaryVersion</key><string>6.0</string>' \
+            '  <key>CFBundleName</key><string>libgodot_gsplat.ios</string>' \
+            '  <key>CFBundlePackageType</key><string>FMWK</string>' \
+            '  <key>CFBundleShortVersionString</key><string>1.0</string>' \
+            '  <key>CFBundleVersion</key><string>1</string>' \
+            '  <key>CFBundleSupportedPlatforms</key><array><string>iPhoneOS</string></array>' \
+            '  <key>MinimumOSVersion</key><string>12.0</string>' \
+            '</dict>' \
+            '</plist>' > "$FW/Info.plist"
+          ls -laR "$FW"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v6
+        with:
+          name: ios
+          path: dist/
+
+  release:
+    needs: [prepare, build-linux-windows, build-macos, build-android, build-ios]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v7
+        with:
+          path: artifacts
+
+      - name: Commit and push version update
+        run: |
+          # Apply version updates from artifact
+          cp artifacts/version-commit/Cargo.toml Cargo.toml
+          cp artifacts/version-commit/addons/godot_gsplat/plugin.cfg addons/godot_gsplat/plugin.cfg
+
+          # Commit and push (skip if version already set)
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add addons/godot_gsplat/plugin.cfg Cargo.toml
+          if git diff --cached --quiet; then
+            echo "No version changes needed (version already set)"
+          else
+            git commit -m "chore: bump version to ${{ needs.prepare.outputs.version }}"
+            git push origin main
+          fi
+
+          # Create and push tag for git-cliff
+          git tag ${{ needs.prepare.outputs.version }}
+          git push origin ${{ needs.prepare.outputs.version }}
+
+      - name: Prepare release archive
+        run: |
+          ADDON=addons/godot_gsplat
+
+          # Create platform-specific bin directories
+          mkdir -p $ADDON/bin/windows
+          mkdir -p $ADDON/bin/linux
+          mkdir -p $ADDON/bin/macos-x86_64
+          mkdir -p $ADDON/bin/macos-arm64
+          mkdir -p $ADDON/bin/android-arm64
+          mkdir -p $ADDON/bin/android-x86_64
+          mkdir -p $ADDON/bin/ios
+
+          # Copy libraries to platform-specific directories
+          cp artifacts/x86_64-pc-windows-gnu/godot_gsplat.dll       $ADDON/bin/windows/
+          cp artifacts/x86_64-unknown-linux-gnu/libgodot_gsplat.so  $ADDON/bin/linux/
+          cp artifacts/x86_64-apple-darwin/libgodot_gsplat.dylib    $ADDON/bin/macos-x86_64/
+          cp artifacts/aarch64-apple-darwin/libgodot_gsplat.dylib   $ADDON/bin/macos-arm64/
+          cp artifacts/android/arm64-v8a/libgodot_gsplat.so         $ADDON/bin/android-arm64/
+          cp artifacts/android/x86_64/libgodot_gsplat.so            $ADDON/bin/android-x86_64/
+          cp -R artifacts/ios/libgodot_gsplat.ios.framework         $ADDON/bin/ios/
+
+          # Generate the distribution .gdextension (runtime addon: no `.editor`
+          # tag, all PC/mobile platforms point at the bundled bin/ libraries).
+          cat > $ADDON/godot_gsplat.gdextension <<'EOF'
+          [configuration]
+          entry_symbol = "gdext_rust_init"
+          compatibility_minimum = "4.5"
+          reloadable = true
+
+          [libraries]
+          windows.debug.x86_64   = "res://addons/godot_gsplat/bin/windows/godot_gsplat.dll"
+          windows.release.x86_64 = "res://addons/godot_gsplat/bin/windows/godot_gsplat.dll"
+          linux.debug.x86_64     = "res://addons/godot_gsplat/bin/linux/libgodot_gsplat.so"
+          linux.release.x86_64   = "res://addons/godot_gsplat/bin/linux/libgodot_gsplat.so"
+          macos.debug.x86_64     = "res://addons/godot_gsplat/bin/macos-x86_64/libgodot_gsplat.dylib"
+          macos.release.x86_64   = "res://addons/godot_gsplat/bin/macos-x86_64/libgodot_gsplat.dylib"
+          macos.debug.arm64      = "res://addons/godot_gsplat/bin/macos-arm64/libgodot_gsplat.dylib"
+          macos.release.arm64    = "res://addons/godot_gsplat/bin/macos-arm64/libgodot_gsplat.dylib"
+          android.debug.arm64    = "res://addons/godot_gsplat/bin/android-arm64/libgodot_gsplat.so"
+          android.release.arm64  = "res://addons/godot_gsplat/bin/android-arm64/libgodot_gsplat.so"
+          android.debug.x86_64   = "res://addons/godot_gsplat/bin/android-x86_64/libgodot_gsplat.so"
+          android.release.x86_64 = "res://addons/godot_gsplat/bin/android-x86_64/libgodot_gsplat.so"
+          ios.debug   = "res://addons/godot_gsplat/bin/ios/libgodot_gsplat.ios.framework"
+          ios.release = "res://addons/godot_gsplat/bin/ios/libgodot_gsplat.ios.framework"
+          EOF
+
+          # Show contents
+          ls -laR $ADDON/bin/
+          cat $ADDON/godot_gsplat.gdextension
+
+          # Create zip archive with wrapper folder for Godot Asset Library
+          # Godot auto-skips the top-level folder, so we wrap addons/ in godot_gsplat/.
+          mkdir -p godot_gsplat/addons
+          cp -R $ADDON godot_gsplat/addons/
+          zip -r godot_gsplat-${{ needs.prepare.outputs.version }}.zip godot_gsplat
+
+      - name: Generate changelog
+        uses: orhun/git-cliff-action@v4
+        with:
+          config: .github/cliff.toml
+          args: --latest --strip header
+        env:
+          OUTPUT: CHANGELOG.md
+
+      - name: Create Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          gh release create ${{ needs.prepare.outputs.version }} \
+            --title "Release ${{ needs.prepare.outputs.version }}" \
+            --notes-file CHANGELOG.md \
+            godot_gsplat-${{ needs.prepare.outputs.version }}.zip
