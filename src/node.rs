@@ -87,6 +87,10 @@ pub struct GaussianSplatNode3D {
     preview_scale_multiplier: PhantomVar<f32>,
     #[var(get, set, usage_flags = [EDITOR])]
     show_all_preview_splats_action: PhantomVar<bool>,
+    // The decoded asset is not serialized into the .scn, so persist the point
+    // count here to recover it after a scene reload.
+    #[var(get, set, usage_flags = [STORAGE])]
+    imported_point_count: PhantomVar<i32>,
     metadata: ImportedSplatMetadata,
     is_bound: bool,
     transform_state: NodeTransformState,
@@ -154,6 +158,16 @@ impl GaussianSplatNode3D {
     #[func]
     pub fn get_asset(&self) -> Option<Gd<GaussianSplatAsset>> {
         self.asset.clone()
+    }
+
+    #[func]
+    pub fn get_imported_point_count(&self) -> i32 {
+        self.backend_state.asset_point_count
+    }
+
+    #[func]
+    pub fn set_imported_point_count(&mut self, point_count: i32) {
+        self.backend_state.asset_point_count = point_count.max(0);
     }
 
     #[func]

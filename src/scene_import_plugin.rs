@@ -13,6 +13,11 @@ const INTERNAL_OPTION_PREVIEW_MAX_SPLATS: &str = "gsplat_preview/preview_max_spl
 const INTERNAL_OPTION_PREVIEW_MAX_SPLAT_RADIUS: &str = "gsplat_preview/preview_max_splat_radius";
 const INTERNAL_OPTION_PREVIEW_SCALE_MULTIPLIER: &str = "gsplat_preview/preview_scale_multiplier";
 
+// Point counts are i32 throughout the pipeline, so i32::MAX is the real ceiling.
+// A previous unbounded `or_greater` range let the inspector accept values that
+// overflowed i64, raising a parse error and saving 0.
+const PREVIEW_MAX_SPLATS_HINT: &str = "0,2147483647,1";
+
 #[derive(GodotClass)]
 #[class(tool, base=EditorScenePostImportPlugin)]
 pub struct GsplatScenePostImportPlugin {
@@ -135,13 +140,17 @@ impl GsplatScenePostImportPlugin {
     }
 
     fn add_general_preview_options(&mut self) {
-        self.add_i32_option(OPTION_PREVIEW_MAX_SPLATS, 10_000, "0,1,or_greater");
+        self.add_i32_option(OPTION_PREVIEW_MAX_SPLATS, 10_000, PREVIEW_MAX_SPLATS_HINT);
         self.add_f32_option(OPTION_PREVIEW_MAX_SPLAT_RADIUS, 0.02, "0.001,1.0,0.001");
         self.add_f32_option(OPTION_PREVIEW_SCALE_MULTIPLIER, 1.0, "0.01,64.0,0.01");
     }
 
     fn add_internal_preview_options(&mut self) {
-        self.add_i32_option(INTERNAL_OPTION_PREVIEW_MAX_SPLATS, 10_000, "0,1,or_greater");
+        self.add_i32_option(
+            INTERNAL_OPTION_PREVIEW_MAX_SPLATS,
+            10_000,
+            PREVIEW_MAX_SPLATS_HINT,
+        );
         self.add_f32_option(
             INTERNAL_OPTION_PREVIEW_MAX_SPLAT_RADIUS,
             0.02,
