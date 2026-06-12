@@ -244,6 +244,61 @@ pub fn select_chunks(table: &ChunkTable, cam: [f32; 3], budget: u32) -> Vec<(u32
     selected
 }
 
+/// Spread `budget` across ALL chunks proportionally to their size, taking each
+/// chunk's importance-ranked prefix — a whole-extent LOD rather than a near-camera
+/// bubble. Indoor captures larger than the budget look better with the full room
+/// present at reduced density than with a hard selection boundary cutting through
+/// ceiling/desk/floor. Camera-independent: the selection only changes with the
+/// budget. Allocation is floor(proportional) with the remainder distributed by
+/// largest fractional part (deterministic; ties by chunk index).
+pub fn select_chunks_coverage(table: &ChunkTable, budget: u32) -> Vec<(u32, u32)> {
+    let n = table.entries.len();
+    if n == 0 || budget == 0 {
+        return Vec::new();
+    }
+    let total: u64 = table.entries.iter().map(|e| e.count as u64).sum();
+    if total == 0 {
+        return Vec::new();
+    }
+    if budget as u64 >= total {
+        return (0..n as u32)
+            .map(|i| (i, table.entries[i as usize].count))
+            .filter(|&(_, count)| count > 0)
+            .collect();
+    }
+
+    // Floor allocation, tracking the fractional remainder per chunk.
+    let mut alloc: Vec<u32> = Vec::with_capacity(n);
+    let mut remainders: Vec<(u64, u32)> = Vec::with_capacity(n); // (scaled fraction, idx)
+    let mut allocated: u64 = 0;
+    for (i, e) in table.entries.iter().enumerate() {
+        let scaled = e.count as u64 * budget as u64;
+        let share = (scaled / total) as u32;
+        let share = share.min(e.count);
+        alloc.push(share);
+        allocated += share as u64;
+        remainders.push((scaled % total, i as u32));
+    }
+    // Hand the leftover budget to the largest fractional parts (capped per chunk).
+    let mut leftover = (budget as u64).saturating_sub(allocated) as u32;
+    remainders.sort_unstable_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
+    for &(_, idx) in &remainders {
+        if leftover == 0 {
+            break;
+        }
+        let e = &table.entries[idx as usize];
+        if alloc[idx as usize] < e.count {
+            alloc[idx as usize] += 1;
+            leftover -= 1;
+        }
+    }
+
+    (0..n as u32)
+        .map(|i| (i, alloc[i as usize]))
+        .filter(|&(_, count)| count > 0)
+        .collect()
+}
+
 /// Concatenate the first `lod_count` (importance-ranked) splats of each selected
 /// `(chunk_index, lod_count)` into one slice (the active render set). Out-of-range
 /// chunks are skipped; `lod_count` is clamped to the chunk's size.
@@ -421,6 +476,63 @@ mod tests {
             &gathered[0..POINT_STRIDE_FLOATS],
             &part.payload[start..start + POINT_STRIDE_FLOATS]
         );
+    }
+
+    #[test]
+    fn coverage_spreads_budget_across_all_chunks() {
+        let payload = grid_payload();
+        let part = partition_payload(&payload, 2.0, POINT_STRIDE_FLOATS);
+        let table = &part.table;
+        let total: u32 = table.entries.iter().map(|e| e.count).sum();
+        assert!(table.entries.len() > 1, "expected multiple chunks");
+
+        // Ample budget -> every chunk in full.
+        let all = select_chunks_coverage(table, u32::MAX);
+        assert_eq!(all.len(), table.entries.len());
+        assert_eq!(all.iter().map(|&(_, lod)| lod).sum::<u32>(), total);
+
+        // Limited budget (>= chunk count) -> exact fill, every chunk represented.
+        let budget = table.entries.len() as u32;
+        let sel = select_chunks_coverage(table, budget);
+        assert_eq!(sel.iter().map(|&(_, lod)| lod).sum::<u32>(), budget);
+        assert_eq!(
+            sel.len(),
+            table.entries.len(),
+            "every chunk should contribute when the budget covers them"
+        );
+        // Offset-sorted for a cache-friendly gather.
+        let mut sorted = sel.clone();
+        sorted.sort_unstable_by_key(|&(idx, _)| idx);
+        assert_eq!(sorted, sel);
+        // Each allocation stays within its chunk.
+        for &(idx, lod) in &sel {
+            assert!(lod <= table.entries[idx as usize].count);
+        }
+    }
+
+    #[test]
+    fn coverage_allocation_is_proportional() {
+        // Two chunks: 90 and 10 splats. A budget of 50 should split ~45/5.
+        let mut payload = Vec::new();
+        for i in 0..90 {
+            payload.extend_from_slice(&make_splat([0.01 * i as f32, 0.0, 0.0], 0.1, 0.5));
+        }
+        for i in 0..10 {
+            payload.extend_from_slice(&make_splat([10.0 + 0.01 * i as f32, 0.0, 0.0], 0.1, 0.5));
+        }
+        let part = partition_payload(&payload, 2.0, POINT_STRIDE_FLOATS);
+        let table = &part.table;
+        assert_eq!(table.entries.len(), 2);
+        let sel = select_chunks_coverage(table, 50);
+        assert_eq!(sel.iter().map(|&(_, lod)| lod).sum::<u32>(), 50);
+        let by_idx: std::collections::HashMap<u32, u32> = sel.into_iter().collect();
+        let (big, small) = if table.entries[0].count == 90 {
+            (0u32, 1u32)
+        } else {
+            (1u32, 0u32)
+        };
+        assert_eq!(by_idx[&big], 45);
+        assert_eq!(by_idx[&small], 5);
     }
 
     #[test]

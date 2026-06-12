@@ -1,5 +1,14 @@
 use godot::prelude::*;
 
+// Chunk-selection strategies for a budget-limited active set. `nearest` fills the
+// budget with the chunks closest to the camera (dense local bubble; the selection
+// boundary can cut through surfaces of a capture larger than the budget).
+// `coverage` spreads the budget across every chunk proportionally, keeping each
+// chunk's importance-ranked prefix — the whole extent stays visible at reduced
+// density, which reads better inside room-scale captures.
+pub const CHUNK_SELECTION_NEAREST: &str = "nearest";
+pub const CHUNK_SELECTION_COVERAGE: &str = "coverage";
+
 #[derive(GodotClass)]
 #[class(tool, base=Resource)]
 pub struct GaussianSplatCloudSettings {
@@ -14,6 +23,7 @@ pub struct GaussianSplatCloudSettings {
     // Spherical-harmonics degree (0-3) to evaluate for view-dependent color. Capped
     // at the degree the source glTF actually provides.
     sh_degree: i32,
+    chunk_selection: GString,
 }
 
 #[godot_api]
@@ -30,6 +40,7 @@ impl IResource for GaussianSplatCloudSettings {
             // (no .import) previews all of its points.
             max_preview_splats: i32::MAX,
             sh_degree: 3,
+            chunk_selection: CHUNK_SELECTION_NEAREST.into(),
         }
     }
 }
@@ -103,6 +114,18 @@ impl GaussianSplatCloudSettings {
     }
 
     #[func]
+    pub fn get_chunk_selection(&self) -> GString {
+        self.chunk_selection.clone()
+    }
+
+    #[func]
+    pub fn set_chunk_selection(&mut self, chunk_selection: GString) {
+        self.chunk_selection =
+            normalize_chunk_selection(chunk_selection.to_string().as_str()).into();
+        self.base_mut().emit_changed();
+    }
+
+    #[func]
     pub fn apply_defaults(&mut self) {
         self.splat_visible = true;
         self.render_enabled = true;
@@ -110,6 +133,14 @@ impl GaussianSplatCloudSettings {
         self.max_preview_splat_radius = 0.02;
         self.max_preview_splats = i32::MAX;
         self.sh_degree = 3;
+        self.chunk_selection = CHUNK_SELECTION_NEAREST.into();
         self.base_mut().emit_changed();
+    }
+}
+
+fn normalize_chunk_selection(chunk_selection: &str) -> &'static str {
+    match chunk_selection {
+        CHUNK_SELECTION_COVERAGE => CHUNK_SELECTION_COVERAGE,
+        _ => CHUNK_SELECTION_NEAREST,
     }
 }

@@ -210,6 +210,7 @@ impl GaussianSplatNode3D {
         material.set_shader_parameter("sh_degree", &Variant::from(render.sh_degree));
         // Step 1 renders unsorted (slot == id); the compute sort (Step 2) flips this on.
         material.set_shader_parameter("sort_enabled", &Variant::from(0_i32));
+        material.set_shader_parameter("sort_per_eye", &Variant::from(0_i32));
 
         let material_resource = material.upcast::<godot::classes::Material>();
         mesh_instance.set_multimesh(&multimesh);

@@ -33,6 +33,12 @@ uniform sampler2D sort_tex : filter_nearest;
 uniform sampler2D sort_tex_b : filter_nearest;
 uniform int splat_count;
 uniform int sort_enabled;
+// 1 only when a per-eye sort actually wrote sort_tex_b. Head-center sorting
+// must NOT route the second eye through sort_tex_b at all: on device the
+// second-sampler binding intermittently resolved invalid and texelFetch then
+// returned 0 for every slot — the whole right eye drew splat #0 and flashed
+// washed-out white (Quest standalone and PC-VR alike).
+uniform int sort_per_eye;
 uniform int sh_degree;
 
 varying vec2 v_corner;
@@ -89,9 +95,10 @@ void vertex() {
     int slot = int(INSTANCE_ID);
     int splat_id = slot;
     if (sort_enabled > 0) {
-        // VIEW_INDEX selects the per-eye sort order under multiview (VR). It is
-        // always 0 on flat displays, so sort_tex_b is then unused.
-        if (VIEW_INDEX == 1) {
+        // VIEW_INDEX selects the per-eye sort order under multiview (VR), but
+        // only when a per-eye dispatch actually wrote sort_tex_b; head-center
+        // shares the one order in sort_tex for both eyes.
+        if (sort_per_eye > 0 && VIEW_INDEX == 1) {
             int sw = textureSize(sort_tex_b, 0).x;
             splat_id = int(texelFetch(sort_tex_b, ivec2(slot % sw, slot / sw), 0).r + 0.5);
         } else {
@@ -256,7 +263,12 @@ void fragment() {
 }
 "#;
 
-// Pass 1: count splats per depth bucket (bucket 0 = farthest).
+// Pass 1: count splats per distance bucket (bucket 0 = farthest).
+// The key is the EUCLIDEAN camera distance (the glTF's sortingMethod =
+// cameraDistance), not the view-axis depth: distances are invariant under
+// camera rotation, so a head/orbit rotation re-sort reproduces the identical
+// order instead of reshuffling every bucket (which flashed white across
+// translucent room-scale captures on every re-sort).
 pub(super) const SORT_COUNT_GLSL: &str = r#"#version 450
 layout(local_size_x = 256) in;
 layout(set = 0, binding = 0, std430) restrict readonly buffer Pos { vec4 positions[]; };
@@ -272,8 +284,8 @@ layout(push_constant, std430) uniform PC {
 void main() {
     uint i = gl_GlobalInvocationID.x;
     if (i >= pc.count) { return; }
-    float vz = (pc.view * vec4(positions[i].xyz, 1.0)).z;
-    float t = clamp((-vz - pc.depth_min) * pc.depth_inv_range, 0.0, 1.0);
+    float dist = length((pc.view * vec4(positions[i].xyz, 1.0)).xyz);
+    float t = clamp((dist - pc.depth_min) * pc.depth_inv_range, 0.0, 1.0);
     uint bucket = uint((1.0 - t) * float(pc.num_buckets - 1u) + 0.5);
     atomicAdd(histogram[bucket], 1u);
 }
@@ -391,8 +403,9 @@ layout(push_constant, std430) uniform PC {
 void main() {
     uint i = gl_GlobalInvocationID.x;
     if (i >= pc.count) { return; }
-    float vz = (pc.view * vec4(positions[i].xyz, 1.0)).z;
-    float t = clamp((-vz - pc.depth_min) * pc.depth_inv_range, 0.0, 1.0);
+    // Same camera-distance key as the count pass (rotation-invariant order).
+    float dist = length((pc.view * vec4(positions[i].xyz, 1.0)).xyz);
+    float t = clamp((dist - pc.depth_min) * pc.depth_inv_range, 0.0, 1.0);
     uint bucket = uint((1.0 - t) * float(pc.num_buckets - 1u) + 0.5);
     uint slot = atomicAdd(offsets[bucket], 1u);
     ivec2 c = ivec2(int(slot % pc.tex_width), int(slot / pc.tex_width));

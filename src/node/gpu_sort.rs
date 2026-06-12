@@ -7,7 +7,7 @@ use godot::classes::rendering_device::{
 };
 use godot::classes::{
     RdShaderSource, RdTextureFormat, RdTextureView, RdUniform, RenderingDevice, RenderingServer,
-    Texture2D, Texture2Drd, Viewport, XrServer,
+    Texture2D, Texture2Drd, Time, Viewport, XrServer,
 };
 use godot::prelude::*;
 
@@ -42,11 +42,14 @@ const ST_SCAN_BLOCKSUMS: usize = 2;
 const ST_SCAN_ADD: usize = 3;
 const ST_SCATTER: usize = 4;
 
-// Re-sort gating thresholds: a static view keeps the previous back-to-front order.
-// Position is a fraction of the splat cloud diagonal; orientation is a per-axis
-// cosine (~0.3 degrees).
+// Re-sort gating threshold: a fraction of the splat cloud diagonal the camera
+// must move (in node-local space) before a re-sort. The camera-distance sort
+// key is rotation-invariant, so only camera POSITION changes can change the
+// order — rotation needs no gate at all.
 const SORT_RESORT_POS_FRACTION: f32 = 0.002;
-const SORT_RESORT_AXIS_COS: f32 = 0.999_986;
+// Minimum interval between re-sorts. An unthrottled HMD re-sorts ~30x/s while
+// looking around (measured on Quest 3: App 14 -> 20-24 ms at 800k splats).
+const SORT_RESORT_MIN_INTERVAL_MS: u64 = 200;
 
 // Runtime GPU counting-sort state. RIDs live on the main RenderingDevice; the
 // per-frame dispatch runs via RenderingServer::call_on_render_thread.
@@ -58,8 +61,20 @@ pub(super) struct SortGpu {
     // Whether the last dispatch wrote a separate second-eye order (per-eye VR);
     // decides what the material's sort_tex_b sampler must point at.
     pub(super) per_eye_dispatched: bool,
-    // Last view (camera_view * node_model) used for a sort; gates re-sorting.
-    pub(super) last_view: Option<Transform3D>,
+    // Head-center double buffering: which texture the material currently
+    // samples. A re-sort scatters into the OTHER texture and flips afterwards,
+    // so the sampled order is never written mid-frame (on tiler GPUs the
+    // fragment work of a frame runs long after submission and overlapped the
+    // rewrite — the mixed old/new order flashed washed-out white per re-sort).
+    pub(super) front_is_b: bool,
+    // Lifetime dispatch count (telemetry: re-sort rate diagnosis on device).
+    pub(super) dispatch_count: u64,
+    // When the last re-sort was dispatched (Time ticks, msec); throttles the
+    // re-sort rate to SORT_RESORT_MIN_INTERVAL_MS.
+    pub(super) last_sort_msec: u64,
+    // Node-local camera position at the last sort; gates re-sorting (the
+    // distance sort key only depends on the camera position in node space).
+    pub(super) last_sort_cam_local: Option<Vector3>,
     // Inputs stashed when the splat render is (re)built.
     pub(super) positions: PackedByteArray,
     pub(super) splat_count: i32,
@@ -90,7 +105,11 @@ impl Default for SortGpu {
             enabled_in_shader: false,
             dispatched_once: false,
             per_eye_dispatched: false,
-            last_view: None,
+            // The first dispatch writes the non-front (A) texture and flips.
+            front_is_b: true,
+            dispatch_count: 0,
+            last_sort_msec: 0,
+            last_sort_cam_local: None,
             positions: PackedByteArray::new(),
             splat_count: 0,
             local_aabb: Aabb::default(),
@@ -367,24 +386,39 @@ impl GaussianSplatNode3D {
         Some(eyes)
     }
 
-    // Whether the view moved/rotated enough to warrant a re-sort.
-    pub(super) fn sort_view_changed(&self, last: Transform3D, current: Transform3D) -> bool {
-        let scale = self.backend.sort.local_aabb.size.length().max(1.0e-3);
-        if (current.origin - last.origin).length() > scale * SORT_RESORT_POS_FRACTION {
+    // Rate limit between re-sorts (true = enough time has passed). Keeps an HMD's
+    // continuous micro-motion from dispatching a sort nearly every frame.
+    pub(super) fn sort_interval_elapsed(&self) -> bool {
+        let last = self.backend.sort.last_sort_msec;
+        if last == 0 {
             return true;
         }
-        let axis_cos = normalized_dot(last.basis.col_a(), current.basis.col_a())
-            .min(normalized_dot(last.basis.col_b(), current.basis.col_b()))
-            .min(normalized_dot(last.basis.col_c(), current.basis.col_c()));
-        axis_cos < SORT_RESORT_AXIS_COS
+        Time::singleton().get_ticks_msec().saturating_sub(last) >= SORT_RESORT_MIN_INTERVAL_MS
+    }
+
+    pub(super) fn mark_sort_dispatched(&mut self) {
+        self.backend.sort.dispatch_count += 1;
+        self.backend.sort.last_sort_msec = Time::singleton().get_ticks_msec();
+    }
+
+    // Whether the camera moved (in node-local space) enough to warrant a re-sort.
+    // Rotation never changes a camera-distance order, so it is not considered.
+    pub(super) fn sort_cam_moved(&self, last: Vector3, current: Vector3) -> bool {
+        let scale = self.backend.sort.local_aabb.size.length().max(1.0e-3);
+        (current - last).length() > scale * SORT_RESORT_POS_FRACTION
     }
 
     // Queue a back-to-front counting sort per view (camera_view * node_model). One
-    // pass on flat displays; one per eye for VR, each scattering into its own sort
-    // texture. The closure runs on the render thread and must not touch the node.
+    // pass on flat/head-center displays; one per eye for VR per-eye sorting, each
+    // scattering into its own texture. The closure runs on the render thread and
+    // must not touch the node.
+    //
+    // Head-center writes the BACK texture of the double buffer (never the one the
+    // material currently samples); the caller flips the front afterwards. Per-eye
+    // mode still writes both textures in place (experimental, unverified).
     pub(super) fn dispatch_sort(&self, eyes: &[(Transform3D, usize)]) {
-        // Resolve each eye to (push constant, scatter uniform set). Eye 1 targets
-        // the second sort texture; all others target the primary one.
+        let head_center = eyes.len() == 1;
+        // Resolve each eye to (push constant, scatter uniform set).
         let mut passes: Vec<(PackedByteArray, Rid)> = Vec::with_capacity(eyes.len());
         for &(combined, eye) in eyes {
             let (depth_min, depth_inv_range) = depth_range(combined, self.backend.sort.local_aabb);
@@ -395,7 +429,14 @@ impl GaussianSplatNode3D {
                 self.backend.sort.splat_count,
                 self.backend.sort.tex_width,
             );
-            let scatter_set = if eye == 1 {
+            let scatter_set = if head_center {
+                // Back buffer: the texture NOT currently bound as sort_tex.
+                if self.backend.sort.front_is_b {
+                    self.backend.sort.sets[ST_SCATTER]
+                } else {
+                    self.backend.sort.scatter_set_b
+                }
+            } else if eye == 1 {
                 self.backend.sort.scatter_set_b
             } else {
                 self.backend.sort.sets[ST_SCATTER]
@@ -494,14 +535,16 @@ impl GaussianSplatNode3D {
         }
 
         // Reset GPU state but keep the stashed inputs so a later tree re-entry can
-        // rebuild the sort.
+        // rebuild the sort (and the lifetime dispatch counter for telemetry).
         let positions = std::mem::take(&mut self.backend.sort.positions);
         let splat_count = self.backend.sort.splat_count;
         let local_aabb = self.backend.sort.local_aabb;
+        let dispatch_count = self.backend.sort.dispatch_count;
         self.backend.sort = SortGpu::default();
         self.backend.sort.positions = positions;
         self.backend.sort.splat_count = splat_count;
         self.backend.sort.local_aabb = local_aabb;
+        self.backend.sort.dispatch_count = dispatch_count;
 
         // Stop the shader from sampling a freed sort texture.
         self.set_material_sort(false);
@@ -512,27 +555,32 @@ impl GaussianSplatNode3D {
             return;
         };
         if enabled {
-            if let Some(texture) = &self.backend.sort.texture {
-                material.set_shader_parameter("sort_tex", &Variant::from(texture.clone()));
-                // Head-center sorting dispatches one order shared by both eyes
-                // and never writes the second-eye texture — alias the primary
-                // order into sort_tex_b so multiview's VIEW_INDEX == 1 samples
-                // a valid order (it read undefined data before, leaving the
-                // right eye effectively empty under XR).
-                let texture_b = if self.backend.sort.per_eye_dispatched {
-                    self.backend
-                        .sort
-                        .texture_b
-                        .clone()
-                        .unwrap_or(texture.clone())
+            if let (Some(texture), Some(texture_b)) =
+                (&self.backend.sort.texture, &self.backend.sort.texture_b)
+            {
+                // Per-eye mode samples A for eye 0 and B for eye 1. Head-center
+                // samples only sort_tex, pointed at the double buffer's FRONT
+                // (the back is being rewritten by the next re-sort); sort_tex_b
+                // is never sampled then (sort_per_eye == 0) but still gets a
+                // valid texture bound.
+                let (front, back) = if self.backend.sort.per_eye_dispatched {
+                    (texture.clone(), texture_b.clone())
+                } else if self.backend.sort.front_is_b {
+                    (texture_b.clone(), texture_b.clone())
                 } else {
-                    texture.clone()
+                    (texture.clone(), texture.clone())
                 };
-                material.set_shader_parameter("sort_tex_b", &Variant::from(texture_b));
+                material.set_shader_parameter("sort_tex", &Variant::from(front));
+                material.set_shader_parameter("sort_tex_b", &Variant::from(back));
             }
+            material.set_shader_parameter(
+                "sort_per_eye",
+                &Variant::from(self.backend.sort.per_eye_dispatched as i32),
+            );
             material.set_shader_parameter("sort_enabled", &Variant::from(1_i32));
         } else {
             material.set_shader_parameter("sort_enabled", &Variant::from(0_i32));
+            material.set_shader_parameter("sort_per_eye", &Variant::from(0_i32));
             material.set_shader_parameter("sort_tex", &Variant::nil());
             material.set_shader_parameter("sort_tex_b", &Variant::nil());
         }
@@ -608,24 +656,20 @@ fn build_sort_push_constant(
     PackedByteArray::from(bytes)
 }
 
-// Camera-space depth bounds (as positive distances) of the AABB under `view`.
+// Camera-distance bounds of the AABB under `view` (the combined camera_view *
+// node_model transform; the camera sits at the view-space origin). The lower
+// bound is fixed at 0 so it stays valid with the camera inside the cloud and
+// the range is invariant under camera rotation (lengths are preserved) —
+// rotation re-sorts then reproduce the identical bucketing.
 fn depth_range(view: Transform3D, aabb: Aabb) -> (f32, f32) {
-    let mut depth_min = f32::INFINITY;
-    let mut depth_max = f32::NEG_INFINITY;
+    let mut dist_max: f32 = 0.0;
     for corner in aabb_corners(aabb) {
-        let view_z = (view * corner).z;
-        depth_min = depth_min.min(-view_z);
-        depth_max = depth_max.max(-view_z);
+        let dist = (view * corner).length();
+        if dist.is_finite() {
+            dist_max = dist_max.max(dist);
+        }
     }
-    if !depth_min.is_finite() || !depth_max.is_finite() {
-        return (0.0, 1.0);
-    }
-    (depth_min, 1.0 / (depth_max - depth_min).max(1e-4))
-}
-
-// Cosine of the angle between two vectors (1.0 = identical direction).
-fn normalized_dot(a: Vector3, b: Vector3) -> f32 {
-    a.normalized().dot(b.normalized())
+    (0.0, 1.0 / dist_max.max(1e-4))
 }
 
 fn aabb_corners(aabb: Aabb) -> [Vector3; 8] {
@@ -641,4 +685,47 @@ fn aabb_corners(aabb: Aabb) -> [Vector3; 8] {
         Vector3::new(p.x, p.y + s.y, p.z + s.z),
         Vector3::new(p.x + s.x, p.y + s.y, p.z + s.z),
     ]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // A camera rotation must not change the distance-sort normalization: the
+    // re-sorted order then reproduces bit-identically and nothing flashes.
+    #[test]
+    fn depth_range_is_rotation_invariant() {
+        let aabb = Aabb::new(Vector3::new(-3.0, -2.0, -5.0), Vector3::new(8.0, 4.0, 9.0));
+        let view = Transform3D::IDENTITY.translated(Vector3::new(0.5, -1.0, 2.0));
+        let rotated = Transform3D::default()
+            .rotated(Vector3::UP, 0.7)
+            .rotated(Vector3::RIGHT, -0.3)
+            * view;
+        let (min_a, inv_a) = depth_range(view, aabb);
+        let (min_b, inv_b) = depth_range(rotated, aabb);
+        assert_eq!(min_a, 0.0);
+        assert_eq!(min_b, 0.0);
+        let range_a = 1.0 / inv_a;
+        let range_b = 1.0 / inv_b;
+        assert!(
+            (range_a - range_b).abs() < range_a * 1.0e-5,
+            "rotation changed the distance range: {range_a} vs {range_b}"
+        );
+    }
+
+    // With the camera inside the cloud the lower bound must stay 0 so nearby
+    // splats keep distinct buckets instead of clamping into one.
+    #[test]
+    fn depth_range_lower_bound_is_zero_inside() {
+        let aabb = Aabb::new(
+            Vector3::new(-10.0, -5.0, -10.0),
+            Vector3::new(20.0, 10.0, 20.0),
+        );
+        let inside = Transform3D::IDENTITY; // camera at the cloud center
+        let (min_d, inv) = depth_range(inside, aabb);
+        assert_eq!(min_d, 0.0);
+        let range = 1.0 / inv;
+        let half_diag = (Vector3::new(10.0, 5.0, 10.0)).length();
+        assert!((range - half_diag).abs() < 1.0e-3);
+    }
 }

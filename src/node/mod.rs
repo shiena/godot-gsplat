@@ -177,32 +177,41 @@ impl INode3D for GaussianSplatNode3D {
             return;
         }
         let eyes = self.current_sort_views();
-        let Some(&(primary, _)) = eyes.first() else {
+        if eyes.is_empty() {
+            return;
+        }
+        let Some(cam_local) = self.camera_local_pos() else {
             return;
         };
-        // Re-sort only when the camera/node view changes meaningfully; a static
-        // view keeps the last back-to-front order, saving per-frame GPU work.
-        let should_sort = match self.backend.sort.last_view {
-            Some(last) => self.sort_view_changed(last, primary),
+        // Re-sort only when the camera position moved meaningfully (the
+        // camera-distance order is rotation-invariant) AND the throttle interval
+        // elapsed. A blocked re-sort stays wanted: the reference position is only
+        // updated on dispatch, so the next eligible tick picks it up.
+        let should_sort = match self.backend.sort.last_sort_cam_local {
+            Some(last) => self.sort_cam_moved(last, cam_local),
             None => true,
         };
-        if should_sort {
+        if should_sort && self.sort_interval_elapsed() {
             self.dispatch_sort(&eyes);
-            self.backend.sort.last_view = Some(primary);
-            // Track whether a separate second-eye order exists; when the mode
-            // flips (e.g. per-eye sorting toggled), re-point the material's
-            // sort_tex_b sampler at the right texture.
+            self.mark_sort_dispatched();
+            self.backend.sort.last_sort_cam_local = Some(cam_local);
             let per_eye = eyes.len() > 1;
-            if per_eye != self.backend.sort.per_eye_dispatched {
-                self.backend.sort.per_eye_dispatched = per_eye;
-                if self.backend.sort.enabled_in_shader {
-                    self.set_material_sort(true);
-                }
+            self.backend.sort.per_eye_dispatched = per_eye;
+            if !per_eye {
+                // Head-center double buffer: the dispatch above wrote the back
+                // texture; flip and re-point the material at the new front. The
+                // parameter change is queued after the compute, so no frame ever
+                // samples a half-written order (the tiler-GPU race that flashed
+                // the view washed-out on every re-sort).
+                self.backend.sort.front_is_b = !self.backend.sort.front_is_b;
+            }
+            if self.backend.sort.enabled_in_shader {
+                self.set_material_sort(true);
             }
         }
         // Enable sorted sampling one frame after the first dispatch, so the sort
         // texture is registered and written before the material binds it.
-        if self.backend.sort.last_view.is_some() && !self.backend.sort.enabled_in_shader {
+        if self.backend.sort.last_sort_cam_local.is_some() && !self.backend.sort.enabled_in_shader {
             if self.backend.sort.dispatched_once {
                 self.set_material_sort(true);
                 self.backend.sort.enabled_in_shader = true;
@@ -482,6 +491,31 @@ impl GaussianSplatNode3D {
     }
 
     #[func]
+    pub fn get_chunk_selection(&self) -> GString {
+        self.cloud_settings
+            .as_ref()
+            .map(|settings| settings.bind().get_chunk_selection())
+            .unwrap_or_else(|| crate::cloud_settings::CHUNK_SELECTION_NEAREST.into())
+    }
+
+    // Chunk-selection strategy ("nearest" | "coverage"). Orthogonal to the render
+    // profile presets (they only drive budget/SH/backend), so changing it does not
+    // flip the profile to Custom.
+    #[func]
+    pub fn set_chunk_selection(&mut self, chunk_selection: GString) {
+        self.ensure_cloud_settings();
+        if let Some(settings) = &mut self.cloud_settings {
+            settings.bind_mut().set_chunk_selection(chunk_selection);
+        }
+        // Force a re-selection under the new strategy on the next process tick
+        // (which kicks the rebuild if the active set actually changed).
+        if let Some(rt) = self.backend.chunks.as_mut() {
+            rt.last_select_pos = None;
+        }
+        self.mark_backend_dirty("chunk_selection");
+    }
+
+    #[func]
     pub fn get_preview_max_splat_radius(&self) -> f32 {
         self.cloud_settings
             .as_ref()
@@ -594,6 +628,13 @@ impl GaussianSplatNode3D {
     #[func]
     pub fn is_depth_sorted(&self) -> bool {
         self.backend.sort.enabled_in_shader
+    }
+
+    // Lifetime GPU sort dispatch count (telemetry: shows the on-device re-sort
+    // rate, which view-change gating is supposed to keep low for a calm head).
+    #[func]
+    pub fn get_sort_dispatch_count(&self) -> i64 {
+        self.backend.sort.dispatch_count as i64
     }
 
     #[func]

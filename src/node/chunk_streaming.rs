@@ -49,7 +49,11 @@ impl GaussianSplatNode3D {
         let budget = self.active_budget();
         let center = crate::chunking::table_center(&table);
         let budget_u = if budget <= 0 { u32::MAX } else { budget as u32 };
-        let active = crate::chunking::select_chunks(&table, center, budget_u);
+        let active = if self.coverage_selection_enabled() {
+            crate::chunking::select_chunks_coverage(&table, budget_u)
+        } else {
+            crate::chunking::select_chunks(&table, center, budget_u)
+        };
         self.backend.chunks = Some(ChunkRuntime {
             table: Arc::new(table),
             payload: Arc::new(payload),
@@ -76,17 +80,26 @@ impl GaussianSplatNode3D {
         {
             return;
         }
-        let Some(cam) = self.camera_local_pos() else {
-            return;
+        // Coverage selection is camera-independent (it only changes with the
+        // budget), so it neither needs a camera nor re-selects on movement.
+        let coverage = self.coverage_selection_enabled();
+        let cam = match self.camera_local_pos() {
+            Some(cam) => cam,
+            None if coverage => Vector3::ZERO,
+            None => return,
         };
         let budget = self.active_budget();
         let changed = match &self.backend.chunks {
             Some(rt) => {
-                let threshold = (rt.table.chunk_size * 0.25).max(1.0e-3);
-                match rt.last_select_pos {
-                    Some(last) => budget != rt.last_budget || (cam - last).length() > threshold,
-                    None => true,
-                }
+                let moved = if coverage {
+                    false
+                } else {
+                    let threshold = (rt.table.chunk_size * 0.25).max(1.0e-3);
+                    rt.last_select_pos
+                        .map(|last| (cam - last).length() > threshold)
+                        .unwrap_or(true)
+                };
+                budget != rt.last_budget || moved || rt.last_select_pos.is_none()
             }
             None => return,
         };
@@ -117,11 +130,15 @@ impl GaussianSplatNode3D {
             return Vec::new();
         };
         let budget = if budget <= 0 { u32::MAX } else { budget as u32 };
-        crate::chunking::select_chunks(
-            rt.table.as_ref(),
-            [cam_local.x, cam_local.y, cam_local.z],
-            budget,
-        )
+        if self.coverage_selection_enabled() {
+            crate::chunking::select_chunks_coverage(rt.table.as_ref(), budget)
+        } else {
+            crate::chunking::select_chunks(
+                rt.table.as_ref(),
+                [cam_local.x, cam_local.y, cam_local.z],
+                budget,
+            )
+        }
     }
 
     pub(super) fn active_budget(&self) -> i32 {
@@ -129,6 +146,16 @@ impl GaussianSplatNode3D {
             .as_ref()
             .map(|settings| settings.bind().get_max_preview_splats().max(0))
             .unwrap_or(i32::MAX)
+    }
+
+    pub(super) fn coverage_selection_enabled(&self) -> bool {
+        self.cloud_settings
+            .as_ref()
+            .map(|settings| {
+                settings.bind().get_chunk_selection()
+                    == crate::cloud_settings::CHUNK_SELECTION_COVERAGE
+            })
+            .unwrap_or(false)
     }
 
     // Kick off an async rebuild of the active render set on a worker thread (Phase
