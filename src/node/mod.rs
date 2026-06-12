@@ -1,12 +1,13 @@
 use godot::classes::{
     Camera3D, EditorInterface, Engine, GltfState, MultiMeshInstance3D, Node3D, ShaderMaterial,
+    XrServer,
 };
 use godot::prelude::*;
 
 use crate::asset::GaussianSplatAsset;
 use crate::backend::{
-    GaussianSplatBackendSettings, BACKEND_PROFILE_DESKTOP, BACKEND_PROFILE_MOBILE,
-    BACKEND_PROFILE_VR_SAFE,
+    GaussianSplatBackendSettings, BACKEND_PROFILE_AUTOMATIC, BACKEND_PROFILE_DESKTOP,
+    BACKEND_PROFILE_MOBILE, BACKEND_PROFILE_VR_SAFE, VR_VIEW_BASIS_HEAD_CENTER,
 };
 use crate::cloud_settings::GaussianSplatCloudSettings;
 use crate::import_state::{ImportedSplatMetadata, NODE_STATE_KEY};
@@ -58,8 +59,9 @@ struct NodeBackendState {
 }
 
 // Inspector render-quality preset. Low/Middle/High are fixed presets that map to a
-// backend platform target plus a splat budget; Custom leaves the individual fields
-// (backend settings, preview limits) under manual control.
+// backend platform target plus a splat budget; VRHigh is a VR-oriented preset whose
+// budget adapts to the asset's spatial extent (see vr_adaptive_budget); Custom leaves
+// the individual fields (backend settings, preview limits) under manual control.
 #[derive(GodotConvert, Var, Export, Clone, Copy, Eq, PartialEq, Debug, Default)]
 #[godot(via = i64)]
 #[repr(i64)]
@@ -69,6 +71,11 @@ enum RenderProfile {
     Low = 1,
     Middle = 2,
     High = 3,
+    // VR-oriented high-quality preset: vr_safe pipeline + head-center sort and SH 1,
+    // with a splat budget derived from the asset's spatial extent. A 3DGS capture can
+    // be anything from a tabletop object to a whole building, so a single fixed count
+    // would not fit all scenes.
+    VRHigh = 4,
 }
 
 // Per-tier splat budgets (max rendered splats; clamped to the asset point count).
@@ -79,6 +86,20 @@ const RENDER_PROFILE_HIGH_SPLATS: i32 = i32::MAX;
 const RENDER_PROFILE_LOW_SH_DEGREE: i32 = 0;
 const RENDER_PROFILE_MIDDLE_SH_DEGREE: i32 = 1;
 const RENDER_PROFILE_HIGH_SH_DEGREE: i32 = 3;
+const RENDER_PROFILE_VR_HIGH_SH_DEGREE: i32 = 1;
+
+// VRHigh active-splat budget. A 3DGS capture ranges from a tabletop object to a
+// whole building, so VRHigh does not pin an absolute count: it interpolates between
+// a floor and a ceiling by the asset's spatial extent, then clamps to the point
+// count (in set_preview_max_splats). The budget is a per-frame work ceiling, while
+// the runtime chunk-importance selection decides which splats to spend it on. The
+// thresholds are starting values to calibrate on device (Quest 3); they assume the
+// asset's local space is roughly metric, which holds for typical normalized captures.
+const RENDER_PROFILE_VR_BUDGET_FLOOR: i32 = 300_000;
+const RENDER_PROFILE_VR_BUDGET_CEILING: i32 = 800_000;
+// Local AABB diagonal (world units) mapped to the budget floor / ceiling.
+const RENDER_PROFILE_VR_EXTENT_SMALL: f32 = 2.0;
+const RENDER_PROFILE_VR_EXTENT_LARGE: f32 = 30.0;
 
 #[derive(GodotClass)]
 #[class(tool, init, base=Node3D)]
@@ -208,35 +229,65 @@ impl GaussianSplatNode3D {
         self.apply_render_profile(profile);
     }
 
-    // Apply a fixed Low/Middle/High preset: map to a backend platform target and a
-    // splat budget. Custom makes no change (individual fields stay manual).
+    // Apply a fixed Low/Middle/High preset or the adaptive VRHigh preset: map to a
+    // backend platform target, a VR view basis, an SH degree, and a splat budget.
+    // Custom makes no change (individual fields stay manual).
     fn apply_render_profile(&mut self, profile: RenderProfile) {
-        let (target_hint, budget, sh_degree) = match profile {
+        let (target_hint, budget, sh_degree, vr_view_basis) = match profile {
             RenderProfile::Custom => return,
             RenderProfile::Low => (
                 BACKEND_PROFILE_VR_SAFE,
                 RENDER_PROFILE_LOW_SPLATS,
                 RENDER_PROFILE_LOW_SH_DEGREE,
+                VR_VIEW_BASIS_HEAD_CENTER,
             ),
             RenderProfile::Middle => (
                 BACKEND_PROFILE_MOBILE,
                 RENDER_PROFILE_MIDDLE_SPLATS,
                 RENDER_PROFILE_MIDDLE_SH_DEGREE,
+                VR_VIEW_BASIS_HEAD_CENTER,
+            ),
+            // Budget is derived from the bound asset's extent; recomputed on a later
+            // asset bind by refresh_from_asset.
+            RenderProfile::VRHigh => (
+                BACKEND_PROFILE_VR_SAFE,
+                self.vr_adaptive_budget(),
+                RENDER_PROFILE_VR_HIGH_SH_DEGREE,
+                VR_VIEW_BASIS_HEAD_CENTER,
             ),
             RenderProfile::High => (
                 BACKEND_PROFILE_DESKTOP,
                 RENDER_PROFILE_HIGH_SPLATS,
                 RENDER_PROFILE_HIGH_SH_DEGREE,
+                VR_VIEW_BASIS_HEAD_CENTER,
             ),
         };
         self.ensure_backend_settings();
         if let Some(backend_settings) = &mut self.backend_settings {
-            backend_settings
-                .bind_mut()
-                .set_target_hint(target_hint.into());
+            let mut backend_settings = backend_settings.bind_mut();
+            // resolve_pipeline matches an explicit backend `profile` before the
+            // target hint, so a pinned profile (e.g. a prior apply_mobile_defaults)
+            // would silently defeat the preset's pipeline. Presets drive the
+            // pipeline via target_hint, so reset the profile to automatic.
+            backend_settings.set_profile(BACKEND_PROFILE_AUTOMATIC.into());
+            backend_settings.set_target_hint(target_hint.into());
+            backend_settings.set_vr_view_basis(vr_view_basis.into());
         }
         self.backend_state.profile_hint = self.resolve_backend_pipeline();
         self.mark_backend_dirty("render_profile");
+        // Without a live asset the budget would clamp to 0 and the rebuild would
+        // clear any baked render (Case B: a node instanced from a pre-imported
+        // .scn has no live asset), so only the backend settings apply here.
+        // refresh_from_asset re-applies the full preset once an asset binds.
+        if self.asset.is_none() {
+            if self.splat_multimesh.is_some() {
+                godot_warn!(
+                    "[gsplat] render_profile {profile:?} set on a baked render without a \
+                     live asset; only backend settings applied (budget/SH need the asset)."
+                );
+            }
+            return;
+        }
         self.ensure_cloud_settings();
         if let Some(settings) = &mut self.cloud_settings {
             settings.bind_mut().set_sh_degree(sh_degree);
@@ -246,6 +297,36 @@ impl GaussianSplatNode3D {
         self.applying_profile = true;
         self.set_preview_max_splats(budget);
         self.applying_profile = false;
+    }
+
+    // VRHigh active-splat budget for the currently bound asset: interpolate between
+    // the floor and ceiling by the asset's spatial extent (local AABB diagonal). The
+    // result is clamped to the point count by set_preview_max_splats. Returns the
+    // floor when no asset is bound yet (refresh_from_asset recomputes once the asset
+    // is available).
+    //
+    // The curve direction (larger extent => larger budget) is a fill-rate hypothesis:
+    // a tabletop capture projects each splat large on screen, so overdraw limits how
+    // many splats are affordable, while a building-scale capture projects splats
+    // small and can spend more before fill-rate binds. A counter-pressure exists
+    // (without occlusion-aware selection, indoor scenes pay vertex/sort cost for
+    // active splats hidden behind walls), so the direction is provisional until the
+    // Quest 3 profiling matrix in docs/quest3-high-profile-notes.md validates it.
+    // Note the extent is fragile against floaters: stray splats far from the subject
+    // inflate the AABB and over-budget a small capture (the failure direction is
+    // frame drops); an occupancy-based extent from the chunk table would be more
+    // robust.
+    fn vr_adaptive_budget(&self) -> i32 {
+        let extent = self
+            .asset
+            .as_ref()
+            .map(|asset| asset.bind().get_local_aabb().size.length())
+            .unwrap_or(0.0);
+        let span = RENDER_PROFILE_VR_EXTENT_LARGE - RENDER_PROFILE_VR_EXTENT_SMALL;
+        let t = ((extent - RENDER_PROFILE_VR_EXTENT_SMALL) / span).clamp(0.0, 1.0);
+        let floor = RENDER_PROFILE_VR_BUDGET_FLOOR as f32;
+        let ceiling = RENDER_PROFILE_VR_BUDGET_CEILING as f32;
+        (floor + t * (ceiling - floor)).round() as i32
     }
 
     #[func]
@@ -589,7 +670,15 @@ impl GaussianSplatNode3D {
             self.backend_state.asset_point_count = asset_ref.get_point_count();
             self.backend_state.profile_hint = self.resolve_backend_pipeline();
             drop(asset_ref);
-            self.clamp_preview_settings_to_asset();
+            if self.render_profile_value != RenderProfile::Custom {
+                // Re-apply the active preset against the newly bound asset: a preset
+                // selected before the asset bound skipped its budget/SH writes (see
+                // the no-asset guard in apply_render_profile), and the VRHigh budget
+                // is derived from the asset extent.
+                self.apply_render_profile(self.render_profile_value);
+            } else {
+                self.clamp_preview_settings_to_asset();
+            }
         } else {
             self.is_bound = false;
             self.visibility_state.asset_ready = false;
@@ -685,10 +774,27 @@ impl GaussianSplatNode3D {
         }
     }
 
+    // World-space view transform the sort/selection tracks. An XR viewport renders
+    // from the tracked HMD pose, NOT the scene's current-flagged Camera3D — a
+    // desktop camera left current (e.g. the demo's orbit camera at the origin)
+    // would pin the sort basis and chunk selection to the wrong place — so in XR
+    // the head pose comes from the XRServer (world_origin * hmd transform).
+    pub(super) fn active_view_transform(&self) -> Option<Transform3D> {
+        if !Engine::singleton().is_editor_hint() {
+            if let Some(viewport) = self.base().get_viewport() {
+                if viewport.is_using_xr() {
+                    let xr = XrServer::singleton();
+                    return Some(xr.get_world_origin() * xr.get_hmd_transform());
+                }
+            }
+        }
+        self.active_camera()
+            .map(|camera| camera.get_global_transform())
+    }
+
     fn camera_local_pos(&self) -> Option<Vector3> {
-        let camera = self.active_camera()?;
-        let cam_world = camera.get_global_transform().origin;
-        Some(self.base().get_global_transform().affine_inverse() * cam_world)
+        let view_world = self.active_view_transform()?.origin;
+        Some(self.base().get_global_transform().affine_inverse() * view_world)
     }
 
     // Reconnect the field to the baked render child when the node is deserialized

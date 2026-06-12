@@ -6,8 +6,8 @@ use godot::classes::rendering_device::{
     DataFormat, ShaderLanguage, ShaderStage, TextureUsageBits, UniformType,
 };
 use godot::classes::{
-    Node3D, RdShaderSource, RdTextureFormat, RdTextureView, RdUniform, RenderingDevice,
-    RenderingServer, Texture2D, Texture2Drd, Viewport, XrServer,
+    RdShaderSource, RdTextureFormat, RdTextureView, RdUniform, RenderingDevice, RenderingServer,
+    Texture2D, Texture2Drd, Viewport, XrServer,
 };
 use godot::prelude::*;
 
@@ -327,13 +327,13 @@ impl GaussianSplatNode3D {
             }
         }
 
-        // Flat / head-center: a single view from the active camera (the editor
-        // viewport camera in the editor, the scene camera at runtime).
-        let Some(camera) = self.active_camera() else {
+        // Flat / head-center: a single view — the editor viewport camera in the
+        // editor, the scene camera at runtime, the tracked HMD pose in XR (the
+        // current-flagged Camera3D is not what an XR viewport renders from).
+        let Some(view_world) = self.active_view_transform() else {
             return Vec::new();
         };
-        let view = camera.get_global_transform().affine_inverse();
-        vec![(view * model, 0)]
+        vec![(view_world.affine_inverse() * model, 0)]
     }
 
     pub(super) fn vr_per_eye_enabled(&self) -> bool {
@@ -343,25 +343,22 @@ impl GaussianSplatNode3D {
             .unwrap_or(false)
     }
 
-    // Acquire per-eye world views from the XR interface. Assumes the standard
-    // XROrigin3D > XRCamera3D hierarchy for the reference transform; the exact
-    // per-eye math must be validated on real XR hardware.
+    // Acquire per-eye world views from the XR interface. The reference is the XR
+    // play-space origin from the XRServer (synced by the current XROrigin3D) —
+    // deriving it from the current camera's parent breaks when a non-XR camera is
+    // left current. The exact per-eye math must be validated on real XR hardware.
     pub(super) fn xr_eye_views(
         &self,
-        viewport: &Gd<Viewport>,
+        _viewport: &Gd<Viewport>,
         model: Transform3D,
     ) -> Option<Vec<(Transform3D, usize)>> {
-        let interface = XrServer::singleton().get_primary_interface()?;
+        let xr = XrServer::singleton();
+        let interface = xr.get_primary_interface()?;
         let view_count = interface.get_view_count().min(2);
         if view_count == 0 {
             return None;
         }
-        let reference = viewport
-            .get_camera_3d()
-            .and_then(|camera| camera.get_parent())
-            .and_then(|parent| parent.try_cast::<Node3D>().ok())
-            .map(|origin| origin.get_global_transform())
-            .unwrap_or(Transform3D::IDENTITY);
+        let reference = xr.get_world_origin();
         let mut eyes = Vec::with_capacity(view_count as usize);
         for eye in 0..view_count {
             let eye_world = interface.get_transform_for_view(eye, reference);
