@@ -180,6 +180,7 @@ impl IGltfDocumentExtension for GltfGsplatDocumentExtension {
             node.bind_mut().bind_asset(Some(asset));
             if let Some(preview_options) = preview_options {
                 apply_preview_options_to_node(&mut node, &preview_options);
+                persist_clamped_preview_max_splats(&preview_options, &node);
             }
         }
 
@@ -208,8 +209,9 @@ fn metadata_from_state(state: &Gd<GltfState>, mesh_index: i32) -> Option<VarDict
     None
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 struct SavedPreviewImportOptions {
+    import_path: String,
     max_splats: Option<i32>,
     max_splat_radius: Option<f32>,
     scale_multiplier: Option<f32>,
@@ -225,8 +227,10 @@ fn preview_options_from_saved_import_file(
 
     let mut config = ConfigFile::new_gd();
     let mut loaded = false;
+    let mut loaded_import_path = String::new();
     for import_path in import_path_candidates(state, filename.as_str()) {
         if config.load(import_path.as_str()) == Error::OK {
+            loaded_import_path = import_path;
             loaded = true;
             break;
         }
@@ -236,6 +240,7 @@ fn preview_options_from_saved_import_file(
     }
 
     let mut options = SavedPreviewImportOptions {
+        import_path: loaded_import_path,
         max_splats: config_i32(&config, OPTION_PREVIEW_MAX_SPLATS),
         max_splat_radius: config_f32(&config, OPTION_PREVIEW_MAX_SPLAT_RADIUS),
         scale_multiplier: config_f32(&config, OPTION_PREVIEW_SCALE_MULTIPLIER),
@@ -382,5 +387,34 @@ fn apply_preview_options_to_node(
     if let Some(scale_multiplier) = options.scale_multiplier {
         node.bind_mut()
             .set_preview_scale_multiplier(scale_multiplier);
+    }
+}
+
+fn persist_clamped_preview_max_splats(
+    options: &SavedPreviewImportOptions,
+    node: &Gd<GaussianSplatNode3D>,
+) {
+    let Some(saved_max_splats) = options.max_splats else {
+        return;
+    };
+    let clamped_max_splats = node.bind().get_preview_max_splats();
+    if saved_max_splats == clamped_max_splats {
+        return;
+    }
+
+    let mut config = ConfigFile::new_gd();
+    if config.load(options.import_path.as_str()) != Error::OK {
+        return;
+    }
+    config.set_value(
+        "params",
+        OPTION_PREVIEW_MAX_SPLATS,
+        &Variant::from(clamped_max_splats),
+    );
+    if config.save(options.import_path.as_str()) != Error::OK {
+        godot_warn!(
+            "Failed to save clamped Gaussian splat preview limit to '{}'.",
+            options.import_path
+        );
     }
 }
