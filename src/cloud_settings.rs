@@ -20,7 +20,7 @@ impl IResource for GaussianSplatCloudSettings {
             base,
             debug_point_size: 24.0,
             debug_visible: true,
-            debug_fallback_enabled: false,
+            debug_fallback_enabled: true,
             gaussian_scale_multiplier: 3.0,
             max_debug_splats: 10_000,
         }
