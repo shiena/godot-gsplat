@@ -363,7 +363,7 @@ fn variant_to_i32(value: &Variant) -> Option<i32> {
         value
             .try_to::<i64>()
             .ok()
-            .and_then(|value| i32::try_from(value).ok())
+            .map(|value| value.clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32)
     })
 }
 
@@ -400,14 +400,27 @@ fn record_pending_preview_max_splats_clamp(
     };
     let clamped_max_splats = node.bind().get_preview_max_splats();
     if saved_max_splats == clamped_max_splats {
+        godot_print!(
+            "[godot-gsplat] Preview limit already clamped for '{}': {}.",
+            options.import_path,
+            saved_max_splats,
+        );
         return;
     }
 
     let mut config = ConfigFile::new_gd();
     let _ = config.load(PENDING_PREVIEW_CLAMPS_PATH);
+    let source_path = import_path_to_source_path(options.import_path.as_str());
+    godot_print!(
+        "[godot-gsplat] Record pending preview clamp: import_path='{}', source_path='{}', saved={}, clamped={}.",
+        options.import_path,
+        source_path,
+        saved_max_splats,
+        clamped_max_splats,
+    );
     config.set_value(
         "files",
-        import_path_to_source_path(options.import_path.as_str()).as_str(),
+        source_path.as_str(),
         &Variant::from(clamped_max_splats),
     );
     if config.save(PENDING_PREVIEW_CLAMPS_PATH) != Error::OK {

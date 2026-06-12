@@ -214,10 +214,7 @@ fn is_internal_preview_option(option: &str) -> bool {
 }
 
 fn option_i32(plugin: &EditorScenePostImportPlugin, name: &str, fallback: i32) -> i32 {
-    plugin
-        .get_option_value(name)
-        .try_to::<i32>()
-        .unwrap_or(fallback)
+    variant_to_i32(plugin.get_option_value(name)).unwrap_or(fallback)
 }
 
 fn option_f32(plugin: &EditorScenePostImportPlugin, name: &str, fallback: f32) -> f32 {
@@ -248,7 +245,7 @@ fn apply_options_from_subresources(options: &mut PreviewImportOptions, subresour
 }
 
 fn find_i32_option(value: &Variant, name: &str) -> Option<i32> {
-    find_option(value, name).and_then(|value| value.try_to::<i32>().ok())
+    find_option(value, name).and_then(variant_to_i32)
 }
 
 fn find_f32_option(value: &Variant, name: &str) -> Option<f32> {
@@ -277,6 +274,15 @@ fn find_option(value: &Variant, name: &str) -> Option<Variant> {
     }
 
     None
+}
+
+fn variant_to_i32(value: Variant) -> Option<i32> {
+    value.try_to::<i32>().ok().or_else(|| {
+        value
+            .try_to::<i64>()
+            .ok()
+            .map(|value| value.clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32)
+    })
 }
 
 fn apply_preview_options_to_tree(mut node: Gd<Node>, options: &PreviewImportOptions) {

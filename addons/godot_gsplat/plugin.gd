@@ -10,16 +10,26 @@ const PENDING_PREVIEW_CLAMPS_PATH := "user://godot_gsplat_pending_preview_clamps
 var _gltf_extension: Object
 var _scene_post_import_plugin: Object
 var _resource_filesystem: EditorFileSystem
+var _pending_clamp_poll_elapsed := 0.0
 
 func _enter_tree() -> void:
 	_register_gltf_extension()
 	_register_scene_post_import_plugin()
 	_register_filesystem_hooks()
+	set_process(true)
 
 func _exit_tree() -> void:
+	set_process(false)
 	_unregister_filesystem_hooks()
 	_unregister_scene_post_import_plugin()
 	_unregister_gltf_extension()
+
+func _process(delta: float) -> void:
+	_pending_clamp_poll_elapsed += delta
+	if _pending_clamp_poll_elapsed < 0.25:
+		return
+	_pending_clamp_poll_elapsed = 0.0
+	_apply_pending_preview_limit_clamps()
 
 func _register_gltf_extension() -> void:
 	if _gltf_extension != null:
@@ -68,9 +78,11 @@ func _register_filesystem_hooks() -> void:
 		return
 	_resource_filesystem = get_editor_interface().get_resource_filesystem()
 	if _resource_filesystem == null:
+		print("[godot-gsplat] Editor filesystem hook unavailable.")
 		return
 	if not _resource_filesystem.resources_reimported.is_connected(_on_resources_reimported):
 		_resource_filesystem.resources_reimported.connect(_on_resources_reimported)
+		print("[godot-gsplat] Connected resources_reimported hook.")
 
 func _unregister_filesystem_hooks() -> void:
 	if _resource_filesystem == null:
@@ -80,6 +92,7 @@ func _unregister_filesystem_hooks() -> void:
 	_resource_filesystem = null
 
 func _on_resources_reimported(resources: PackedStringArray) -> void:
+	print("[godot-gsplat] resources_reimported: %s" % [Array(resources)])
 	_clamp_reimported_preview_limits(resources)
 
 func _clamp_reimported_preview_limits(resources: PackedStringArray) -> void:
@@ -92,44 +105,88 @@ func _is_gltf_path(path: String) -> bool:
 	return extension == "gltf" or extension == "glb"
 
 func _clamp_import_preview_limit(source_path: String) -> void:
-	var import_path := source_path + ".import"
-	var config := ConfigFile.new()
-	if config.load(import_path) != OK:
-		return
-	if not config.has_section_key("params", OPTION_PREVIEW_MAX_SPLATS):
-		return
-
-	var saved_limit := int(config.get_value("params", OPTION_PREVIEW_MAX_SPLATS, 10000))
 	var clamped_limit := _read_pending_preview_limit(source_path)
 	if clamped_limit < 0:
 		clamped_limit = _read_imported_point_count(source_path)
+		print("[godot-gsplat] Clamp fallback point_count for '%s': %s." % [source_path, clamped_limit])
 	if clamped_limit < 0:
+		print("[godot-gsplat] Clamp skip: point count unavailable for '%s'." % [source_path])
 		return
 
-	clamped_limit = clampi(saved_limit, 0, clamped_limit)
-	if clamped_limit == saved_limit:
+	if _apply_preview_limit_clamp(source_path, clamped_limit):
+		_clear_pending_preview_limit(source_path)
+
+func _apply_pending_preview_limit_clamps() -> void:
+	var pending_config := ConfigFile.new()
+	var load_status := pending_config.load(PENDING_PREVIEW_CLAMPS_PATH)
+	if load_status != OK:
 		return
+	if not pending_config.has_section("files"):
+		return
+
+	for source_path in pending_config.get_section_keys("files"):
+		var clamped_limit := int(pending_config.get_value("files", source_path, -1))
+		print("[godot-gsplat] Pending clamp poll: source='%s', clamped=%s." % [source_path, clamped_limit])
+		if clamped_limit < 0:
+			_clear_pending_preview_limit(source_path)
+			continue
+		if _apply_preview_limit_clamp(source_path, clamped_limit):
+			_clear_pending_preview_limit(source_path)
+
+func _apply_preview_limit_clamp(source_path: String, max_valid_limit: int) -> bool:
+	var import_path := source_path + ".import"
+	var config := ConfigFile.new()
+	var load_status := config.load(import_path)
+	if load_status != OK:
+		print("[godot-gsplat] Clamp skip: failed to load '%s': %s." % [import_path, load_status])
+		return false
+	if not config.has_section_key("params", OPTION_PREVIEW_MAX_SPLATS):
+		print("[godot-gsplat] Clamp skip: '%s' has no %s." % [import_path, OPTION_PREVIEW_MAX_SPLATS])
+		return true
+
+	var saved_limit := int(config.get_value("params", OPTION_PREVIEW_MAX_SPLATS, 10000))
+	var clamped_limit := clampi(saved_limit, 0, max_valid_limit)
+	print("[godot-gsplat] Clamp check: source='%s', saved=%s, max_valid=%s, result=%s." % [source_path, saved_limit, max_valid_limit, clamped_limit])
+	if clamped_limit == saved_limit:
+		print("[godot-gsplat] Clamp skip: saved limit already valid for '%s': %s." % [source_path, saved_limit])
+		return true
 
 	config.set_value("params", OPTION_PREVIEW_MAX_SPLATS, clamped_limit)
 	var save_status := config.save(import_path)
 	if save_status != OK:
 		push_warning("Failed to save clamped Gaussian splat preview limit for '%s': %s" % [source_path, save_status])
-		return
+		return false
 	print("[godot-gsplat] Clamped %s from %s to %s." % [OPTION_PREVIEW_MAX_SPLATS, saved_limit, clamped_limit])
+	return true
 
 func _read_pending_preview_limit(source_path: String) -> int:
 	var config := ConfigFile.new()
-	if config.load(PENDING_PREVIEW_CLAMPS_PATH) != OK:
+	var load_status := config.load(PENDING_PREVIEW_CLAMPS_PATH)
+	if load_status != OK:
+		print("[godot-gsplat] Pending clamp unavailable for '%s': load_status=%s." % [source_path, load_status])
 		return -1
 	if not config.has_section_key("files", source_path):
+		print("[godot-gsplat] Pending clamp missing for '%s'." % [source_path])
 		return -1
 
 	var clamped_limit := int(config.get_value("files", source_path, -1))
+	print("[godot-gsplat] Pending clamp hit for '%s': %s." % [source_path, clamped_limit])
+	return clamped_limit
+
+func _clear_pending_preview_limit(source_path: String) -> void:
+	var config := ConfigFile.new()
+	var load_status := config.load(PENDING_PREVIEW_CLAMPS_PATH)
+	if load_status != OK:
+		return
+	if not config.has_section_key("files", source_path):
+		return
+
 	config.set_value("files", source_path, null)
 	var save_status := config.save(PENDING_PREVIEW_CLAMPS_PATH)
 	if save_status != OK:
 		push_warning("Failed to clear pending Gaussian splat preview limit for '%s': %s" % [source_path, save_status])
-	return clamped_limit
+	else:
+		print("[godot-gsplat] Cleared pending clamp for '%s'." % [source_path])
 
 func _read_imported_point_count(source_path: String) -> int:
 	var packed_scene := ResourceLoader.load(source_path)
