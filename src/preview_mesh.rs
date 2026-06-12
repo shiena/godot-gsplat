@@ -16,7 +16,13 @@ pub struct GaussianSplatPreviewMeshInstance3D {
     #[var(get, set)]
     #[export]
     preview_scale_multiplier: PhantomVar<f32>,
-    #[export_tool_button(fn = Self::show_all_preview_splats, name = "Show All Preview Splats")]
+    #[var(
+        no_set,
+        get = get_show_all_preview_splats_button,
+        usage_flags = [EDITOR],
+        hint = TOOL_BUTTON,
+        hint_string = "Show All Preview Splats"
+    )]
     show_all_preview_splats_button: PhantomVar<Callable>,
 }
 
@@ -61,6 +67,11 @@ impl GaussianSplatPreviewMeshInstance3D {
     #[func]
     pub fn show_all_preview_splats(&mut self) {
         self.call_parent_void("show_all_preview_splats", &[]);
+    }
+
+    #[func]
+    pub fn get_show_all_preview_splats_button(&self) -> Callable {
+        self.base().callable("show_all_preview_splats")
     }
 
     fn call_parent_i32(&self, method: &str, fallback: i32) -> i32 {
