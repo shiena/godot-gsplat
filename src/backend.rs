@@ -13,8 +13,14 @@ pub const PIPELINE_MOBILE_DIRECT: &str = "mobile_direct";
 pub const PIPELINE_VR_SAFE_SPATIAL: &str = "vr_safe_spatial";
 pub const PIPELINE_DESKTOP_COMPOSITOR: &str = "desktop_compositor";
 
+pub const SORT_TRANSPORT_INLINE: &str = "inline";
+pub const SORT_TRANSPORT_LOCK_FREE_LATEST: &str = "lock_free_latest";
+
+pub const VR_VIEW_BASIS_HEAD_CENTER: &str = "head_center";
+pub const VR_VIEW_BASIS_PER_EYE: &str = "per_eye";
+
 #[derive(GodotClass)]
-#[class(base=Resource)]
+#[class(tool, base=Resource)]
 pub struct GaussianSplatBackendSettings {
     #[base]
     base: Base<Resource>,
@@ -25,6 +31,9 @@ pub struct GaussianSplatBackendSettings {
     desktop_cluster_threshold: i32,
     mobile_point_budget: i32,
     vr_point_budget: i32,
+    sort_transport: GString,
+    vr_view_basis: GString,
+    incremental_streaming: bool,
 }
 
 #[godot_api]
@@ -38,6 +47,9 @@ impl IResource for GaussianSplatBackendSettings {
             desktop_cluster_threshold: 200_000,
             mobile_point_budget: 131_072,
             vr_point_budget: 262_144,
+            sort_transport: SORT_TRANSPORT_LOCK_FREE_LATEST.into(),
+            vr_view_basis: VR_VIEW_BASIS_HEAD_CENTER.into(),
+            incremental_streaming: true,
         }
     }
 }
@@ -78,6 +90,39 @@ impl GaussianSplatBackendSettings {
     }
 
     #[func]
+    pub fn get_sort_transport(&self) -> GString {
+        self.sort_transport.clone()
+    }
+
+    #[func]
+    pub fn set_sort_transport(&mut self, sort_transport: GString) {
+        self.sort_transport = normalize_sort_transport(sort_transport.to_string().as_str()).into();
+        self.base_mut().emit_changed();
+    }
+
+    #[func]
+    pub fn get_vr_view_basis(&self) -> GString {
+        self.vr_view_basis.clone()
+    }
+
+    #[func]
+    pub fn set_vr_view_basis(&mut self, vr_view_basis: GString) {
+        self.vr_view_basis = normalize_vr_view_basis(vr_view_basis.to_string().as_str()).into();
+        self.base_mut().emit_changed();
+    }
+
+    #[func]
+    pub fn is_incremental_streaming_enabled(&self) -> bool {
+        self.incremental_streaming
+    }
+
+    #[func]
+    pub fn set_incremental_streaming_enabled(&mut self, incremental_streaming: bool) {
+        self.incremental_streaming = incremental_streaming;
+        self.base_mut().emit_changed();
+    }
+
+    #[func]
     pub fn resolve_pipeline(&self, metadata: VarDictionary) -> GString {
         let metadata = ImportedSplatMetadata::from_dictionary(metadata);
         GString::from(self.resolve_pipeline_for_metadata(&metadata).as_str())
@@ -95,6 +140,12 @@ impl GaussianSplatBackendSettings {
         );
         dict.set("mobile_point_budget", self.mobile_point_budget as i64);
         dict.set("vr_point_budget", self.vr_point_budget as i64);
+        dict.set(
+            "sort_transport",
+            &Variant::from(self.sort_transport.clone()),
+        );
+        dict.set("vr_view_basis", &Variant::from(self.vr_view_basis.clone()));
+        dict.set("incremental_streaming", self.incremental_streaming);
         dict
     }
 
@@ -103,6 +154,9 @@ impl GaussianSplatBackendSettings {
         self.profile = BACKEND_PROFILE_AUTOMATIC.into();
         self.target_hint = BACKEND_PROFILE_DESKTOP.into();
         self.allow_compositor = false;
+        self.sort_transport = SORT_TRANSPORT_LOCK_FREE_LATEST.into();
+        self.vr_view_basis = VR_VIEW_BASIS_HEAD_CENTER.into();
+        self.incremental_streaming = true;
         self.base_mut().emit_changed();
     }
 
@@ -111,6 +165,9 @@ impl GaussianSplatBackendSettings {
         self.profile = BACKEND_PROFILE_MOBILE.into();
         self.target_hint = BACKEND_PROFILE_MOBILE.into();
         self.allow_compositor = false;
+        self.sort_transport = SORT_TRANSPORT_LOCK_FREE_LATEST.into();
+        self.vr_view_basis = VR_VIEW_BASIS_HEAD_CENTER.into();
+        self.incremental_streaming = true;
         self.base_mut().emit_changed();
     }
 
@@ -119,6 +176,9 @@ impl GaussianSplatBackendSettings {
         self.profile = BACKEND_PROFILE_VR_SAFE.into();
         self.target_hint = BACKEND_PROFILE_VR_SAFE.into();
         self.allow_compositor = false;
+        self.sort_transport = SORT_TRANSPORT_LOCK_FREE_LATEST.into();
+        self.vr_view_basis = VR_VIEW_BASIS_HEAD_CENTER.into();
+        self.incremental_streaming = true;
         self.base_mut().emit_changed();
     }
 }
@@ -156,5 +216,21 @@ impl GaussianSplatBackendSettings {
         } else {
             PIPELINE_DESKTOP_DIRECT.to_string()
         }
+    }
+}
+
+fn normalize_sort_transport(sort_transport: &str) -> &'static str {
+    match sort_transport {
+        SORT_TRANSPORT_INLINE => SORT_TRANSPORT_INLINE,
+        SORT_TRANSPORT_LOCK_FREE_LATEST => SORT_TRANSPORT_LOCK_FREE_LATEST,
+        _ => SORT_TRANSPORT_LOCK_FREE_LATEST,
+    }
+}
+
+fn normalize_vr_view_basis(vr_view_basis: &str) -> &'static str {
+    match vr_view_basis {
+        VR_VIEW_BASIS_HEAD_CENTER => VR_VIEW_BASIS_HEAD_CENTER,
+        VR_VIEW_BASIS_PER_EYE => VR_VIEW_BASIS_PER_EYE,
+        _ => VR_VIEW_BASIS_HEAD_CENTER,
     }
 }

@@ -1,12 +1,42 @@
-use godot::classes::base_material_3d::{Flags as BaseMaterialFlags, ShadingMode, Transparency};
 use godot::classes::mesh::{ArrayType, PrimitiveType};
 use godot::classes::GltfState;
-use godot::classes::{ArrayMesh, MeshInstance3D, StandardMaterial3D};
+use godot::classes::{ArrayMesh, MeshInstance3D, Shader, ShaderMaterial};
 use godot::prelude::*;
 
 use crate::asset::GaussianSplatAsset;
 use crate::backend::{GaussianSplatBackendSettings, BACKEND_PROFILE_DESKTOP};
-use crate::import_state::{ImportedSplatMetadata, NODE_STATE_KEY};
+use crate::cloud_settings::GaussianSplatCloudSettings;
+use crate::import_state::{ImportedSplatMetadata, NODE_STATE_KEY, POINT_STRIDE_FLOATS};
+use crate::render_packet::GaussianSplatRenderPacket;
+
+const GAUSSIAN_BILLBOARD_SHADER: &str = r#"
+shader_type spatial;
+render_mode unshaded, cull_disabled, blend_mix, depth_draw_never;
+
+varying vec2 splat_offset;
+
+void vertex() {
+    splat_offset = UV;
+
+    vec3 center_world = (MODEL_MATRIX * vec4(VERTEX, 1.0)).xyz;
+    vec3 camera_right = INV_VIEW_MATRIX[0].xyz;
+    vec3 camera_up = INV_VIEW_MATRIX[1].xyz;
+    vec3 world_offset = camera_right * UV.x * UV2.x + camera_up * UV.y * UV2.y;
+
+    VERTEX = (inverse(MODEL_MATRIX) * vec4(center_world + world_offset, 1.0)).xyz;
+}
+
+void fragment() {
+    float radius2 = dot(splat_offset, splat_offset);
+    float alpha = COLOR.a * exp(-4.5 * radius2);
+    if (alpha < 0.003) {
+        discard;
+    }
+
+    ALBEDO = COLOR.rgb;
+    ALPHA = alpha;
+}
+"#;
 
 #[derive(Clone, Debug, Default)]
 struct NodeTransformState {
@@ -37,13 +67,15 @@ struct NodeBackendState {
 }
 
 #[derive(GodotClass)]
-#[class(init, base=Node3D)]
+#[class(tool, init, base=Node3D)]
 pub struct GaussianSplatNode3D {
     #[base]
     base: Base<Node3D>,
 
     asset: Option<Gd<GaussianSplatAsset>>,
+    cloud_settings: Option<Gd<GaussianSplatCloudSettings>>,
     backend_settings: Option<Gd<GaussianSplatBackendSettings>>,
+    render_packet: Option<Gd<GaussianSplatRenderPacket>>,
     metadata: ImportedSplatMetadata,
     is_bound: bool,
     transform_state: NodeTransformState,
@@ -55,7 +87,6 @@ pub struct GaussianSplatNode3D {
 #[godot_api]
 impl INode3D for GaussianSplatNode3D {
     fn ready(&mut self) {
-        self.ensure_debug_mesh_instance();
         self.sync_runtime_state();
         self.sync_node_name();
     }
@@ -66,6 +97,7 @@ impl GaussianSplatNode3D {
     #[func]
     pub fn bind_asset(&mut self, asset: Option<Gd<GaussianSplatAsset>>) {
         self.asset = asset;
+        self.ensure_cloud_settings();
         self.ensure_backend_settings();
         self.refresh_from_asset();
     }
@@ -75,6 +107,7 @@ impl GaussianSplatNode3D {
         self.asset = None;
         self.metadata = ImportedSplatMetadata::default();
         self.is_bound = false;
+        self.clear_render_packet();
         self.clear_debug_mesh();
         self.sync_node_name();
     }
@@ -113,6 +146,19 @@ impl GaussianSplatNode3D {
     }
 
     #[func]
+    pub fn bind_cloud_settings(&mut self, cloud_settings: Option<Gd<GaussianSplatCloudSettings>>) {
+        self.cloud_settings = cloud_settings;
+        self.ensure_cloud_settings();
+        self.mark_backend_dirty("cloud_settings");
+        self.rebuild_debug_mesh();
+    }
+
+    #[func]
+    pub fn get_cloud_settings(&self) -> Option<Gd<GaussianSplatCloudSettings>> {
+        self.cloud_settings.clone()
+    }
+
+    #[func]
     pub fn bind_backend_settings(
         &mut self,
         backend_settings: Option<Gd<GaussianSplatBackendSettings>>,
@@ -121,11 +167,17 @@ impl GaussianSplatNode3D {
         self.ensure_backend_settings();
         self.backend_state.profile_hint = self.resolve_backend_pipeline();
         self.mark_backend_dirty("backend_settings");
+        self.refresh_render_packet();
     }
 
     #[func]
     pub fn get_backend_settings(&self) -> Option<Gd<GaussianSplatBackendSettings>> {
         self.backend_settings.clone()
+    }
+
+    #[func]
+    pub fn get_render_packet(&self) -> Option<Gd<GaussianSplatRenderPacket>> {
+        self.render_packet.clone()
     }
 
     #[func]
@@ -199,6 +251,10 @@ impl GaussianSplatNode3D {
                 &Variant::from(asset_ref.get_fallback_mode()),
             );
         }
+        if let Some(render_packet) = &self.render_packet {
+            let packet_ref = render_packet.bind();
+            dict.set("render_packet", &Variant::from(packet_ref.export_packet()));
+        }
         dict
     }
 
@@ -211,7 +267,9 @@ impl GaussianSplatNode3D {
     }
 
     fn refresh_from_asset(&mut self) {
+        self.ensure_cloud_settings();
         self.ensure_backend_settings();
+        self.ensure_render_packet();
         if let Some(asset) = &self.asset {
             let asset = asset.clone();
             let asset_ref = asset.bind();
@@ -228,8 +286,9 @@ impl GaussianSplatNode3D {
             self.backend_state.asset_point_count = 0;
             self.backend_state.profile_hint.clear();
         }
-        self.rebuild_debug_mesh();
         self.mark_backend_dirty("asset");
+        self.refresh_render_packet();
+        self.rebuild_debug_mesh();
         self.sync_runtime_state();
         self.sync_node_name();
     }
@@ -256,6 +315,41 @@ impl GaussianSplatNode3D {
                 .set_target_hint(BACKEND_PROFILE_DESKTOP.into());
             self.backend_settings = Some(backend_settings);
         }
+    }
+
+    fn ensure_cloud_settings(&mut self) {
+        if self.cloud_settings.is_none() {
+            self.cloud_settings = Some(GaussianSplatCloudSettings::new_gd());
+        }
+    }
+
+    fn ensure_render_packet(&mut self) {
+        if self.render_packet.is_none() {
+            self.render_packet = Some(GaussianSplatRenderPacket::new_gd());
+        }
+    }
+
+    fn clear_render_packet(&mut self) {
+        if let Some(render_packet) = &mut self.render_packet {
+            render_packet.bind_mut().clear();
+        }
+    }
+
+    fn refresh_render_packet(&mut self) {
+        let Some(asset) = &self.asset else {
+            self.clear_render_packet();
+            return;
+        };
+        let Some(render_packet) = &mut self.render_packet else {
+            return;
+        };
+
+        let pipeline = self.backend_state.profile_hint.clone();
+        render_packet.bind_mut().prepare_from_asset(
+            asset,
+            pipeline.as_str(),
+            self.backend_state.revision,
+        );
     }
 
     fn resolve_backend_pipeline(&self) -> String {
@@ -298,52 +392,143 @@ impl GaussianSplatNode3D {
     }
 
     fn rebuild_debug_mesh(&mut self) {
-        self.ensure_debug_mesh_instance();
-
-        let Some(mesh_instance) = &mut self.debug_mesh_instance else {
+        let Some(asset) = self.asset.clone() else {
+            self.clear_debug_mesh();
             return;
         };
-        let Some(asset) = &self.asset else {
+        let cloud_settings = self.cloud_settings.clone();
+
+        if !cloud_settings
+            .as_ref()
+            .map(|settings| settings.bind().is_debug_fallback_enabled())
+            .unwrap_or(false)
+        {
+            self.clear_debug_mesh();
+            return;
+        }
+
+        self.ensure_debug_mesh_instance();
+
+        let Some((positions, uvs, uv2s, colors, indices)) =
+            self.build_gaussian_billboard_arrays(&asset, cloud_settings.as_ref())
+        else {
             self.clear_debug_mesh();
             return;
         };
 
-        let (positions, colors) = {
-            let asset_ref = asset.bind();
-            (
-                asset_ref.extract_point_positions(),
-                asset_ref.extract_point_colors(),
-            )
-        };
         if positions.is_empty() {
             self.clear_debug_mesh();
             return;
         }
+
+        let Some(mesh_instance) = &mut self.debug_mesh_instance else {
+            return;
+        };
 
         let mut arrays = VarArray::new();
         for _ in 0..ArrayType::MAX.ord() {
             arrays.push(&Variant::nil());
         }
         arrays.set(ArrayType::VERTEX.ord() as usize, &Variant::from(positions));
-        if !colors.is_empty() {
-            arrays.set(ArrayType::COLOR.ord() as usize, &Variant::from(colors));
-        }
+        arrays.set(ArrayType::TEX_UV.ord() as usize, &Variant::from(uvs));
+        arrays.set(ArrayType::TEX_UV2.ord() as usize, &Variant::from(uv2s));
+        arrays.set(ArrayType::COLOR.ord() as usize, &Variant::from(colors));
+        arrays.set(ArrayType::INDEX.ord() as usize, &Variant::from(indices));
 
         let mut mesh = ArrayMesh::new_gd();
-        mesh.add_surface_from_arrays(PrimitiveType::POINTS, &arrays);
+        mesh.add_surface_from_arrays(PrimitiveType::TRIANGLES, &arrays);
 
-        let mut material = StandardMaterial3D::new_gd();
-        material.set_shading_mode(ShadingMode::UNSHADED);
-        material.set_transparency(Transparency::ALPHA);
-        material.set_point_size(24.0);
-        material.set_flag(BaseMaterialFlags::USE_POINT_SIZE, true);
-        material.set_flag(BaseMaterialFlags::ALBEDO_FROM_VERTEX_COLOR, true);
-        material.set_flag(BaseMaterialFlags::SRGB_VERTEX_COLOR, true);
+        let mut shader = Shader::new_gd();
+        shader.set_code(GAUSSIAN_BILLBOARD_SHADER);
+
+        let mut material = ShaderMaterial::new_gd();
+        material.set_shader(&shader);
 
         let mesh_resource = mesh.upcast::<godot::classes::Mesh>();
         let material_resource = material.upcast::<godot::classes::Material>();
         mesh_instance.set_mesh(&mesh_resource);
         mesh_instance.set_material_override(&material_resource);
-        mesh_instance.set_visible(true);
+        mesh_instance.set_visible(
+            cloud_settings
+                .as_ref()
+                .map(|settings| settings.bind().is_debug_visible())
+                .unwrap_or(true),
+        );
+    }
+
+    fn build_gaussian_billboard_arrays(
+        &self,
+        asset: &Gd<GaussianSplatAsset>,
+        cloud_settings: Option<&Gd<GaussianSplatCloudSettings>>,
+    ) -> Option<(
+        PackedVector3Array,
+        PackedVector2Array,
+        PackedVector2Array,
+        PackedColorArray,
+        PackedInt32Array,
+    )> {
+        let values = {
+            let asset_ref = asset.bind();
+            asset_ref.payload_float_values()?
+        };
+
+        let source_point_count = values.len() / POINT_STRIDE_FLOATS;
+        let max_splats = cloud_settings
+            .map(|settings| settings.bind().get_max_debug_splats().max(1) as usize)
+            .unwrap_or(500_000);
+        let point_count = source_point_count.min(max_splats);
+        if point_count == 0 || point_count > (i32::MAX as usize / 4) {
+            return None;
+        }
+
+        let scale_multiplier = cloud_settings
+            .map(|settings| settings.bind().get_gaussian_scale_multiplier())
+            .unwrap_or(3.0)
+            .max(0.01);
+        let corners = [
+            Vector2::new(-1.0, -1.0),
+            Vector2::new(1.0, -1.0),
+            Vector2::new(1.0, 1.0),
+            Vector2::new(-1.0, 1.0),
+        ];
+
+        let mut positions = Vec::with_capacity(point_count * 4);
+        let mut uvs = Vec::with_capacity(point_count * 4);
+        let mut uv2s = Vec::with_capacity(point_count * 4);
+        let mut colors = Vec::with_capacity(point_count * 4);
+        let mut indices = Vec::with_capacity(point_count * 6);
+
+        for point_index in 0..point_count {
+            let offset = point_index * POINT_STRIDE_FLOATS;
+            let center = Vector3::new(values[offset], values[offset + 1], values[offset + 2]);
+            let size = Vector2::new(
+                values[offset + 7].max(0.0001) * scale_multiplier,
+                values[offset + 8].max(0.0001) * scale_multiplier,
+            );
+            let color = Color::from_rgba(
+                values[offset + 14],
+                values[offset + 15],
+                values[offset + 16],
+                values[offset + 17],
+            );
+
+            for corner in corners {
+                positions.push(center);
+                uvs.push(corner);
+                uv2s.push(size);
+                colors.push(color);
+            }
+
+            let base = (point_index * 4) as i32;
+            indices.extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
+        }
+
+        Some((
+            PackedVector3Array::from(positions),
+            PackedVector2Array::from(uvs),
+            PackedVector2Array::from(uv2s),
+            PackedColorArray::from(colors),
+            PackedInt32Array::from(indices),
+        ))
     }
 }

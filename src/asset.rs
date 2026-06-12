@@ -7,7 +7,7 @@ use crate::import_state::{
 };
 
 #[derive(GodotClass)]
-#[class(init, base=Resource)]
+#[class(tool, init, base=Resource)]
 pub struct GaussianSplatAsset {
     #[base]
     base: Base<Resource>,
@@ -98,6 +98,11 @@ impl GaussianSplatAsset {
     }
 
     #[func]
+    pub fn get_payload_byte_len(&self) -> i64 {
+        self.payload.len() as i64
+    }
+
+    #[func]
     pub fn get_payload_layout(&self) -> GString {
         self.payload_layout.clone()
     }
@@ -172,6 +177,20 @@ impl GaussianSplatAsset {
             ));
         }
         PackedColorArray::from(colors)
+    }
+
+    pub fn payload_float_values(&self) -> Option<Vec<f32>> {
+        if self.payload_layout != PAYLOAD_LAYOUT_FLOAT32_V1 {
+            return None;
+        }
+
+        let floats = self.payload.to_float32_array();
+        let values = floats.as_slice();
+        if !values.len().is_multiple_of(POINT_STRIDE_FLOATS) {
+            return None;
+        }
+
+        Some(values.to_vec())
     }
 
     #[func]
