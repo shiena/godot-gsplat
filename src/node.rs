@@ -11,7 +11,7 @@ use crate::render_packet::GaussianSplatRenderPacket;
 
 const GAUSSIAN_BILLBOARD_SHADER: &str = r#"
 shader_type spatial;
-render_mode unshaded, cull_disabled, blend_mix, depth_draw_never;
+render_mode unshaded, cull_disabled, blend_mix, depth_prepass_alpha;
 
 varying vec2 splat_offset;
 
@@ -485,6 +485,10 @@ impl GaussianSplatNode3D {
             .map(|settings| settings.bind().get_gaussian_scale_multiplier())
             .unwrap_or(3.0)
             .max(0.01);
+        let max_splat_radius = cloud_settings
+            .map(|settings| settings.bind().get_max_debug_splat_radius())
+            .unwrap_or(0.02)
+            .max(0.001);
         let corners = [
             Vector2::new(-1.0, -1.0),
             Vector2::new(1.0, -1.0),
@@ -501,10 +505,13 @@ impl GaussianSplatNode3D {
         for point_index in 0..point_count {
             let offset = point_index * POINT_STRIDE_FLOATS;
             let center = Vector3::new(values[offset], values[offset + 1], values[offset + 2]);
-            let size = Vector2::new(
-                values[offset + 7].max(0.0001) * scale_multiplier,
-                values[offset + 8].max(0.0001) * scale_multiplier,
-            );
+            let radius = values[offset + 7]
+                .max(values[offset + 8])
+                .max(values[offset + 9])
+                .max(0.0001)
+                * scale_multiplier;
+            let preview_radius = radius.clamp(0.001, max_splat_radius);
+            let size = Vector2::new(preview_radius, preview_radius);
             let color = Color::from_rgba(
                 values[offset + 14],
                 values[offset + 15],

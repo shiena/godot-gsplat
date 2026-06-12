@@ -10,6 +10,7 @@ pub struct GaussianSplatCloudSettings {
     debug_visible: bool,
     debug_fallback_enabled: bool,
     gaussian_scale_multiplier: f32,
+    max_debug_splat_radius: f32,
     max_debug_splats: i32,
 }
 
@@ -21,7 +22,8 @@ impl IResource for GaussianSplatCloudSettings {
             debug_point_size: 24.0,
             debug_visible: true,
             debug_fallback_enabled: true,
-            gaussian_scale_multiplier: 3.0,
+            gaussian_scale_multiplier: 1.0,
+            max_debug_splat_radius: 0.02,
             max_debug_splats: 10_000,
         }
     }
@@ -74,6 +76,17 @@ impl GaussianSplatCloudSettings {
     }
 
     #[func]
+    pub fn get_max_debug_splat_radius(&self) -> f32 {
+        self.max_debug_splat_radius
+    }
+
+    #[func]
+    pub fn set_max_debug_splat_radius(&mut self, max_debug_splat_radius: f32) {
+        self.max_debug_splat_radius = max_debug_splat_radius.max(0.001);
+        self.base_mut().emit_changed();
+    }
+
+    #[func]
     pub fn get_max_debug_splats(&self) -> i32 {
         self.max_debug_splats
     }
@@ -89,7 +102,8 @@ impl GaussianSplatCloudSettings {
         self.debug_point_size = 24.0;
         self.debug_visible = true;
         self.debug_fallback_enabled = true;
-        self.gaussian_scale_multiplier = 3.0;
+        self.gaussian_scale_multiplier = 1.0;
+        self.max_debug_splat_radius = 0.02;
         self.max_debug_splats = 10_000;
         self.base_mut().emit_changed();
     }
