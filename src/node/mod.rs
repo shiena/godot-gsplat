@@ -102,6 +102,21 @@ const RENDER_PROFILE_VR_BUDGET_CEILING: i32 = 800_000;
 const RENDER_PROFILE_VR_EXTENT_SMALL: f32 = 2.0;
 const RENDER_PROFILE_VR_EXTENT_LARGE: f32 = 30.0;
 
+// Keys of the profile-settings dictionary exchanged with GDScript
+// (get_profile_settings / apply_profile_settings). GDScript reads a profile's
+// resolved values, overrides individual keys (e.g. splat_depth_mode), and hands
+// the dictionary back to apply — so one field can be overridden without
+// re-deriving the rest.
+const PROFILE_KEY_TARGET_HINT: &str = "target_hint";
+const PROFILE_KEY_BUDGET: &str = "budget";
+const PROFILE_KEY_SH_DEGREE: &str = "sh_degree";
+const PROFILE_KEY_VR_VIEW_BASIS: &str = "vr_view_basis";
+const PROFILE_KEY_SPLAT_DEPTH_MODE: &str = "splat_depth_mode";
+// Budget sentinel meaning "resolve from the bound asset's spatial extent"
+// (VRHigh). Kept in the dictionary so the asset-adaptive budget is recomputed
+// when the asset binds rather than frozen to the no-asset floor.
+const PROFILE_BUDGET_ADAPTIVE: i64 = -1;
+
 #[derive(GodotClass)]
 #[class(tool, init, base=Node3D)]
 pub struct GaussianSplatNode3D {
@@ -148,6 +163,11 @@ pub struct GaussianSplatNode3D {
     applying_profile: bool,
     // Backing storage for the `source_gltf` export (PhantomVar holds no state).
     source_gltf_path: GString,
+    // The last settings dictionary applied via a render profile or
+    // apply_profile_settings. Its asset-dependent parts (budget/SH) are re-applied
+    // when an asset binds, so a GDScript field override survives the bind. None ==
+    // Custom / fully manual: refresh_from_asset just clamps the preview budget.
+    applied_settings: Option<VarDictionary>,
 }
 
 #[godot_api]
@@ -239,79 +259,157 @@ impl GaussianSplatNode3D {
         self.apply_render_profile(profile);
     }
 
-    // Apply a fixed Low/Middle/High preset or the adaptive VRHigh preset: map to a
-    // backend platform target, a VR view basis, an SH degree, and a splat budget.
-    // Custom makes no change (individual fields stay manual).
+    // Resolve a fixed Low/Middle/High preset or the adaptive VRHigh preset to its
+    // concrete settings, then apply them. Custom keeps the individual fields under
+    // manual control and stops re-applying a preset when a later asset binds.
     fn apply_render_profile(&mut self, profile: RenderProfile) {
+        if profile == RenderProfile::Custom {
+            self.applied_settings = None;
+            return;
+        }
+        let settings = self.get_profile_settings(profile);
+        self.apply_profile_settings(settings);
+    }
+
+    // Resolve a render profile to its concrete settings dictionary. GDScript can
+    // read it, override individual keys (e.g. splat_depth_mode), and hand it back
+    // to apply_profile_settings — so a single field is overridden without
+    // re-deriving the rest. Keys: target_hint, budget (i64; PROFILE_BUDGET_ADAPTIVE
+    // == -1 means "derive from the asset extent"), sh_degree, vr_view_basis,
+    // splat_depth_mode. Custom returns the node's current effective settings, so a
+    // "read current, tweak, re-apply" round-trip works too.
+    #[func]
+    fn get_profile_settings(&self, profile: RenderProfile) -> VarDictionary {
         let (target_hint, budget, sh_degree, vr_view_basis, splat_depth_mode) = match profile {
-            RenderProfile::Custom => return,
+            RenderProfile::Custom => return self.current_effective_settings(),
             RenderProfile::Low => (
                 BACKEND_PROFILE_VR_SAFE,
-                RENDER_PROFILE_LOW_SPLATS,
+                RENDER_PROFILE_LOW_SPLATS as i64,
                 RENDER_PROFILE_LOW_SH_DEGREE,
                 VR_VIEW_BASIS_HEAD_CENTER,
                 SPLAT_DEPTH_MODE_RAY,
             ),
             RenderProfile::Middle => (
                 BACKEND_PROFILE_MOBILE,
-                RENDER_PROFILE_MIDDLE_SPLATS,
+                RENDER_PROFILE_MIDDLE_SPLATS as i64,
                 RENDER_PROFILE_MIDDLE_SH_DEGREE,
                 VR_VIEW_BASIS_HEAD_CENTER,
                 SPLAT_DEPTH_MODE_RAY,
             ),
-            // Budget is derived from the bound asset's extent; recomputed on a later
-            // asset bind by refresh_from_asset.
+            // The budget is asset-adaptive; the sentinel defers it to apply time so
+            // the bound asset's extent (in refresh_from_asset) drives it.
             RenderProfile::VRHigh => (
                 BACKEND_PROFILE_VR_SAFE,
-                self.vr_adaptive_budget(),
+                PROFILE_BUDGET_ADAPTIVE,
                 RENDER_PROFILE_VR_HIGH_SH_DEGREE,
                 VR_VIEW_BASIS_HEAD_CENTER,
                 SPLAT_DEPTH_MODE_CENTER,
             ),
             RenderProfile::High => (
                 BACKEND_PROFILE_DESKTOP,
-                RENDER_PROFILE_HIGH_SPLATS,
+                RENDER_PROFILE_HIGH_SPLATS as i64,
                 RENDER_PROFILE_HIGH_SH_DEGREE,
                 VR_VIEW_BASIS_HEAD_CENTER,
                 SPLAT_DEPTH_MODE_RAY,
             ),
         };
+        profile_settings_dict(target_hint, budget, sh_degree, vr_view_basis, splat_depth_mode)
+    }
+
+    // Apply an explicit settings dictionary (the keys from get_profile_settings).
+    // Backend-target fields (target_hint, vr_view_basis, splat_depth_mode) are set
+    // immediately and persist across an asset (re)bind. budget/SH need a bound
+    // asset, so they apply now when one is bound and are otherwise deferred — the
+    // stored dictionary is re-applied by refresh_from_asset on bind, which is what
+    // lets a GDScript override survive. Missing keys keep the current value.
+    #[func]
+    fn apply_profile_settings(&mut self, settings: VarDictionary) {
         self.ensure_backend_settings();
         if let Some(backend_settings) = &mut self.backend_settings {
             let mut backend_settings = backend_settings.bind_mut();
             // resolve_pipeline matches an explicit backend `profile` before the
-            // target hint, so a pinned profile (e.g. a prior apply_mobile_defaults)
-            // would silently defeat the preset's pipeline. Presets drive the
-            // pipeline via target_hint, so reset the profile to automatic.
+            // target hint, so a pinned profile would defeat the target hint.
+            // Presets drive the pipeline via target_hint, so reset to automatic.
             backend_settings.set_profile(BACKEND_PROFILE_AUTOMATIC.into());
-            backend_settings.set_target_hint(target_hint.into());
-            backend_settings.set_vr_view_basis(vr_view_basis.into());
-            backend_settings.set_splat_depth_mode(splat_depth_mode.into());
+            if let Some(target_hint) = dict_gstring(&settings, PROFILE_KEY_TARGET_HINT) {
+                backend_settings.set_target_hint(target_hint);
+            }
+            if let Some(vr_view_basis) = dict_gstring(&settings, PROFILE_KEY_VR_VIEW_BASIS) {
+                backend_settings.set_vr_view_basis(vr_view_basis);
+            }
+            if let Some(splat_depth_mode) = dict_gstring(&settings, PROFILE_KEY_SPLAT_DEPTH_MODE) {
+                backend_settings.set_splat_depth_mode(splat_depth_mode);
+            }
         }
         self.backend_state.profile_hint = self.resolve_backend_pipeline();
-        self.mark_backend_dirty("render_profile");
+        self.mark_backend_dirty("profile_settings");
+        // Remember for re-application against a newly bound asset (budget/SH need it).
+        self.applied_settings = Some(settings.clone());
         // Without a live asset the budget would clamp to 0 and the rebuild would
-        // clear any baked render (Case B: a node instanced from a pre-imported
-        // .scn has no live asset), so only the backend settings apply here.
-        // refresh_from_asset re-applies the full preset once an asset binds.
+        // clear any baked render (a node instanced from a pre-imported .scn has no
+        // live asset), so only the backend settings apply here; refresh_from_asset
+        // re-applies the asset-dependent parts once an asset binds.
         if self.asset.is_none() {
             if self.splat_multimesh.is_some() {
                 godot_warn!(
-                    "[gsplat] render_profile {profile:?} set on a baked render without a \
+                    "[gsplat] profile settings applied on a baked render without a \
                      live asset; only backend settings applied (budget/SH need the asset)."
                 );
             }
             return;
         }
+        self.apply_asset_dependent_settings(&settings);
+    }
+
+    // Apply the asset-dependent parts of a settings dictionary (SH degree and the
+    // splat budget) and rebuild. Runs once an asset is bound; the adaptive budget
+    // sentinel resolves from the asset extent here. set_preview_max_splats rebuilds
+    // the render, so the depth mode set on the backend settings is picked up.
+    fn apply_asset_dependent_settings(&mut self, settings: &VarDictionary) {
         self.ensure_cloud_settings();
-        if let Some(settings) = &mut self.cloud_settings {
-            settings.bind_mut().set_sh_degree(sh_degree);
+        if let Some(sh_degree) = dict_i64(settings, PROFILE_KEY_SH_DEGREE) {
+            if let Some(cloud_settings) = &mut self.cloud_settings {
+                cloud_settings.bind_mut().set_sh_degree(sh_degree as i32);
+            }
         }
-        // The budget caps the rendered splat count and rebuilds the render. Guard
-        // so these preset-driven writes do not flip the profile back to Custom.
+        let budget = dict_i64(settings, PROFILE_KEY_BUDGET).unwrap_or(PROFILE_BUDGET_ADAPTIVE);
+        let budget = if budget < 0 {
+            self.vr_adaptive_budget()
+        } else {
+            budget as i32
+        };
+        // Guard so these preset-driven writes do not flip the profile to Custom.
         self.applying_profile = true;
         self.set_preview_max_splats(budget);
         self.applying_profile = false;
+    }
+
+    // The node's current effective settings (what get_profile_settings(Custom)
+    // returns): backend-target fields from the bound settings (class defaults when
+    // none), the current preview budget, and the current SH degree.
+    fn current_effective_settings(&self) -> VarDictionary {
+        let (target_hint, vr_view_basis, splat_depth_mode) = match &self.backend_settings {
+            Some(backend_settings) => {
+                let backend_settings = backend_settings.bind();
+                (
+                    backend_settings.get_target_hint().to_string(),
+                    backend_settings.get_vr_view_basis().to_string(),
+                    backend_settings.get_splat_depth_mode().to_string(),
+                )
+            }
+            None => (
+                BACKEND_PROFILE_DESKTOP.to_string(),
+                VR_VIEW_BASIS_HEAD_CENTER.to_string(),
+                SPLAT_DEPTH_MODE_RAY.to_string(),
+            ),
+        };
+        profile_settings_dict(
+            &target_hint,
+            self.get_preview_max_splats() as i64,
+            self.get_sh_degree(),
+            &vr_view_basis,
+            &splat_depth_mode,
+        )
     }
 
     // VRHigh active-splat budget for the currently bound asset: interpolate between
@@ -461,9 +559,11 @@ impl GaussianSplatNode3D {
 
     #[func]
     pub fn set_preview_max_splats(&mut self, max_splats: i32) {
-        // A manual budget edit no longer matches a fixed preset, so drop to Custom.
+        // A manual budget edit no longer matches a fixed preset, so drop to Custom
+        // and stop re-applying a stored preset's settings when an asset rebinds.
         if !self.applying_profile {
             self.render_profile_value = RenderProfile::Custom;
+            self.applied_settings = None;
         }
         self.ensure_cloud_settings();
         let max_splats = self.clamp_preview_max_splats(max_splats);
@@ -484,9 +584,11 @@ impl GaussianSplatNode3D {
 
     #[func]
     pub fn set_sh_degree(&mut self, sh_degree: i32) {
-        // A manual SH-degree edit no longer matches a fixed preset, so drop to Custom.
+        // A manual SH-degree edit no longer matches a fixed preset, so drop to Custom
+        // and stop re-applying a stored preset's settings when an asset rebinds.
         if !self.applying_profile {
             self.render_profile_value = RenderProfile::Custom;
+            self.applied_settings = None;
         }
         self.ensure_cloud_settings();
         if let Some(settings) = &mut self.cloud_settings {
@@ -710,12 +812,13 @@ impl GaussianSplatNode3D {
             self.backend_state.asset_point_count = asset_ref.get_point_count();
             self.backend_state.profile_hint = self.resolve_backend_pipeline();
             drop(asset_ref);
-            if self.render_profile_value != RenderProfile::Custom {
-                // Re-apply the active preset against the newly bound asset: a preset
-                // selected before the asset bound skipped its budget/SH writes (see
-                // the no-asset guard in apply_render_profile), and the VRHigh budget
-                // is derived from the asset extent.
-                self.apply_render_profile(self.render_profile_value);
+            if let Some(settings) = self.applied_settings.clone() {
+                // Re-apply the asset-dependent parts of the last-applied settings
+                // (budget/SH) now that an asset is bound: they were skipped pre-bind
+                // and the adaptive budget needs the extent. The backend-target fields
+                // already persist on backend_settings, so they are NOT re-applied —
+                // that is what lets a GDScript override (e.g. splat_depth_mode) stick.
+                self.apply_asset_dependent_settings(&settings);
             } else {
                 self.clamp_preview_settings_to_asset();
             }
@@ -861,4 +964,39 @@ impl GaussianSplatNode3D {
             .and_then(|mesh_instance| mesh_instance.get_material_override())
             .and_then(|material| material.try_cast::<ShaderMaterial>().ok())
     }
+}
+
+// Build a profile-settings dictionary from resolved values (the round-trip
+// contract with GDScript; see get_profile_settings).
+fn profile_settings_dict(
+    target_hint: &str,
+    budget: i64,
+    sh_degree: i32,
+    vr_view_basis: &str,
+    splat_depth_mode: &str,
+) -> VarDictionary {
+    let mut dict = VarDictionary::new();
+    dict.set(
+        PROFILE_KEY_TARGET_HINT,
+        &Variant::from(GString::from(target_hint)),
+    );
+    dict.set(PROFILE_KEY_BUDGET, budget);
+    dict.set(PROFILE_KEY_SH_DEGREE, sh_degree as i64);
+    dict.set(
+        PROFILE_KEY_VR_VIEW_BASIS,
+        &Variant::from(GString::from(vr_view_basis)),
+    );
+    dict.set(
+        PROFILE_KEY_SPLAT_DEPTH_MODE,
+        &Variant::from(GString::from(splat_depth_mode)),
+    );
+    dict
+}
+
+fn dict_gstring(dict: &VarDictionary, key: &str) -> Option<GString> {
+    dict.get(key).and_then(|value| value.try_to::<GString>().ok())
+}
+
+fn dict_i64(dict: &VarDictionary, key: &str) -> Option<i64> {
+    dict.get(key).and_then(|value| value.try_to::<i64>().ok())
 }
