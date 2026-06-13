@@ -636,13 +636,6 @@ impl GaussianSplatNode3D {
         self.backend.sort.enabled_in_shader
     }
 
-    // Lifetime GPU sort dispatch count (telemetry: shows the on-device re-sort
-    // rate, which view-change gating is supposed to keep low for a calm head).
-    #[func]
-    pub fn get_sort_dispatch_count(&self) -> i64 {
-        self.backend.sort.dispatch_count as i64
-    }
-
     #[func]
     pub fn export_runtime_state(&self) -> VarDictionary {
         let mut dict = VarDictionary::new();
