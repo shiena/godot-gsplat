@@ -41,8 +41,17 @@ jobs:
             echo "has_errors=false" >> $GITHUB_OUTPUT
           fi
 
+      - name: Run tests
+        id: test
+        run: |
+          if ! cargo test 2>&1 | tee test_output.txt; then
+            echo "has_failures=true" >> $GITHUB_OUTPUT
+          else
+            echo "has_failures=false" >> $GITHUB_OUTPUT
+          fi
+
       - name: Comment on PR
-        if: steps.fmt.outputs.has_diff == 'true' || steps.clippy.outputs.has_errors == 'true'
+        if: steps.fmt.outputs.has_diff == 'true' || steps.clippy.outputs.has_errors == 'true' || steps.test.outputs.has_failures == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -75,13 +84,26 @@ jobs:
               cat clippy_output.txt
               echo "\`\`\`"
               echo "</details>"
+              echo ""
+            fi
+
+            if [ "${{ steps.test.outputs.has_failures }}" = "true" ]; then
+              echo "### Test Failures"
+              echo ""
+              echo "<details>"
+              echo "<summary>Output</summary>"
+              echo ""
+              echo "\`\`\`"
+              cat test_output.txt
+              echo "\`\`\`"
+              echo "</details>"
             fi
           } > comment.md
 
           gh pr comment ${{ github.event.pull_request.number }} --body-file comment.md
 
       - name: Fail if issues found
-        if: steps.fmt.outputs.has_diff == 'true' || steps.clippy.outputs.has_errors == 'true'
+        if: steps.fmt.outputs.has_diff == 'true' || steps.clippy.outputs.has_errors == 'true' || steps.test.outputs.has_failures == 'true'
         run: |
           echo "::error::CI checks failed. See PR comment for details."
           exit 1
