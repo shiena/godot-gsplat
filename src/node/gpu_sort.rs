@@ -42,11 +42,25 @@ const ST_SCAN_BLOCKSUMS: usize = 2;
 const ST_SCAN_ADD: usize = 3;
 const ST_SCATTER: usize = 4;
 
-// Re-sort gating threshold: a fraction of the splat cloud diagonal the camera
-// must move (in node-local space) before a re-sort. The camera-distance sort
-// key is rotation-invariant, so only camera POSITION changes can change the
-// order — rotation needs no gate at all.
+// Re-sort gating threshold: the camera must move at least this far (node-local)
+// from the last sort position before the order is recomputed. Scale-relative (a
+// fraction of the cloud diagonal) so large scenes tolerate larger motion. The
+// camera-distance sort key is rotation-invariant, so only camera POSITION can
+// change the order — rotation needs no gate at all.
 const SORT_RESORT_POS_FRACTION: f32 = 0.002;
+// Absolute floor (node-local meters) under the scale-relative threshold. A worn
+// HMD reports ~1-3 cm of positional sensor sway even when the user holds still,
+// which on a small/tabletop capture (tiny diagonal -> tiny relative threshold)
+// re-triggers a sort every throttle interval. Each re-sort reshuffles the
+// single-pass counting sort's non-deterministic within-bucket order (the scatter
+// races on atomicAdd), surfacing as a faint white twinkle that never settles.
+// The floor freezes the order while the user is effectively stationary; real
+// locomotion (a lean/step, well past the floor) still re-sorts, and there the
+// genuine parallax masks the within-bucket reshuffle. Assumes a roughly metric
+// node-local space (typical normalized captures); a heavily rescaled node skews
+// it, like the budget extent heuristic. Tune on device against
+// tests/verify_head_jitter.gd.
+const SORT_RESORT_POS_FLOOR: f32 = 0.02;
 // Minimum interval between re-sorts. An unthrottled HMD re-sorts ~30x/s while
 // looking around (measured on Quest 3: App 14 -> 20-24 ms at 800k splats).
 const SORT_RESORT_MIN_INTERVAL_MS: u64 = 200;
@@ -404,8 +418,8 @@ impl GaussianSplatNode3D {
     // Whether the camera moved (in node-local space) enough to warrant a re-sort.
     // Rotation never changes a camera-distance order, so it is not considered.
     pub(super) fn sort_cam_moved(&self, last: Vector3, current: Vector3) -> bool {
-        let scale = self.backend.sort.local_aabb.size.length().max(1.0e-3);
-        (current - last).length() > scale * SORT_RESORT_POS_FRACTION
+        let diagonal = self.backend.sort.local_aabb.size.length();
+        (current - last).length() > resort_pos_threshold(diagonal)
     }
 
     // Queue a back-to-front counting sort per view (camera_view * node_model). One
@@ -672,6 +686,14 @@ fn depth_range(view: Transform3D, aabb: Aabb) -> (f32, f32) {
     (0.0, 1.0 / dist_max.max(1e-4))
 }
 
+// Node-local distance the camera must move from the last sort position before a
+// re-sort fires: the scale-relative fraction of the cloud diagonal, floored at
+// SORT_RESORT_POS_FLOOR so worn-HMD positional sway can't re-trigger sorts (and
+// the resulting within-bucket reshuffle twinkle) while the user holds still.
+fn resort_pos_threshold(aabb_diagonal: f32) -> f32 {
+    (aabb_diagonal * SORT_RESORT_POS_FRACTION).max(SORT_RESORT_POS_FLOOR)
+}
+
 fn aabb_corners(aabb: Aabb) -> [Vector3; 8] {
     let p = aabb.position;
     let s = aabb.size;
@@ -711,6 +733,22 @@ mod tests {
             (range_a - range_b).abs() < range_a * 1.0e-5,
             "rotation changed the distance range: {range_a} vs {range_b}"
         );
+    }
+
+    // The re-sort gate must not collapse to near-zero on small captures: a
+    // tabletop diagonal falls back to the absolute floor (so worn-HMD sway can't
+    // re-trigger sorts at rest), while a building-scale diagonal is governed by
+    // the scale-relative term.
+    #[test]
+    fn resort_threshold_floors_small_scenes() {
+        let tabletop = Vector3::new(0.4, 0.4, 0.4).length(); // ~0.69 m diagonal
+        assert_eq!(resort_pos_threshold(tabletop), SORT_RESORT_POS_FLOOR);
+        assert_eq!(resort_pos_threshold(0.0), SORT_RESORT_POS_FLOOR);
+
+        let building = Vector3::new(40.0, 15.0, 40.0).length(); // ~58.5 m diagonal
+        let relative = building * SORT_RESORT_POS_FRACTION;
+        assert!(relative > SORT_RESORT_POS_FLOOR);
+        assert!((resort_pos_threshold(building) - relative).abs() < 1.0e-6);
     }
 
     // With the camera inside the cloud the lower bound must stay 0 so nearby
