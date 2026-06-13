@@ -313,7 +313,13 @@ impl GaussianSplatNode3D {
                 SPLAT_DEPTH_MODE_RAY,
             ),
         };
-        profile_settings_dict(target_hint, budget, sh_degree, vr_view_basis, splat_depth_mode)
+        profile_settings_dict(
+            target_hint,
+            budget,
+            sh_degree,
+            vr_view_basis,
+            splat_depth_mode,
+        )
     }
 
     // Apply an explicit settings dictionary (the keys from get_profile_settings).
@@ -994,7 +1000,8 @@ fn profile_settings_dict(
 }
 
 fn dict_gstring(dict: &VarDictionary, key: &str) -> Option<GString> {
-    dict.get(key).and_then(|value| value.try_to::<GString>().ok())
+    dict.get(key)
+        .and_then(|value| value.try_to::<GString>().ok())
 }
 
 fn dict_i64(dict: &VarDictionary, key: &str) -> Option<i64> {
