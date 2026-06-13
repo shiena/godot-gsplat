@@ -60,8 +60,8 @@ struct NodeBackendState {
 }
 
 // Inspector render-quality preset. Low/Middle/High are fixed presets that map to a
-// backend platform target plus a splat budget; VRHigh is a VR-oriented preset whose
-// budget adapts to the asset's spatial extent (see vr_adaptive_budget); Custom leaves
+// backend platform target plus a splat budget; XR is a VR-oriented preset whose
+// budget adapts to the asset's spatial extent (see xr_adaptive_budget); Custom leaves
 // the individual fields (backend settings, preview limits) under manual control.
 #[derive(GodotConvert, Var, Export, Clone, Copy, Eq, PartialEq, Debug, Default)]
 #[godot(via = i64)]
@@ -76,7 +76,7 @@ enum RenderProfile {
     // with a splat budget derived from the asset's spatial extent. A 3DGS capture can
     // be anything from a tabletop object to a whole building, so a single fixed count
     // would not fit all scenes.
-    VRHigh = 4,
+    XR = 4,
 }
 
 // Per-tier splat budgets (max rendered splats; clamped to the asset point count).
@@ -87,20 +87,20 @@ const RENDER_PROFILE_HIGH_SPLATS: i32 = i32::MAX;
 const RENDER_PROFILE_LOW_SH_DEGREE: i32 = 0;
 const RENDER_PROFILE_MIDDLE_SH_DEGREE: i32 = 1;
 const RENDER_PROFILE_HIGH_SH_DEGREE: i32 = 3;
-const RENDER_PROFILE_VR_HIGH_SH_DEGREE: i32 = 1;
+const RENDER_PROFILE_XR_SH_DEGREE: i32 = 1;
 
-// VRHigh active-splat budget. A 3DGS capture ranges from a tabletop object to a
-// whole building, so VRHigh does not pin an absolute count: it interpolates between
+// XR active-splat budget. A 3DGS capture ranges from a tabletop object to a
+// whole building, so XR does not pin an absolute count: it interpolates between
 // a floor and a ceiling by the asset's spatial extent, then clamps to the point
 // count (in set_preview_max_splats). The budget is a per-frame work ceiling, while
 // the runtime chunk-importance selection decides which splats to spend it on. The
 // thresholds are starting values to calibrate on device (Quest 3); they assume the
 // asset's local space is roughly metric, which holds for typical normalized captures.
-const RENDER_PROFILE_VR_BUDGET_FLOOR: i32 = 300_000;
-const RENDER_PROFILE_VR_BUDGET_CEILING: i32 = 800_000;
+const RENDER_PROFILE_XR_BUDGET_FLOOR: i32 = 300_000;
+const RENDER_PROFILE_XR_BUDGET_CEILING: i32 = 800_000;
 // Local AABB diagonal (world units) mapped to the budget floor / ceiling.
-const RENDER_PROFILE_VR_EXTENT_SMALL: f32 = 2.0;
-const RENDER_PROFILE_VR_EXTENT_LARGE: f32 = 30.0;
+const RENDER_PROFILE_XR_EXTENT_SMALL: f32 = 2.0;
+const RENDER_PROFILE_XR_EXTENT_LARGE: f32 = 30.0;
 
 // Keys of the profile-settings dictionary exchanged with GDScript
 // (get_profile_settings / apply_profile_settings). GDScript reads a profile's
@@ -113,7 +113,7 @@ const PROFILE_KEY_SH_DEGREE: &str = "sh_degree";
 const PROFILE_KEY_VR_VIEW_BASIS: &str = "vr_view_basis";
 const PROFILE_KEY_SPLAT_DEPTH_MODE: &str = "splat_depth_mode";
 // Budget sentinel meaning "resolve from the bound asset's spatial extent"
-// (VRHigh). Kept in the dictionary so the asset-adaptive budget is recomputed
+// (XR). Kept in the dictionary so the asset-adaptive budget is recomputed
 // when the asset binds rather than frozen to the no-asset floor.
 const PROFILE_BUDGET_ADAPTIVE: i64 = -1;
 
@@ -259,7 +259,7 @@ impl GaussianSplatNode3D {
         self.apply_render_profile(profile);
     }
 
-    // Resolve a fixed Low/Middle/High preset or the adaptive VRHigh preset to its
+    // Resolve a fixed Low/Middle/High preset or the adaptive XR preset to its
     // concrete settings, then apply them. Custom keeps the individual fields under
     // manual control and stops re-applying a preset when a later asset binds.
     fn apply_render_profile(&mut self, profile: RenderProfile) {
@@ -298,10 +298,10 @@ impl GaussianSplatNode3D {
             ),
             // The budget is asset-adaptive; the sentinel defers it to apply time so
             // the bound asset's extent (in refresh_from_asset) drives it.
-            RenderProfile::VRHigh => (
+            RenderProfile::XR => (
                 BACKEND_PROFILE_VR_SAFE,
                 PROFILE_BUDGET_ADAPTIVE,
-                RENDER_PROFILE_VR_HIGH_SH_DEGREE,
+                RENDER_PROFILE_XR_SH_DEGREE,
                 VR_VIEW_BASIS_HEAD_CENTER,
                 SPLAT_DEPTH_MODE_CENTER,
             ),
@@ -374,7 +374,7 @@ impl GaussianSplatNode3D {
         }
         let budget = dict_i64(settings, PROFILE_KEY_BUDGET).unwrap_or(PROFILE_BUDGET_ADAPTIVE);
         let budget = if budget < 0 {
-            self.vr_adaptive_budget()
+            self.xr_adaptive_budget()
         } else {
             budget as i32
         };
@@ -412,7 +412,7 @@ impl GaussianSplatNode3D {
         )
     }
 
-    // VRHigh active-splat budget for the currently bound asset: interpolate between
+    // XR active-splat budget for the currently bound asset: interpolate between
     // the floor and ceiling by the asset's spatial extent (local AABB diagonal). The
     // result is clamped to the point count by set_preview_max_splats. Returns the
     // floor when no asset is bound yet (refresh_from_asset recomputes once the asset
@@ -429,16 +429,16 @@ impl GaussianSplatNode3D {
     // inflate the AABB and over-budget a small capture (the failure direction is
     // frame drops); an occupancy-based extent from the chunk table would be more
     // robust.
-    fn vr_adaptive_budget(&self) -> i32 {
+    fn xr_adaptive_budget(&self) -> i32 {
         let extent = self
             .asset
             .as_ref()
             .map(|asset| asset.bind().get_local_aabb().size.length())
             .unwrap_or(0.0);
-        let span = RENDER_PROFILE_VR_EXTENT_LARGE - RENDER_PROFILE_VR_EXTENT_SMALL;
-        let t = ((extent - RENDER_PROFILE_VR_EXTENT_SMALL) / span).clamp(0.0, 1.0);
-        let floor = RENDER_PROFILE_VR_BUDGET_FLOOR as f32;
-        let ceiling = RENDER_PROFILE_VR_BUDGET_CEILING as f32;
+        let span = RENDER_PROFILE_XR_EXTENT_LARGE - RENDER_PROFILE_XR_EXTENT_SMALL;
+        let t = ((extent - RENDER_PROFILE_XR_EXTENT_SMALL) / span).clamp(0.0, 1.0);
+        let floor = RENDER_PROFILE_XR_BUDGET_FLOOR as f32;
+        let ceiling = RENDER_PROFILE_XR_BUDGET_CEILING as f32;
         (floor + t * (ceiling - floor)).round() as i32
     }
 
