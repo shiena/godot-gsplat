@@ -7,7 +7,8 @@ use godot::prelude::*;
 use crate::asset::GaussianSplatAsset;
 use crate::backend::{
     GaussianSplatBackendSettings, BACKEND_PROFILE_AUTOMATIC, BACKEND_PROFILE_DESKTOP,
-    BACKEND_PROFILE_MOBILE, BACKEND_PROFILE_VR_SAFE, VR_VIEW_BASIS_HEAD_CENTER,
+    BACKEND_PROFILE_MOBILE, BACKEND_PROFILE_VR_SAFE, SPLAT_DEPTH_MODE_CENTER, SPLAT_DEPTH_MODE_RAY,
+    VR_VIEW_BASIS_HEAD_CENTER,
 };
 use crate::cloud_settings::GaussianSplatCloudSettings;
 use crate::import_state::{ImportedSplatMetadata, NODE_STATE_KEY};
@@ -242,19 +243,21 @@ impl GaussianSplatNode3D {
     // backend platform target, a VR view basis, an SH degree, and a splat budget.
     // Custom makes no change (individual fields stay manual).
     fn apply_render_profile(&mut self, profile: RenderProfile) {
-        let (target_hint, budget, sh_degree, vr_view_basis) = match profile {
+        let (target_hint, budget, sh_degree, vr_view_basis, splat_depth_mode) = match profile {
             RenderProfile::Custom => return,
             RenderProfile::Low => (
                 BACKEND_PROFILE_VR_SAFE,
                 RENDER_PROFILE_LOW_SPLATS,
                 RENDER_PROFILE_LOW_SH_DEGREE,
                 VR_VIEW_BASIS_HEAD_CENTER,
+                SPLAT_DEPTH_MODE_RAY,
             ),
             RenderProfile::Middle => (
                 BACKEND_PROFILE_MOBILE,
                 RENDER_PROFILE_MIDDLE_SPLATS,
                 RENDER_PROFILE_MIDDLE_SH_DEGREE,
                 VR_VIEW_BASIS_HEAD_CENTER,
+                SPLAT_DEPTH_MODE_RAY,
             ),
             // Budget is derived from the bound asset's extent; recomputed on a later
             // asset bind by refresh_from_asset.
@@ -263,12 +266,14 @@ impl GaussianSplatNode3D {
                 self.vr_adaptive_budget(),
                 RENDER_PROFILE_VR_HIGH_SH_DEGREE,
                 VR_VIEW_BASIS_HEAD_CENTER,
+                SPLAT_DEPTH_MODE_CENTER,
             ),
             RenderProfile::High => (
                 BACKEND_PROFILE_DESKTOP,
                 RENDER_PROFILE_HIGH_SPLATS,
                 RENDER_PROFILE_HIGH_SH_DEGREE,
                 VR_VIEW_BASIS_HEAD_CENTER,
+                SPLAT_DEPTH_MODE_RAY,
             ),
         };
         self.ensure_backend_settings();
@@ -281,6 +286,7 @@ impl GaussianSplatNode3D {
             backend_settings.set_profile(BACKEND_PROFILE_AUTOMATIC.into());
             backend_settings.set_target_hint(target_hint.into());
             backend_settings.set_vr_view_basis(vr_view_basis.into());
+            backend_settings.set_splat_depth_mode(splat_depth_mode.into());
         }
         self.backend_state.profile_hint = self.resolve_backend_pipeline();
         self.mark_backend_dirty("render_profile");

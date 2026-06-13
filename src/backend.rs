@@ -16,6 +16,9 @@ pub const PIPELINE_DESKTOP_COMPOSITOR: &str = "desktop_compositor";
 pub const VR_VIEW_BASIS_HEAD_CENTER: &str = "head_center";
 pub const VR_VIEW_BASIS_PER_EYE: &str = "per_eye";
 
+pub const SPLAT_DEPTH_MODE_RAY: &str = "ray";
+pub const SPLAT_DEPTH_MODE_CENTER: &str = "center";
+
 #[derive(GodotClass)]
 #[class(tool, base=Resource)]
 pub struct GaussianSplatBackendSettings {
@@ -27,6 +30,7 @@ pub struct GaussianSplatBackendSettings {
     allow_compositor: bool,
     desktop_cluster_threshold: i32,
     vr_view_basis: GString,
+    splat_depth_mode: GString,
 }
 
 #[godot_api]
@@ -39,6 +43,7 @@ impl IResource for GaussianSplatBackendSettings {
             allow_compositor: false,
             desktop_cluster_threshold: 200_000,
             vr_view_basis: VR_VIEW_BASIS_HEAD_CENTER.into(),
+            splat_depth_mode: SPLAT_DEPTH_MODE_RAY.into(),
         }
     }
 }
@@ -90,6 +95,18 @@ impl GaussianSplatBackendSettings {
     }
 
     #[func]
+    pub fn get_splat_depth_mode(&self) -> GString {
+        self.splat_depth_mode.clone()
+    }
+
+    #[func]
+    pub fn set_splat_depth_mode(&mut self, splat_depth_mode: GString) {
+        self.splat_depth_mode =
+            normalize_splat_depth_mode(splat_depth_mode.to_string().as_str()).into();
+        self.base_mut().emit_changed();
+    }
+
+    #[func]
     pub fn resolve_pipeline(&self, metadata: VarDictionary) -> GString {
         let metadata = ImportedSplatMetadata::from_dictionary(metadata);
         GString::from(self.resolve_pipeline_for_metadata(&metadata).as_str())
@@ -106,6 +123,10 @@ impl GaussianSplatBackendSettings {
             self.desktop_cluster_threshold as i64,
         );
         dict.set("vr_view_basis", &Variant::from(self.vr_view_basis.clone()));
+        dict.set(
+            "splat_depth_mode",
+            &Variant::from(self.splat_depth_mode.clone()),
+        );
         dict
     }
 
@@ -115,6 +136,7 @@ impl GaussianSplatBackendSettings {
         self.target_hint = BACKEND_PROFILE_DESKTOP.into();
         self.allow_compositor = false;
         self.vr_view_basis = VR_VIEW_BASIS_HEAD_CENTER.into();
+        self.splat_depth_mode = SPLAT_DEPTH_MODE_RAY.into();
         self.base_mut().emit_changed();
     }
 
@@ -124,6 +146,7 @@ impl GaussianSplatBackendSettings {
         self.target_hint = BACKEND_PROFILE_MOBILE.into();
         self.allow_compositor = false;
         self.vr_view_basis = VR_VIEW_BASIS_HEAD_CENTER.into();
+        self.splat_depth_mode = SPLAT_DEPTH_MODE_RAY.into();
         self.base_mut().emit_changed();
     }
 
@@ -133,6 +156,7 @@ impl GaussianSplatBackendSettings {
         self.target_hint = BACKEND_PROFILE_VR_SAFE.into();
         self.allow_compositor = false;
         self.vr_view_basis = VR_VIEW_BASIS_HEAD_CENTER.into();
+        self.splat_depth_mode = SPLAT_DEPTH_MODE_CENTER.into();
         self.base_mut().emit_changed();
     }
 }
@@ -178,5 +202,12 @@ fn normalize_vr_view_basis(vr_view_basis: &str) -> &'static str {
         VR_VIEW_BASIS_HEAD_CENTER => VR_VIEW_BASIS_HEAD_CENTER,
         VR_VIEW_BASIS_PER_EYE => VR_VIEW_BASIS_PER_EYE,
         _ => VR_VIEW_BASIS_HEAD_CENTER,
+    }
+}
+
+fn normalize_splat_depth_mode(splat_depth_mode: &str) -> &'static str {
+    match splat_depth_mode {
+        SPLAT_DEPTH_MODE_CENTER => SPLAT_DEPTH_MODE_CENTER,
+        _ => SPLAT_DEPTH_MODE_RAY,
     }
 }

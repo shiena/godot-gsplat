@@ -11,6 +11,7 @@ use godot::classes::{
 use godot::prelude::*;
 
 use crate::asset::GaussianSplatAsset;
+use crate::backend::SPLAT_DEPTH_MODE_CENTER;
 use crate::cloud_settings::GaussianSplatCloudSettings;
 use crate::import_state::POINT_STRIDE_FLOATS;
 
@@ -120,6 +121,7 @@ impl GaussianSplatNode3D {
     // chunk rebuild (Phase C2b), which both produce a `SplatRenderData`.
     pub(super) fn apply_render_data(&mut self, render: SplatRenderData) {
         let cloud_settings = self.cloud_settings.clone();
+        let depth_mode = self.splat_depth_mode_uniform();
 
         // Per-splat data texture (four RGBA-float texels per splat).
         let Some(image) = Image::create_from_data(
@@ -211,6 +213,7 @@ impl GaussianSplatNode3D {
         // Step 1 renders unsorted (slot == id); the compute sort (Step 2) flips this on.
         material.set_shader_parameter("sort_enabled", &Variant::from(0_i32));
         material.set_shader_parameter("sort_per_eye", &Variant::from(0_i32));
+        material.set_shader_parameter("splat_depth_mode", &Variant::from(depth_mode));
 
         let material_resource = material.upcast::<godot::classes::Material>();
         mesh_instance.set_multimesh(&multimesh);
@@ -287,6 +290,17 @@ impl GaussianSplatNode3D {
             };
 
         pack_raw(&slice, scale_multiplier, stride, sh_degree).map(raw_to_render)
+    }
+}
+
+impl GaussianSplatNode3D {
+    fn splat_depth_mode_uniform(&self) -> i32 {
+        self.backend_settings
+            .as_ref()
+            .map(|settings| {
+                (settings.bind().get_splat_depth_mode() == SPLAT_DEPTH_MODE_CENTER) as i32
+            })
+            .unwrap_or(0)
     }
 }
 

@@ -40,6 +40,8 @@ uniform int sort_enabled;
 // washed-out white (Quest standalone and PC-VR alike).
 uniform int sort_per_eye;
 uniform int sh_degree;
+// 0 = ray-vs-ellipsoid per-corner depth, 1 = splat-center depth.
+uniform int splat_depth_mode;
 
 varying vec2 v_corner;
 varying vec4 v_color;
@@ -133,120 +135,119 @@ void vertex() {
     vec4 quat = vec4(t1.z, t1.w, t2.x, t2.y);
     mat4 mvp = PROJECTION_MATRIX * VIEW_MATRIX * MODEL_MATRIX;
     vec4 center_clip = mvp * vec4(center, 1.0);
+        vec3 ax0 = q_rotate(vec3(scale.x, 0.0, 0.0), quat);
+        vec3 ax1 = q_rotate(vec3(0.0, scale.y, 0.0), quat);
+        vec3 ax2 = q_rotate(vec3(0.0, 0.0, scale.z), quat);
 
-    vec3 ax0 = q_rotate(vec3(scale.x, 0.0, 0.0), quat);
-    vec3 ax1 = q_rotate(vec3(0.0, scale.y, 0.0), quat);
-    vec3 ax2 = q_rotate(vec3(0.0, 0.0, scale.z), quat);
-
-    bool valid = center_clip.w > DIV_EPS;
-    vec2 ell_center = vec2(0.0);
-    vec2 ell_axis = vec2(1.0, 0.0);
-    vec2 ell_size = vec2(0.0);
-    if (valid) {
-        vec2 cndc = center_clip.xy / center_clip.w;
-        vec4 ac0 = mvp * vec4(ax0, 0.0);
-        vec4 ac1 = mvp * vec4(ax1, 0.0);
-        vec4 ac2 = mvp * vec4(ax2, 0.0);
-        vec3 HX = vec3(ac0.x - cndc.x * ac0.w, ac1.x - cndc.x * ac1.w, ac2.x - cndc.x * ac2.w);
-        vec3 HY = vec3(ac0.y - cndc.y * ac0.w, ac1.y - cndc.y * ac1.w, ac2.y - cndc.y * ac2.w);
-        vec3 HW = vec3(ac0.w, ac1.w, ac2.w);
-        float c00 = dot(HX, HX);
-        float c01 = dot(HX, HY);
-        float c11 = dot(HY, HY);
-        float c02 = dot(HX, HW);
-        float c12 = dot(HY, HW);
-        float c22 = dot(HW, HW) - center_clip.w * center_clip.w;
-        if (c22 > 0.0) { c00 = -c00; c01 = -c01; c11 = -c11; c02 = -c02; c12 = -c12; c22 = -c22; }
-        if (abs(c22) <= DIV_EPS) {
-            valid = false;
-        } else {
-            float invC22 = 1.0 / c22;
-            float invS = -invC22;
-            vec2 localCenter = vec2(c02, c12) * invC22;
-            float covXX = (c00 - c02 * c02 * invC22) * invS;
-            float covXY = (c01 - c02 * c12 * invC22) * invS;
-            float covYY = (c11 - c12 * c12 * invC22) * invS;
-            float trace = covXX + covYY;
-            float diff = covXX - covYY;
-            float discr = sqrt(max(diff * diff + 4.0 * covXY * covXY, 0.0));
-            float lMaj = 0.5 * (trace + discr);
-            float lMin = 0.5 * (trace - discr);
-            if (lMaj <= 0.0 || lMin <= 0.0) {
+        bool valid = center_clip.w > DIV_EPS;
+        vec2 ell_center = vec2(0.0);
+        vec2 ell_axis = vec2(1.0, 0.0);
+        vec2 ell_size = vec2(0.0);
+        if (valid) {
+            vec2 cndc = center_clip.xy / center_clip.w;
+            vec4 ac0 = mvp * vec4(ax0, 0.0);
+            vec4 ac1 = mvp * vec4(ax1, 0.0);
+            vec4 ac2 = mvp * vec4(ax2, 0.0);
+            vec3 HX = vec3(ac0.x - cndc.x * ac0.w, ac1.x - cndc.x * ac1.w, ac2.x - cndc.x * ac2.w);
+            vec3 HY = vec3(ac0.y - cndc.y * ac0.w, ac1.y - cndc.y * ac1.w, ac2.y - cndc.y * ac2.w);
+            vec3 HW = vec3(ac0.w, ac1.w, ac2.w);
+            float c00 = dot(HX, HX);
+            float c01 = dot(HX, HY);
+            float c11 = dot(HY, HY);
+            float c02 = dot(HX, HW);
+            float c12 = dot(HY, HW);
+            float c22 = dot(HW, HW) - center_clip.w * center_clip.w;
+            if (c22 > 0.0) { c00 = -c00; c01 = -c01; c11 = -c11; c02 = -c02; c12 = -c12; c22 = -c22; }
+            if (abs(c22) <= DIV_EPS) {
                 valid = false;
             } else {
-                ell_axis = (abs(covXY) + abs(lMaj - covXX) > DIV_EPS)
-                    ? normalize(vec2(covXY, lMaj - covXX)) : vec2(1.0, 0.0);
-                ell_center = cndc + localCenter;
-                ell_size = sqrt(vec2(lMaj, lMin));
-            }
-        }
-    }
-
-    // Reject non-finite / degenerate results (NaN fails the > comparisons).
-    if (!(ell_size.x > 0.0) || !(ell_size.y > 0.0)
-        || !(abs(ell_center.x) < 1.0e4) || !(abs(ell_center.y) < 1.0e4)) {
-        valid = false;
-    }
-
-    // --- Energy-preserving antialiasing: clamp the footprint to a minimum screen
-    // size and dim alpha by the area ratio so sub-pixel splats stay visible without
-    // over-brightening. Replaces the fixed covariance dilation. (GS.cginc.)
-    vec2 half_px = VIEWPORT_SIZE * 0.5;            // 1 NDC unit == half_px pixels
-    vec2 size_px = ell_size * half_px;
-    vec2 size_aa = max(size_px, vec2(SPLAT_MIN_STD_PX));
-    float area_scale = (size_px.x * size_px.y) / max(size_aa.x * size_aa.y, DIV_EPS);
-    v_color.a *= area_scale;
-    size_aa = min(size_aa, vec2(SPLAT_MAX_STD_PX));
-    ell_size = size_aa / half_px;
-
-    // Frustum cull: if the footprint is entirely off-viewport, collapse the quad.
-    float reach = 2.0 * 1.41421356 * max(ell_size.x, ell_size.y);  // |UV|<=2, sqrt(2) sigma map
-    if (!valid
-        || ell_center.x - reach > 1.0 || ell_center.x + reach < -1.0
-        || ell_center.y - reach > 1.0 || ell_center.y + reach < -1.0) {
-        POSITION = vec4(2.0, 2.0, 2.0, 1.0);   // degenerate / clipped
-    } else {
-        // Stretch the quad corner along the ellipse axes. The sqrt(2) maps UV (in
-        // [-2,2]) to standard-deviation units so the fragment's exp(-|UV|^2) equals
-        // the true anisotropic Gaussian exp(-0.5 * mahalanobis^2).
-        mat2 rot = mat2(vec2(ell_axis.x, ell_axis.y), vec2(-ell_axis.y, ell_axis.x));
-        vec2 ndc = ell_center + rot * (v_corner * ell_size * 1.41421356);
-
-        // Per-corner depth: depth of the Gaussian peak along the view ray through
-        // this corner (ray vs ellipsoid, metric closest approach). Writes
-        // POSITION.z only (keeps early-z; no fragment DEPTH). Falls back to the
-        // splat-center depth. (GS.cginc GSTryGetRaySplatDepth.)
-        float depth = center_clip.z / center_clip.w;
-        vec3 cam_w = INV_VIEW_MATRIX[3].xyz;
-        vec3 center_w = (MODEL_MATRIX * vec4(center, 1.0)).xyz;
-        vec3 a0w = (MODEL_MATRIX * vec4(ax0, 0.0)).xyz;
-        vec3 a1w = (MODEL_MATRIX * vec4(ax1, 0.0)).xyz;
-        vec3 a2w = (MODEL_MATRIX * vec4(ax2, 0.0)).xyz;
-        // Inverse of A = [a0w a1w a2w] via cofactor rows (maps world -> unit space).
-        vec3 cof0 = cross(a1w, a2w);
-        vec3 cof1 = cross(a2w, a0w);
-        vec3 cof2 = cross(a0w, a1w);
-        float det = dot(a0w, cof0);
-        if (abs(det) > DIV_EPS) {
-            vec4 vdir = INV_PROJECTION_MATRIX * vec4(ndc, 1.0, 1.0);
-            vec3 dir_w = normalize(mat3(INV_VIEW_MATRIX) * (vdir.xyz / vdir.w));
-            float inv_det = 1.0 / det;
-            vec3 oc = cam_w - center_w;
-            vec3 m = vec3(dot(cof0, oc), dot(cof1, oc), dot(cof2, oc)) * inv_det;
-            vec3 d = vec3(dot(cof0, dir_w), dot(cof1, dir_w), dot(cof2, dir_w)) * inv_det;
-            float dd = dot(d, d);
-            if (dd > DIV_EPS) {
-                float t = -dot(m, d) / dd;
-                if (t > DIV_EPS) {
-                    vec4 hit_clip = PROJECTION_MATRIX * VIEW_MATRIX * vec4(cam_w + dir_w * t, 1.0);
-                    if (hit_clip.w > DIV_EPS) {
-                        depth = clamp(hit_clip.z / hit_clip.w, 0.0, 1.0);
-                    }
+                float invC22 = 1.0 / c22;
+                float invS = -invC22;
+                vec2 localCenter = vec2(c02, c12) * invC22;
+                float covXX = (c00 - c02 * c02 * invC22) * invS;
+                float covXY = (c01 - c02 * c12 * invC22) * invS;
+                float covYY = (c11 - c12 * c12 * invC22) * invS;
+                float trace = covXX + covYY;
+                float diff = covXX - covYY;
+                float discr = sqrt(max(diff * diff + 4.0 * covXY * covXY, 0.0));
+                float lMaj = 0.5 * (trace + discr);
+                float lMin = 0.5 * (trace - discr);
+                if (lMaj <= 0.0 || lMin <= 0.0) {
+                    valid = false;
+                } else {
+                    ell_axis = (abs(covXY) + abs(lMaj - covXX) > DIV_EPS)
+                        ? normalize(vec2(covXY, lMaj - covXX)) : vec2(1.0, 0.0);
+                    ell_center = cndc + localCenter;
+                    ell_size = sqrt(vec2(lMaj, lMin));
                 }
             }
         }
-        POSITION = vec4(ndc, depth, 1.0);
-    }
+
+        // Reject non-finite / degenerate results (NaN fails the > comparisons).
+        if (!(ell_size.x > 0.0) || !(ell_size.y > 0.0)
+            || !(abs(ell_center.x) < 1.0e4) || !(abs(ell_center.y) < 1.0e4)) {
+            valid = false;
+        }
+
+        // --- Energy-preserving antialiasing: clamp the footprint to a minimum screen
+        // size and dim alpha by the area ratio so sub-pixel splats stay visible without
+        // over-brightening. Replaces the fixed covariance dilation. (GS.cginc.)
+        vec2 half_px = VIEWPORT_SIZE * 0.5;            // 1 NDC unit == half_px pixels
+        vec2 size_px = ell_size * half_px;
+        vec2 size_aa = max(size_px, vec2(SPLAT_MIN_STD_PX));
+        float area_scale = (size_px.x * size_px.y) / max(size_aa.x * size_aa.y, DIV_EPS);
+        v_color.a *= area_scale;
+        size_aa = min(size_aa, vec2(SPLAT_MAX_STD_PX));
+        ell_size = size_aa / half_px;
+
+        // Frustum cull: if the footprint is entirely off-viewport, collapse the quad.
+        float reach = 2.0 * 1.41421356 * max(ell_size.x, ell_size.y);  // |UV|<=2, sqrt(2) sigma map
+        if (!valid
+            || ell_center.x - reach > 1.0 || ell_center.x + reach < -1.0
+            || ell_center.y - reach > 1.0 || ell_center.y + reach < -1.0) {
+            POSITION = vec4(2.0, 2.0, 2.0, 1.0);   // degenerate / clipped
+        } else {
+            // Stretch the quad corner along the ellipse axes. The sqrt(2) maps UV (in
+            // [-2,2]) to standard-deviation units so the fragment's exp(-|UV|^2) equals
+            // the true anisotropic Gaussian exp(-0.5 * mahalanobis^2).
+            mat2 rot = mat2(vec2(ell_axis.x, ell_axis.y), vec2(-ell_axis.y, ell_axis.x));
+            vec2 ndc = ell_center + rot * (v_corner * ell_size * 1.41421356);
+
+            // Per-corner depth: depth of the Gaussian peak along the view ray through
+            // this corner (ray vs ellipsoid, metric closest approach). Writes
+            // POSITION.z only (keeps early-z; no fragment DEPTH). Falls back to the
+            // splat-center depth. (GS.cginc GSTryGetRaySplatDepth.)
+            float depth = center_clip.z / center_clip.w;
+            vec3 cam_w = INV_VIEW_MATRIX[3].xyz;
+            vec3 center_w = (MODEL_MATRIX * vec4(center, 1.0)).xyz;
+            vec3 a0w = (MODEL_MATRIX * vec4(ax0, 0.0)).xyz;
+            vec3 a1w = (MODEL_MATRIX * vec4(ax1, 0.0)).xyz;
+            vec3 a2w = (MODEL_MATRIX * vec4(ax2, 0.0)).xyz;
+            // Inverse of A = [a0w a1w a2w] via cofactor rows (maps world -> unit space).
+            vec3 cof0 = cross(a1w, a2w);
+            vec3 cof1 = cross(a2w, a0w);
+            vec3 cof2 = cross(a0w, a1w);
+            float det = dot(a0w, cof0);
+            if (splat_depth_mode == 0 && abs(det) > DIV_EPS) {
+                vec4 vdir = INV_PROJECTION_MATRIX * vec4(ndc, 1.0, 1.0);
+                vec3 dir_w = normalize(mat3(INV_VIEW_MATRIX) * (vdir.xyz / vdir.w));
+                float inv_det = 1.0 / det;
+                vec3 oc = cam_w - center_w;
+                vec3 m = vec3(dot(cof0, oc), dot(cof1, oc), dot(cof2, oc)) * inv_det;
+                vec3 d = vec3(dot(cof0, dir_w), dot(cof1, dir_w), dot(cof2, dir_w)) * inv_det;
+                float dd = dot(d, d);
+                if (dd > DIV_EPS) {
+                    float t = -dot(m, d) / dd;
+                    if (t > DIV_EPS) {
+                        vec4 hit_clip = PROJECTION_MATRIX * VIEW_MATRIX * vec4(cam_w + dir_w * t, 1.0);
+                        if (hit_clip.w > DIV_EPS) {
+                            depth = clamp(hit_clip.z / hit_clip.w, 0.0, 1.0);
+                        }
+                    }
+                }
+            }
+            POSITION = vec4(ndc, depth, 1.0);
+        }
 }
 
 void fragment() {
