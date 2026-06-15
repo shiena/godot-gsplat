@@ -299,6 +299,150 @@ pub fn select_chunks_coverage(table: &ChunkTable, budget: u32) -> Vec<(u32, u32)
         .collect()
 }
 
+/// Select chunks inside a wide view cone and distance range. Chunks in range are
+/// kept represented; if their full count exceeds `budget`, low-priority chunks
+/// (farther from the camera and farther from the view center) are reduced to a
+/// prefix LOD instead of shrinking the distance range.
+pub fn select_chunks_view_priority(
+    table: &ChunkTable,
+    cam: [f32; 3],
+    forward: [f32; 3],
+    fov_degrees: f32,
+    full_distance: f32,
+    budget: u32,
+    min_lod_per_chunk: u32,
+) -> Vec<(u32, u32)> {
+    if table.entries.is_empty() || budget == 0 || full_distance <= 0.0 {
+        return Vec::new();
+    }
+
+    let forward = normalize_or(forward, [0.0, 0.0, -1.0]);
+    let fov_degrees = fov_degrees.clamp(1.0, 360.0);
+    let cos_half_fov = (fov_degrees.to_radians() * 0.5).cos();
+    let include_all_angles = fov_degrees >= 359.999;
+
+    let mut candidates: Vec<ViewPriorityCandidate> = Vec::new();
+    for (idx, entry) in table.entries.iter().enumerate() {
+        let distance = aabb_distance(cam, entry.aabb_min, entry.aabb_max);
+        if distance > full_distance {
+            continue;
+        }
+
+        let center = aabb_center(entry.aabb_min, entry.aabb_max);
+        let to_center = [center[0] - cam[0], center[1] - cam[1], center[2] - cam[2]];
+        let dir = normalize_or(to_center, forward);
+        let center_dot = dot3(forward, dir).clamp(-1.0, 1.0);
+        if !include_all_angles && center_dot < cos_half_fov {
+            continue;
+        }
+
+        let distance_score = 1.0 / (1.0 + distance.max(0.0));
+        let angle_score = (center_dot + 1.0) * 0.5;
+        let count_score = (entry.count.max(1) as f32).ln() * 0.01;
+        let priority = distance_score * 2.0 + angle_score * 2.0 + count_score;
+        candidates.push(ViewPriorityCandidate {
+            idx: idx as u32,
+            count: entry.count,
+            priority,
+        });
+    }
+
+    if candidates.is_empty() {
+        return Vec::new();
+    }
+
+    let total: u64 = candidates.iter().map(|c| c.count as u64).sum();
+    if total <= budget as u64 {
+        return sorted_selection(candidates.into_iter().map(|c| (c.idx, c.count)));
+    }
+
+    let min_lod_per_chunk = min_lod_per_chunk.max(1);
+    let candidate_count = candidates.len() as u32;
+    if budget < candidate_count {
+        candidates.sort_by(high_priority_first);
+        return sorted_selection(
+            candidates
+                .into_iter()
+                .take(budget as usize)
+                .map(|c| (c.idx, 1)),
+        );
+    }
+
+    let effective_min_lod = min_lod_per_chunk.min((budget / candidate_count).max(1));
+    let mut selected: Vec<(u32, u32, f32)> = candidates
+        .into_iter()
+        .map(|c| (c.idx, c.count, c.priority))
+        .collect();
+    let mut current_total: u64 = selected.iter().map(|&(_, count, _)| count as u64).sum();
+    selected.sort_by(low_priority_first);
+
+    for (_, lod, _) in &mut selected {
+        if current_total <= budget as u64 {
+            break;
+        }
+        let floor = effective_min_lod.min(*lod);
+        let removable = (*lod - floor) as u64;
+        let needed = current_total - budget as u64;
+        let remove = removable.min(needed) as u32;
+        *lod -= remove;
+        current_total -= remove as u64;
+    }
+
+    sorted_selection(
+        selected
+            .into_iter()
+            .map(|(idx, lod, _)| (idx, lod))
+            .filter(|&(_, lod)| lod > 0),
+    )
+}
+
+#[derive(Clone, Copy)]
+struct ViewPriorityCandidate {
+    idx: u32,
+    count: u32,
+    priority: f32,
+}
+
+fn high_priority_first(a: &ViewPriorityCandidate, b: &ViewPriorityCandidate) -> std::cmp::Ordering {
+    b.priority
+        .partial_cmp(&a.priority)
+        .unwrap_or(std::cmp::Ordering::Equal)
+        .then(a.idx.cmp(&b.idx))
+}
+
+fn low_priority_first(a: &(u32, u32, f32), b: &(u32, u32, f32)) -> std::cmp::Ordering {
+    a.2.partial_cmp(&b.2)
+        .unwrap_or(std::cmp::Ordering::Equal)
+        .then(a.0.cmp(&b.0))
+}
+
+fn sorted_selection(items: impl Iterator<Item = (u32, u32)>) -> Vec<(u32, u32)> {
+    let mut selected: Vec<(u32, u32)> = items.collect();
+    selected.sort_unstable_by_key(|&(idx, _)| idx);
+    selected
+}
+
+fn aabb_center(min: [f32; 3], max: [f32; 3]) -> [f32; 3] {
+    [
+        (min[0] + max[0]) * 0.5,
+        (min[1] + max[1]) * 0.5,
+        (min[2] + max[2]) * 0.5,
+    ]
+}
+
+fn normalize_or(v: [f32; 3], fallback: [f32; 3]) -> [f32; 3] {
+    let len_sq = dot3(v, v);
+    if len_sq <= 1.0e-12 {
+        return fallback;
+    }
+    let inv_len = len_sq.sqrt().recip();
+    [v[0] * inv_len, v[1] * inv_len, v[2] * inv_len]
+}
+
+fn dot3(a: [f32; 3], b: [f32; 3]) -> f32 {
+    a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
+}
+
 /// Concatenate the first `lod_count` (importance-ranked) splats of each selected
 /// `(chunk_index, lod_count)` into one slice (the active render set). Out-of-range
 /// chunks are skipped; `lod_count` is clamped to the chunk's size.
@@ -533,6 +677,94 @@ mod tests {
         };
         assert_eq!(by_idx[&big], 45);
         assert_eq!(by_idx[&small], 5);
+    }
+
+    #[test]
+    fn view_priority_keeps_candidates_full_when_budget_allows() {
+        let payload = grid_payload();
+        let part = partition_payload(&payload, 2.0, POINT_STRIDE_FLOATS);
+        let table = &part.table;
+        let selected = select_chunks_view_priority(
+            table,
+            [0.0, 0.0, 0.0],
+            [1.0, 1.0, 0.0],
+            360.0,
+            100.0,
+            u32::MAX,
+            2,
+        );
+        assert_eq!(selected.len(), table.entries.len());
+        assert_eq!(
+            selected.iter().map(|&(_, lod)| lod).sum::<u32>(),
+            table.entries.iter().map(|entry| entry.count).sum::<u32>()
+        );
+    }
+
+    #[test]
+    fn view_priority_reduces_low_priority_chunks_before_near_center_chunks() {
+        let table = ChunkTable {
+            chunk_size: 2.0,
+            grid_origin: [0.0, 0.0, 0.0],
+            stride: POINT_STRIDE_FLOATS,
+            entries: vec![
+                ChunkEntry {
+                    grid: [0, 0, 0],
+                    aabb_min: [0.0, -0.5, -0.5],
+                    aabb_max: [1.0, 0.5, 0.5],
+                    offset: 0,
+                    count: 100,
+                },
+                ChunkEntry {
+                    grid: [1, 0, 0],
+                    aabb_min: [9.0, -0.5, -0.5],
+                    aabb_max: [10.0, 0.5, 0.5],
+                    offset: 100,
+                    count: 100,
+                },
+                ChunkEntry {
+                    grid: [0, 1, 0],
+                    aabb_min: [0.0, 9.0, -0.5],
+                    aabb_max: [1.0, 10.0, 0.5],
+                    offset: 200,
+                    count: 100,
+                },
+            ],
+        };
+        let selected = select_chunks_view_priority(
+            &table,
+            [0.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0],
+            200.0,
+            20.0,
+            150,
+            10,
+        );
+        assert_eq!(selected.iter().map(|&(_, lod)| lod).sum::<u32>(), 150);
+        let by_idx: std::collections::HashMap<u32, u32> = selected.into_iter().collect();
+        assert_eq!(by_idx.len(), 3);
+        assert_eq!(by_idx[&0], 100, "near center chunk should stay full");
+        assert!(
+            by_idx[&1] > by_idx[&2],
+            "far center should outrank far edge"
+        );
+        assert!(by_idx[&2] >= 10);
+    }
+
+    #[test]
+    fn view_priority_respects_budget_when_min_lod_cannot_cover_every_chunk() {
+        let payload = grid_payload();
+        let part = partition_payload(&payload, 2.0, POINT_STRIDE_FLOATS);
+        let selected = select_chunks_view_priority(
+            &part.table,
+            [0.0, 0.0, 0.0],
+            [1.0, 1.0, 0.0],
+            360.0,
+            100.0,
+            3,
+            256,
+        );
+        assert_eq!(selected.iter().map(|&(_, lod)| lod).sum::<u32>(), 3);
+        assert!(selected.iter().all(|&(_, lod)| lod == 1));
     }
 
     #[test]

@@ -6,8 +6,17 @@ use godot::prelude::*;
 // `coverage` spreads the budget across every chunk proportionally, keeping each
 // chunk's importance-ranked prefix — the whole extent stays visible at reduced
 // density, which reads better inside room-scale captures.
+// `view_priority` keeps a wide view cone and full-distance range represented,
+// then lowers density on distant / peripheral chunks when the target budget would
+// otherwise be exceeded.
 pub const CHUNK_SELECTION_NEAREST: &str = "nearest";
 pub const CHUNK_SELECTION_COVERAGE: &str = "coverage";
+pub const CHUNK_SELECTION_VIEW_PRIORITY: &str = "view_priority";
+
+pub const DEFAULT_VIEW_PRIORITY_FOV_DEGREES: f32 = 200.0;
+pub const DEFAULT_VIEW_PRIORITY_FULL_DISTANCE: f32 = 5.0;
+pub const DEFAULT_VIEW_PRIORITY_TARGET_BUDGET: i32 = 800_000;
+pub const DEFAULT_VIEW_PRIORITY_MIN_LOD_PER_CHUNK: i32 = 256;
 
 #[derive(GodotClass)]
 #[class(tool, base=Resource)]
@@ -24,6 +33,10 @@ pub struct GaussianSplatCloudSettings {
     // at the degree the source glTF actually provides.
     sh_degree: i32,
     chunk_selection: GString,
+    view_priority_fov_degrees: f32,
+    view_priority_full_distance: f32,
+    view_priority_target_budget: i32,
+    view_priority_min_lod_per_chunk: i32,
 }
 
 #[godot_api]
@@ -41,6 +54,10 @@ impl IResource for GaussianSplatCloudSettings {
             max_preview_splats: i32::MAX,
             sh_degree: 3,
             chunk_selection: CHUNK_SELECTION_NEAREST.into(),
+            view_priority_fov_degrees: DEFAULT_VIEW_PRIORITY_FOV_DEGREES,
+            view_priority_full_distance: DEFAULT_VIEW_PRIORITY_FULL_DISTANCE,
+            view_priority_target_budget: DEFAULT_VIEW_PRIORITY_TARGET_BUDGET,
+            view_priority_min_lod_per_chunk: DEFAULT_VIEW_PRIORITY_MIN_LOD_PER_CHUNK,
         }
     }
 }
@@ -126,6 +143,50 @@ impl GaussianSplatCloudSettings {
     }
 
     #[func]
+    pub fn get_view_priority_fov_degrees(&self) -> f32 {
+        self.view_priority_fov_degrees
+    }
+
+    #[func]
+    pub fn set_view_priority_fov_degrees(&mut self, fov_degrees: f32) {
+        self.view_priority_fov_degrees = fov_degrees.clamp(1.0, 360.0);
+        self.base_mut().emit_changed();
+    }
+
+    #[func]
+    pub fn get_view_priority_full_distance(&self) -> f32 {
+        self.view_priority_full_distance
+    }
+
+    #[func]
+    pub fn set_view_priority_full_distance(&mut self, full_distance: f32) {
+        self.view_priority_full_distance = full_distance.max(0.0);
+        self.base_mut().emit_changed();
+    }
+
+    #[func]
+    pub fn get_view_priority_target_budget(&self) -> i32 {
+        self.view_priority_target_budget
+    }
+
+    #[func]
+    pub fn set_view_priority_target_budget(&mut self, target_budget: i32) {
+        self.view_priority_target_budget = target_budget.max(0);
+        self.base_mut().emit_changed();
+    }
+
+    #[func]
+    pub fn get_view_priority_min_lod_per_chunk(&self) -> i32 {
+        self.view_priority_min_lod_per_chunk
+    }
+
+    #[func]
+    pub fn set_view_priority_min_lod_per_chunk(&mut self, min_lod_per_chunk: i32) {
+        self.view_priority_min_lod_per_chunk = min_lod_per_chunk.max(1);
+        self.base_mut().emit_changed();
+    }
+
+    #[func]
     pub fn apply_defaults(&mut self) {
         self.splat_visible = true;
         self.render_enabled = true;
@@ -134,6 +195,10 @@ impl GaussianSplatCloudSettings {
         self.max_preview_splats = i32::MAX;
         self.sh_degree = 3;
         self.chunk_selection = CHUNK_SELECTION_NEAREST.into();
+        self.view_priority_fov_degrees = DEFAULT_VIEW_PRIORITY_FOV_DEGREES;
+        self.view_priority_full_distance = DEFAULT_VIEW_PRIORITY_FULL_DISTANCE;
+        self.view_priority_target_budget = DEFAULT_VIEW_PRIORITY_TARGET_BUDGET;
+        self.view_priority_min_lod_per_chunk = DEFAULT_VIEW_PRIORITY_MIN_LOD_PER_CHUNK;
         self.base_mut().emit_changed();
     }
 }
@@ -141,6 +206,7 @@ impl GaussianSplatCloudSettings {
 fn normalize_chunk_selection(chunk_selection: &str) -> &'static str {
     match chunk_selection {
         CHUNK_SELECTION_COVERAGE => CHUNK_SELECTION_COVERAGE,
+        CHUNK_SELECTION_VIEW_PRIORITY => CHUNK_SELECTION_VIEW_PRIORITY,
         _ => CHUNK_SELECTION_NEAREST,
     }
 }

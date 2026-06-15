@@ -1,6 +1,7 @@
 use godot::classes::GltfState;
 use godot::prelude::*;
 
+use crate::gsplat_pack::GsplatPackIndex;
 use crate::import_state::{
     DecodedSplatData, ImportedSplatMetadata, FALLBACK_NONE, GLTF_STATE_KEY,
     PAYLOAD_LAYOUT_FLOAT32_V1, PAYLOAD_LAYOUT_V1, POINT_STRIDE_FLOATS,
@@ -24,6 +25,10 @@ pub struct GaussianSplatAsset {
     chunk_table: Option<crate::chunking::ChunkTable>,
     // Highest SH degree (0-3) present in the source glTF (Phase: higher-order SH).
     sh_degree_available: i32,
+    // Disk-backed payload index for large scenes. When present, runtime chunk
+    // streaming reads selected pages from disk instead of keeping the full payload
+    // in memory.
+    pack_index: Option<GsplatPackIndex>,
 }
 
 #[godot_api]
@@ -38,6 +43,7 @@ impl GaussianSplatAsset {
         self.local_aabb = Aabb::default();
         self.chunk_table = None;
         self.sh_degree_available = 0;
+        self.pack_index = None;
         self.base_mut().emit_changed();
     }
 
@@ -233,6 +239,24 @@ impl GaussianSplatAsset {
         self.local_aabb = decoded.local_aabb;
         self.chunk_table = decoded.chunk_table;
         self.sh_degree_available = decoded.sh_degree_available;
+        self.pack_index = None;
+        self.base_mut().emit_changed();
+    }
+
+    pub fn apply_pack_index(
+        &mut self,
+        metadata: ImportedSplatMetadata,
+        pack_index: GsplatPackIndex,
+    ) {
+        self.metadata = metadata;
+        self.point_count = pack_index.point_count as i32;
+        self.payload.clear();
+        self.payload_layout = PAYLOAD_LAYOUT_FLOAT32_V1.into();
+        self.fallback_mode = FALLBACK_NONE.into();
+        self.local_aabb = pack_aabb(&pack_index);
+        self.chunk_table = Some(pack_index.chunk_table());
+        self.sh_degree_available = pack_index.sh_degree_available;
+        self.pack_index = Some(pack_index);
         self.base_mut().emit_changed();
     }
 
@@ -246,6 +270,27 @@ impl GaussianSplatAsset {
     pub fn sh_degree_available(&self) -> i32 {
         self.sh_degree_available
     }
+
+    pub fn pack_index(&self) -> Option<&GsplatPackIndex> {
+        self.pack_index.as_ref()
+    }
+}
+
+fn pack_aabb(pack: &GsplatPackIndex) -> Aabb {
+    let mut min = Vector3::new(f32::INFINITY, f32::INFINITY, f32::INFINITY);
+    let mut max = Vector3::new(f32::NEG_INFINITY, f32::NEG_INFINITY, f32::NEG_INFINITY);
+    for chunk in &pack.chunks {
+        min.x = min.x.min(chunk.entry.aabb_min[0]);
+        min.y = min.y.min(chunk.entry.aabb_min[1]);
+        min.z = min.z.min(chunk.entry.aabb_min[2]);
+        max.x = max.x.max(chunk.entry.aabb_max[0]);
+        max.y = max.y.max(chunk.entry.aabb_max[1]);
+        max.z = max.z.max(chunk.entry.aabb_max[2]);
+    }
+    if !min.x.is_finite() {
+        return Aabb::default();
+    }
+    Aabb::new(min, max - min)
 }
 
 fn build_placeholder_payload(metadata: &ImportedSplatMetadata) -> PackedByteArray {

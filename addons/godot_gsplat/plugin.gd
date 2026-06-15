@@ -2,22 +2,27 @@
 extends EditorPlugin
 
 const GltfRegistration := preload("res://addons/godot_gsplat/runtime/gltf_registration.gd")
+const PackConverterDock := preload("res://addons/godot_gsplat/pack_converter_dock.gd")
 const SCENE_POST_IMPORT_PLUGIN_CLASS_NAME := "GsplatScenePostImportPlugin"
 const OPTION_PREVIEW_MAX_SPLATS := "gsplat/preview_max_splats"
 const GAUSSIAN_SPLAT_NODE_CLASS_NAME := "GaussianSplatNode3D"
 const SOURCE_GLTF_PROPERTY := "source_gltf"
+const PACK_CONVERTER_MENU_ITEM := "Godot Gsplat Pack Converter"
 
 var _gltf_extension: Object
 var _scene_post_import_plugin: Object
 var _resource_filesystem: EditorFileSystem
+var _pack_converter_dock: Control
 
 func _enter_tree() -> void:
 	_register_gltf_extension()
 	_register_scene_post_import_plugin()
 	_register_filesystem_hooks()
 	_register_viewport_drop_hook()
+	_register_pack_converter_tool()
 
 func _exit_tree() -> void:
+	_unregister_pack_converter_tool()
 	_unregister_viewport_drop_hook()
 	_unregister_filesystem_hooks()
 	_unregister_scene_post_import_plugin()
@@ -77,6 +82,30 @@ func _unregister_filesystem_hooks() -> void:
 	if _resource_filesystem.resources_reimported.is_connected(_on_resources_reimported):
 		_resource_filesystem.resources_reimported.disconnect(_on_resources_reimported)
 	_resource_filesystem = null
+
+func _register_pack_converter_tool() -> void:
+	if _pack_converter_dock != null:
+		return
+	_pack_converter_dock = PackConverterDock.new()
+	add_control_to_dock(DOCK_SLOT_RIGHT_UL, _pack_converter_dock)
+	_pack_converter_dock.hide()
+	add_tool_menu_item(PACK_CONVERTER_MENU_ITEM, _show_pack_converter_tool)
+
+func _unregister_pack_converter_tool() -> void:
+	remove_tool_menu_item(PACK_CONVERTER_MENU_ITEM)
+	if _pack_converter_dock == null:
+		return
+	remove_control_from_docks(_pack_converter_dock)
+	_pack_converter_dock.queue_free()
+	_pack_converter_dock = null
+
+func _show_pack_converter_tool() -> void:
+	if _pack_converter_dock == null:
+		_register_pack_converter_tool()
+	if _pack_converter_dock == null:
+		return
+	_pack_converter_dock.show()
+	_pack_converter_dock.grab_focus()
 
 # --- Drag-and-drop into the 3D viewport -------------------------------------
 #

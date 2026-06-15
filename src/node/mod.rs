@@ -1,6 +1,6 @@
 use godot::classes::{
-    Camera3D, EditorInterface, Engine, GltfState, MultiMeshInstance3D, Node3D, ShaderMaterial,
-    XrServer,
+    Camera3D, EditorInterface, Engine, GltfState, MultiMeshInstance3D, Node3D, ProjectSettings,
+    ShaderMaterial, XrServer,
 };
 use godot::prelude::*;
 
@@ -127,7 +127,7 @@ pub struct GaussianSplatNode3D {
     cloud_settings: Option<Gd<GaussianSplatCloudSettings>>,
     backend_settings: Option<Gd<GaussianSplatBackendSettings>>,
     #[var(get, set)]
-    #[export(file = "*.gltf,*.glb")]
+    #[export(file = "*.gltf,*.glb,*.gsplatpack")]
     source_gltf: PhantomVar<GString>,
     #[var(get, set)]
     #[export]
@@ -163,6 +163,7 @@ pub struct GaussianSplatNode3D {
     applying_profile: bool,
     // Backing storage for the `source_gltf` export (PhantomVar holds no state).
     source_gltf_path: GString,
+    last_load_error: GString,
     // The last settings dictionary applied via a render profile or
     // apply_profile_settings. Its asset-dependent parts (budget/SH) are re-applied
     // when an asset binds, so a GDScript field override survives the bind. None ==
@@ -456,6 +457,7 @@ impl GaussianSplatNode3D {
     #[func]
     fn set_source_gltf(&mut self, path: GString) {
         self.source_gltf_path = path.clone();
+        self.last_load_error = GString::new();
         // Only (re)load when a path is set. An empty path leaves the current asset
         // intact, so nodes created by the scene importer (which never set this) are
         // not cleared on load.
@@ -467,8 +469,13 @@ impl GaussianSplatNode3D {
     // Decode the first splat primitive from the glTF and bind it as the asset.
     fn load_from_gltf(&mut self, path: GString) {
         let path_str = path.to_string();
+        if path_str.ends_with(".gsplatpack") {
+            self.load_from_pack(&path_str);
+            return;
+        }
         match crate::import_state::decode_first_splat_from_gltf(&path_str) {
             Ok((metadata, decoded)) => {
+                self.last_load_error = GString::new();
                 let mut asset = GaussianSplatAsset::new_gd();
                 {
                     let mut bound = asset.bind_mut();
@@ -478,7 +485,68 @@ impl GaussianSplatNode3D {
                 self.bind_asset(Some(asset));
             }
             Err(error) => {
-                godot_error!("[gsplat] failed to load splat from '{path_str}': {error}");
+                let message = format!("[gsplat] failed to load splat from '{path_str}': {error}");
+                self.last_load_error = message.as_str().into();
+                godot_error!("{message}");
+            }
+        }
+    }
+
+    fn load_from_pack(&mut self, path: &str) {
+        let global_path = globalize_path(path);
+        match crate::gsplat_pack::read_pack_index(&global_path) {
+            Ok(pack_index) => {
+                self.last_load_error = GString::new();
+                let metadata = ImportedSplatMetadata {
+                    source_extension: "gsplatpack".to_string(),
+                    kernel: Some("3D".to_string()),
+                    color_space: Some("linear".to_string()),
+                    projection: "perspective".to_string(),
+                    sorting_method: "cameraDistance".to_string(),
+                    point_count: pack_index.point_count as i32,
+                    fallback_mode: crate::import_state::FALLBACK_NONE.to_string(),
+                    ..Default::default()
+                };
+                let mut asset = GaussianSplatAsset::new_gd();
+                asset.bind_mut().apply_pack_index(metadata, pack_index);
+                self.bind_asset(Some(asset));
+            }
+            Err(error) => {
+                let message =
+                    format!("[gsplat] failed to load pack from '{path}' ({global_path}): {error}");
+                self.last_load_error = message.as_str().into();
+                godot_error!("{message}");
+            }
+        }
+    }
+
+    #[func]
+    pub fn write_gsplat_pack_from_gltf(&self, source_gltf: GString, pack_path: GString) -> bool {
+        let source = source_gltf.to_string();
+        let pack = globalize_path(pack_path.to_string().as_str());
+        let decoded = match crate::import_state::decode_first_splat_from_gltf(&source) {
+            Ok((_metadata, decoded)) => decoded,
+            Err(error) => {
+                godot_error!("[gsplat] failed to decode '{source}' for pack writing: {error}");
+                return false;
+            }
+        };
+        let Some(table) = decoded.chunk_table.as_ref() else {
+            godot_error!("[gsplat] decoded splat data has no chunk table; cannot write pack.");
+            return false;
+        };
+        let floats = decoded.payload.to_float32_array();
+        match crate::gsplat_pack::write_pack(
+            &pack,
+            floats.as_slice(),
+            table,
+            decoded.sh_degree_available,
+            crate::gsplat_pack::DEFAULT_PAGE_SPLATS,
+        ) {
+            Ok(_) => true,
+            Err(error) => {
+                godot_error!("[gsplat] failed to write pack '{pack}': {error}");
+                false
             }
         }
     }
@@ -500,6 +568,11 @@ impl GaussianSplatNode3D {
     #[func]
     pub fn has_asset(&self) -> bool {
         self.asset.is_some()
+    }
+
+    #[func]
+    pub fn get_last_load_error(&self) -> GString {
+        self.last_load_error.clone()
     }
 
     #[func]
@@ -625,6 +698,7 @@ impl GaussianSplatNode3D {
         // (which kicks the rebuild if the active set actually changed).
         if let Some(rt) = self.backend.chunks.as_mut() {
             rt.last_select_pos = None;
+            rt.last_select_forward = None;
         }
         self.mark_backend_dirty("chunk_selection");
     }
@@ -946,6 +1020,20 @@ impl GaussianSplatNode3D {
         Some(self.base().get_global_transform().affine_inverse() * view_world)
     }
 
+    fn camera_local_forward(&self) -> Option<Vector3> {
+        let view_world = self.active_view_transform()?;
+        let forward_world = -view_world.basis.col_c();
+        let node_inverse = self.base().get_global_transform().affine_inverse();
+        let local_origin = node_inverse * view_world.origin;
+        let local_tip = node_inverse * (view_world.origin + forward_world);
+        let forward = local_tip - local_origin;
+        let len = forward.length();
+        if len <= 1.0e-6 {
+            return None;
+        }
+        Some(forward / len)
+    }
+
     // Reconnect the field to the baked render child when the node is deserialized
     // from a pre-imported .scn (the field itself is not serialized). A baked mesh
     // means there is renderable data even without a live asset.
@@ -1006,4 +1094,14 @@ fn dict_gstring(dict: &VarDictionary, key: &str) -> Option<GString> {
 
 fn dict_i64(dict: &VarDictionary, key: &str) -> Option<i64> {
     dict.get(key).and_then(|value| value.try_to::<i64>().ok())
+}
+
+fn globalize_path(path: &str) -> String {
+    if path.starts_with("res://") || path.starts_with("user://") {
+        ProjectSettings::singleton()
+            .globalize_path(path)
+            .to_string()
+    } else {
+        path.to_string()
+    }
 }

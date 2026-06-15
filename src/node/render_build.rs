@@ -101,7 +101,7 @@ impl GaussianSplatNode3D {
         if !Engine::singleton().is_editor_hint() {
             if let Some(rt) = &self.backend.chunks {
                 let selected: u32 = rt.active.iter().map(|&(_, count)| count).sum();
-                if selected as usize > SYNC_BUILD_MAX_SPLATS {
+                if rt.pack.is_some() || selected as usize > SYNC_BUILD_MAX_SPLATS {
                     self.begin_chunk_rebuild();
                     return;
                 }
@@ -250,44 +250,49 @@ impl GaussianSplatNode3D {
         // Chunked path: gather the currently selected chunks from the shared payload
         // (selection bounds the count). Legacy path (no chunk table): clone the asset
         // payload and uniformly decimate it to the budget.
-        let (slice, stride, sh_degree): (Vec<f32>, usize, i32) =
-            if let Some(rt) = &self.backend.chunks {
-                // No bound cloud settings means class defaults: full SH degree.
-                let cap = cloud_settings
-                    .map(|settings| settings.bind().get_sh_degree())
-                    .unwrap_or(3);
-                (
-                    crate::chunking::gather_active(
-                        rt.payload.as_slice(),
-                        rt.table.as_ref(),
-                        &rt.active,
-                    ),
-                    rt.table.stride,
-                    cap.clamp(0, 3).min(rt.sh_degree_available),
-                )
+        let (slice, stride, sh_degree): (Vec<f32>, usize, i32) = if let Some(rt) =
+            &self.backend.chunks
+        {
+            // No bound cloud settings means class defaults: full SH degree.
+            let cap = cloud_settings
+                .map(|settings| settings.bind().get_sh_degree())
+                .unwrap_or(3);
+            let slice = if let Some(payload) = &rt.payload {
+                crate::chunking::gather_active(payload.as_slice(), rt.table.as_ref(), &rt.active)
             } else {
-                let values = {
-                    let asset_ref = asset.bind();
-                    asset_ref.payload_float_values()?
-                };
-                let source_point_count = values.len() / POINT_STRIDE_FLOATS;
-                let max_splats = cloud_settings
-                    .map(|settings| settings.bind().get_max_preview_splats().max(0) as usize)
-                    .unwrap_or(usize::MAX);
-                let point_count = source_point_count.min(max_splats);
-                if point_count == 0 {
-                    return None;
-                }
-                let sample_stride = source_point_count.div_ceil(point_count);
-                let mut slice = Vec::with_capacity(point_count * POINT_STRIDE_FLOATS);
-                for slot in 0..point_count {
-                    let pi = (slot * sample_stride).min(source_point_count - 1);
-                    slice.extend_from_slice(
-                        &values[pi * POINT_STRIDE_FLOATS..(pi + 1) * POINT_STRIDE_FLOATS],
-                    );
-                }
-                (slice, POINT_STRIDE_FLOATS, 0)
+                // Disk-backed packs are intended for large scenes; the normal
+                // path is async. If this synchronous path is reached before the
+                // async worker runs, leave the current render untouched.
+                return None;
             };
+            (
+                slice,
+                rt.table.stride,
+                cap.clamp(0, 3).min(rt.sh_degree_available),
+            )
+        } else {
+            let values = {
+                let asset_ref = asset.bind();
+                asset_ref.payload_float_values()?
+            };
+            let source_point_count = values.len() / POINT_STRIDE_FLOATS;
+            let max_splats = cloud_settings
+                .map(|settings| settings.bind().get_max_preview_splats().max(0) as usize)
+                .unwrap_or(usize::MAX);
+            let point_count = source_point_count.min(max_splats);
+            if point_count == 0 {
+                return None;
+            }
+            let sample_stride = source_point_count.div_ceil(point_count);
+            let mut slice = Vec::with_capacity(point_count * POINT_STRIDE_FLOATS);
+            for slot in 0..point_count {
+                let pi = (slot * sample_stride).min(source_point_count - 1);
+                slice.extend_from_slice(
+                    &values[pi * POINT_STRIDE_FLOATS..(pi + 1) * POINT_STRIDE_FLOATS],
+                );
+            }
+            (slice, POINT_STRIDE_FLOATS, 0)
+        };
 
         pack_raw(&slice, scale_multiplier, stride, sh_degree).map(raw_to_render)
     }
