@@ -1,6 +1,6 @@
+use godot::classes::notify::Node3DNotification;
 use godot::classes::{
-    Camera3D, EditorInterface, Engine, GltfState, MultiMeshInstance3D, Node3D, ProjectSettings,
-    ShaderMaterial, XrServer,
+    Camera3D, EditorInterface, Engine, GltfState, Node3D, ProjectSettings, ShaderMaterial, XrServer,
 };
 use godot::prelude::*;
 
@@ -29,6 +29,15 @@ use gpu_sort::SortGpu;
 struct SplatRenderBackend {
     sort: SortGpu,
     chunks: Option<ChunkRuntime>,
+    draw: Option<LowLevelSplatDraw>,
+}
+
+struct LowLevelSplatDraw {
+    mesh_rid: Rid,
+    instance_rid: Rid,
+    material: Gd<ShaderMaterial>,
+    splat_count: i32,
+    local_aabb: Aabb,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -154,7 +163,6 @@ pub struct GaussianSplatNode3D {
     transform_state: NodeTransformState,
     visibility_state: NodeVisibilityState,
     backend_state: NodeBackendState,
-    splat_multimesh: Option<Gd<MultiMeshInstance3D>>,
     backend: SplatRenderBackend,
     // Backing storage for the `render_profile` export (PhantomVar holds no state).
     render_profile_value: RenderProfile,
@@ -173,6 +181,13 @@ pub struct GaussianSplatNode3D {
 
 #[godot_api]
 impl INode3D for GaussianSplatNode3D {
+    fn on_notification(&mut self, what: Node3DNotification) {
+        if what == Node3DNotification::PREDELETE {
+            self.teardown_sort();
+            self.clear_splat_draw();
+        }
+    }
+
     fn ready(&mut self) {
         // Reconnect to the baked render child when instanced from a pre-imported
         // .scn (the field itself is not serialized); also marks renderable data.
@@ -187,6 +202,7 @@ impl INode3D for GaussianSplatNode3D {
     }
 
     fn process(&mut self, _delta: f64) {
+        self.sync_splat_draw_instance();
         // Apply any finished async chunk rebuild, then re-select nearby chunks when
         // the camera crosses a boundary (Phase C2/C2b). Applying a rebuild tears down
         // the sort, which the block below brings back up at the new active count.
@@ -244,6 +260,7 @@ impl INode3D for GaussianSplatNode3D {
 
     fn exit_tree(&mut self) {
         self.teardown_sort();
+        self.clear_splat_draw();
     }
 }
 
@@ -252,6 +269,31 @@ impl GaussianSplatNode3D {
     #[func]
     fn get_render_profile(&self) -> RenderProfile {
         self.render_profile_value
+    }
+
+    #[func]
+    fn get_rendered_splat_count(&self) -> i32 {
+        self.backend
+            .draw
+            .as_ref()
+            .map(|draw| draw.splat_count)
+            .unwrap_or(0)
+    }
+
+    #[func]
+    fn get_render_aabb(&self) -> Aabb {
+        self.backend
+            .draw
+            .as_ref()
+            .map(|draw| draw.local_aabb)
+            .unwrap_or_default()
+    }
+
+    #[func]
+    fn set_live_splat_depth_mode(&mut self, depth_mode: i32) {
+        if let Some(mut material) = self.splat_material() {
+            material.set_shader_parameter("splat_depth_mode", &Variant::from(depth_mode));
+        }
     }
 
     #[func]
@@ -353,14 +395,13 @@ impl GaussianSplatNode3D {
         // Remember for re-application against a newly bound asset (budget/SH need it).
         self.applied_settings = Some(settings.clone());
         // Without a live asset the budget would clamp to 0 and the rebuild would
-        // clear any baked render (a node instanced from a pre-imported .scn has no
-        // live asset), so only the backend settings apply here; refresh_from_asset
-        // re-applies the asset-dependent parts once an asset binds.
+        // clear any runtime draw, so only the backend settings apply here;
+        // refresh_from_asset re-applies the asset-dependent parts once an asset binds.
         if self.asset.is_none() {
-            if self.splat_multimesh.is_some() {
+            if self.backend.draw.is_some() {
                 godot_warn!(
-                    "[gsplat] profile settings applied on a baked render without a \
-                     live asset; only backend settings applied (budget/SH need the asset)."
+                    "[gsplat] profile settings applied without a live asset; only backend \
+                     settings applied (budget/SH need the asset)."
                 );
             }
             return;
@@ -1034,29 +1075,12 @@ impl GaussianSplatNode3D {
         Some(forward / len)
     }
 
-    // Reconnect the field to the baked render child when the node is deserialized
-    // from a pre-imported .scn (the field itself is not serialized). A baked mesh
-    // means there is renderable data even without a live asset.
-    fn adopt_serialized_render(&mut self) {
-        if self.splat_multimesh.is_some() {
-            return;
-        }
-        for child in self.base().get_children().iter_shared() {
-            if let Ok(mesh_instance) = child.try_cast::<MultiMeshInstance3D>() {
-                if mesh_instance.get_multimesh().is_some() {
-                    self.visibility_state.asset_ready = true;
-                    self.splat_multimesh = Some(mesh_instance);
-                    return;
-                }
-            }
-        }
-    }
+    // The low-level RenderingServer draw path is runtime state and is not
+    // serialized into scenes. Imported scenes rebuild it from the bound asset.
+    fn adopt_serialized_render(&mut self) {}
 
     fn splat_material(&self) -> Option<Gd<ShaderMaterial>> {
-        self.splat_multimesh
-            .as_ref()
-            .and_then(|mesh_instance| mesh_instance.get_material_override())
-            .and_then(|material| material.try_cast::<ShaderMaterial>().ok())
+        self.backend.draw.as_ref().map(|draw| draw.material.clone())
     }
 }
 

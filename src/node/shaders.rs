@@ -3,10 +3,10 @@
 
 // Texture-driven anisotropic Gaussian splat shader (Step 1 render path). Per-splat
 // data (center, per-axis scale, rotation quaternion, color) lives in `data_tex`,
-// four RGBA-float texels per splat. The geometry is a single quad rendered via
-// MultiMesh (one instance per splat); the instance index (INSTANCE_ID) is the
-// slot, UV = quad corner in [-2, 2]. Each slot resolves to a splat id via
-// `sort_tex` when `sort_enabled`,
+// four RGBA-float texels per splat. The geometry is a low-level empty-vertex
+// triangle surface with 6 virtual vertices per splat; VERTEX_ID / 6 is the slot
+// and VERTEX_ID % 6 selects the quad corner in [-2, 2]. Each slot resolves to a
+// splat id via `sort_tex` when `sort_enabled`,
 // otherwise slot == id (unsorted, matching the Phase 1 look). The resolved splat's
 // ellipsoid is projected to a screen-space ellipse *without* the affine/Jacobian
 // approximation: the center and the three rotated/scaled semi-axes are projected to
@@ -58,7 +58,9 @@ varying vec4 v_color;
 // Fetch float `idx` from the flat SH region starting at texel `sh_base`.
 float sh_tex_float(int sh_base, int idx, int w) {
     int t = sh_base + idx / 4;
-    return texelFetch(data_tex, ivec2(t % w, t / w), 0)[idx % 4];
+    vec4 v = texelFetch(data_tex, ivec2(t % w, t / w), 0);
+    int lane = idx - (idx / 4) * 4;
+    return lane == 0 ? v.r : (lane == 1 ? v.g : (lane == 2 ? v.b : v.a));
 }
 vec3 sh_coeff(int sh_base, int c, int w) {
     int f = c * 3;
@@ -155,8 +157,18 @@ vec3 q_rotate(vec3 v, vec4 q) {
 }
 
 void vertex() {
-    v_corner = UV;
-    int slot = int(INSTANCE_ID);
+    int vertex_id = int(VERTEX_ID);
+    int slot = vertex_id / 6;
+    int quad_vertex = vertex_id - slot * 6;
+    if (quad_vertex == 0 || quad_vertex == 3) {
+        v_corner = vec2(-2.0, -2.0);
+    } else if (quad_vertex == 1) {
+        v_corner = vec2(2.0, -2.0);
+    } else if (quad_vertex == 2 || quad_vertex == 4) {
+        v_corner = vec2(2.0, 2.0);
+    } else {
+        v_corner = vec2(-2.0, 2.0);
+    }
     int splat_id = slot;
     if (sort_enabled > 0) {
         // VIEW_INDEX selects the per-eye sort order under multiview (VR), but

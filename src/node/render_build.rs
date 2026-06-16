@@ -1,13 +1,12 @@
 //! Render-set construction for the texture-driven splat path: pack splats into
-//! the per-splat data texture, build the MultiMesh quad + material, and stash
-//! the GPU-sort inputs.
+//! the per-splat data texture, build the low-level draw surface + material, and
+//! stash the GPU-sort inputs.
 
 use godot::classes::image::Format as ImageFormat;
-use godot::classes::mesh::{ArrayType, PrimitiveType};
-use godot::classes::multi_mesh::TransformFormat;
-use godot::classes::{
-    ArrayMesh, Engine, Image, ImageTexture, MultiMesh, MultiMeshInstance3D, Shader, ShaderMaterial,
+use godot::classes::rendering_server::{
+    ArrayFormat as RsArrayFormat, PrimitiveType as RsPrimitiveType,
 };
+use godot::classes::{Engine, Image, ImageTexture, RenderingServer, Shader, ShaderMaterial};
 use godot::prelude::*;
 
 use crate::asset::GaussianSplatAsset;
@@ -16,7 +15,7 @@ use crate::cloud_settings::GaussianSplatCloudSettings;
 use crate::import_state::POINT_STRIDE_FLOATS;
 
 use super::shaders::SPLAT_TEXTURE_SHADER;
-use super::GaussianSplatNode3D;
+use super::{GaussianSplatNode3D, LowLevelSplatDraw};
 
 // Width (in RGBA-float texels) of the per-splat data texture. Each splat occupies
 // four consecutive texels, so a row holds SPLAT_DATA_TEX_WIDTH / 4 splats.
@@ -75,21 +74,30 @@ pub(super) struct RawRenderData {
 }
 
 impl GaussianSplatNode3D {
-    pub(super) fn ensure_splat_multimesh(&mut self) {
-        if self.splat_multimesh.is_some() {
-            return;
-        }
-
-        let mut mesh_instance = MultiMeshInstance3D::new_alloc();
-        mesh_instance.set_name("SplatMultiMesh");
-        self.base_mut()
-            .add_child(&mesh_instance.clone().upcast::<Node>());
-        self.splat_multimesh = Some(mesh_instance);
+    pub(super) fn clear_splat_multimesh(&mut self) {
+        self.clear_splat_draw();
     }
 
-    pub(super) fn clear_splat_multimesh(&mut self) {
-        if let Some(mesh_instance) = &mut self.splat_multimesh {
-            mesh_instance.set_visible(false);
+    pub(super) fn clear_splat_draw(&mut self) {
+        let Some(draw) = self.backend.draw.take() else {
+            return;
+        };
+        let mut server = RenderingServer::singleton();
+        server.free_rid(draw.instance_rid);
+        server.free_rid(draw.mesh_rid);
+    }
+
+    pub(super) fn sync_splat_draw_instance(&mut self) {
+        let Some(draw) = &self.backend.draw else {
+            return;
+        };
+        if !self.base().is_inside_tree() {
+            return;
+        }
+        let mut server = RenderingServer::singleton();
+        server.instance_set_transform(draw.instance_rid, self.base().get_global_transform());
+        if let Some(world) = self.base().get_world_3d() {
+            server.instance_set_scenario(draw.instance_rid, world.get_scenario());
         }
     }
 
@@ -114,8 +122,8 @@ impl GaussianSplatNode3D {
         // million-splat gather + pack does not block the main thread; the
         // current render (if any) stays up until the worker delivers via
         // poll_chunk_rebuild(). The editor always builds synchronously: the
-        // import pipeline packs the baked SplatMultiMesh into the .scn right
-        // after scene generation, so it must exist immediately.
+        // import pipeline expects render state immediately, so editor builds stay
+        // synchronous.
         if !Engine::singleton().is_editor_hint() {
             if let Some(rt) = &self.backend.chunks {
                 let selected: u32 = rt.active.iter().map(|&(_, count)| count).sum();
@@ -134,7 +142,7 @@ impl GaussianSplatNode3D {
         self.apply_render_data(render);
     }
 
-    // Build the data texture + MultiMesh + material from a finished render set and
+    // Build the data texture + low-level mesh instance + material from a finished render set and
     // re-arm the GPU sort. Shared by the synchronous rebuild above and the async
     // chunk rebuild (Phase C2b), which both produce a `SplatRenderData`.
     pub(super) fn apply_render_data(&mut self, render: SplatRenderData) {
@@ -157,69 +165,6 @@ impl GaussianSplatNode3D {
             self.clear_splat_multimesh();
             return;
         };
-
-        self.ensure_splat_multimesh();
-        let Some(mesh_instance) = &mut self.splat_multimesh else {
-            return;
-        };
-
-        // Single quad rendered via MultiMesh, one instance per splat. The shader
-        // expands each instance's quad from `data_tex`, indexed by INSTANCE_ID.
-        let corners = [
-            Vector2::new(-2.0, -2.0),
-            Vector2::new(2.0, -2.0),
-            Vector2::new(2.0, 2.0),
-            Vector2::new(-2.0, 2.0),
-        ];
-        let quad_positions: Vec<Vector3> = corners
-            .iter()
-            .map(|c| Vector3::new(c.x, c.y, 0.0))
-            .collect();
-        let quad_uvs: Vec<Vector2> = corners.to_vec();
-        let quad_indices: Vec<i32> = vec![0, 1, 2, 0, 2, 3];
-
-        let mut arrays = VarArray::new();
-        for _ in 0..ArrayType::MAX.ord() {
-            arrays.push(&Variant::nil());
-        }
-        arrays.set(
-            ArrayType::VERTEX.ord() as usize,
-            &Variant::from(PackedVector3Array::from(quad_positions)),
-        );
-        arrays.set(
-            ArrayType::TEX_UV.ord() as usize,
-            &Variant::from(PackedVector2Array::from(quad_uvs)),
-        );
-        arrays.set(
-            ArrayType::INDEX.ord() as usize,
-            &Variant::from(PackedInt32Array::from(quad_indices)),
-        );
-
-        let mut mesh = ArrayMesh::new_gd();
-        mesh.add_surface_from_arrays_ex(PrimitiveType::TRIANGLES, &arrays)
-            .done();
-
-        // One identity transform per splat: the shader positions each splat from
-        // the data texture, not from the instance transform, so transforms stay
-        // identity and the instance index is the slot.
-        let identity = [
-            1.0_f32, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0,
-        ];
-        let mut buffer = Vec::with_capacity(render.splat_count.max(0) as usize * 12);
-        for _ in 0..render.splat_count {
-            buffer.extend_from_slice(&identity);
-        }
-
-        let mut multimesh = MultiMesh::new_gd();
-        multimesh.set_transform_format(TransformFormat::TRANSFORM_3D);
-        multimesh.set_mesh(&mesh.upcast::<godot::classes::Mesh>());
-        multimesh.set_instance_count(render.splat_count);
-        multimesh.set_buffer(&PackedFloat32Array::from(buffer));
-        // The unit quad's own bounds do not cover the cloud and identity instance
-        // transforms keep them at the origin, so give the MultiMesh an explicit
-        // AABB. This drives `get_aabb()` for the editor import-preview auto-framing
-        // (and the demo orbit camera); runtime culling uses the instance override.
-        multimesh.set_custom_aabb(render.aabb);
 
         let mut shader = Shader::new_gd();
         shader.set_code(SPLAT_TEXTURE_SHADER);
@@ -273,18 +218,53 @@ impl GaussianSplatNode3D {
         material.set_shader_parameter("sort_per_eye", &Variant::from(0_i32));
         material.set_shader_parameter("splat_depth_mode", &Variant::from(depth_mode));
 
-        let material_resource = material.upcast::<godot::classes::Material>();
-        mesh_instance.set_multimesh(&multimesh);
-        mesh_instance.set_material_override(&material_resource);
-        // The unit quad's own bounds do not cover the cloud, so set an explicit
-        // AABB for frustum culling and the editor import-preview auto-framing.
-        mesh_instance.set_custom_aabb(render.aabb);
-        mesh_instance.set_visible(
+        self.clear_splat_draw();
+
+        let mut server = RenderingServer::singleton();
+        let mesh_rid = server.mesh_create();
+        let instance_rid = server.instance_create();
+        let vertex_count = render.splat_count.saturating_mul(6);
+        let mut surface = VarDictionary::new();
+        surface.set("primitive", RsPrimitiveType::TRIANGLES);
+        surface.set(
+            "format",
+            RsArrayFormat::FLAG_USES_EMPTY_VERTEX_ARRAY
+                | RsArrayFormat::FLAG_FORMAT_CURRENT_VERSION,
+        );
+        surface.set("vertex_data", &PackedByteArray::new());
+        surface.set("vertex_count", vertex_count);
+        surface.set("aabb", render.aabb);
+        surface.set("material", material.get_rid());
+        server.mesh_add_surface(mesh_rid, &surface);
+        server.mesh_set_custom_aabb(mesh_rid, render.aabb);
+        server.instance_set_base(instance_rid, mesh_rid);
+        let transform = if self.base().is_inside_tree() {
+            self.base().get_global_transform()
+        } else {
+            Transform3D::IDENTITY
+        };
+        server.instance_set_transform(instance_rid, transform);
+        server.instance_set_custom_aabb(instance_rid, render.aabb);
+        if self.base().is_inside_tree() {
+            if let Some(world) = self.base().get_world_3d() {
+                server.instance_set_scenario(instance_rid, world.get_scenario());
+            }
+        }
+        server.instance_set_visible(
+            instance_rid,
             cloud_settings
                 .as_ref()
                 .map(|settings| settings.bind().is_splat_visible())
                 .unwrap_or(true),
         );
+
+        self.backend.draw = Some(LowLevelSplatDraw {
+            mesh_rid,
+            instance_rid,
+            material,
+            splat_count: render.splat_count,
+            local_aabb: render.aabb,
+        });
 
         // Stash GPU sort inputs (Step 2). A rebuild invalidates any prior sort
         // (the material above already starts with sort_enabled = 0).
