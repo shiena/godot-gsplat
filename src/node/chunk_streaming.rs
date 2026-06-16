@@ -6,11 +6,11 @@ use std::sync::{Arc, Mutex};
 
 use godot::prelude::*;
 
-use super::render_build::{pack_raw, raw_to_render, RawRenderData};
+use super::render_build::{pack_quantized_records, pack_raw, raw_to_render, RawRenderData};
 use super::GaussianSplatNode3D;
 
 pub(super) struct PageCacheState {
-    pages: HashMap<u32, Arc<Vec<f32>>>,
+    pages: HashMap<u32, Arc<Vec<u8>>>,
     order: VecDeque<u32>,
 }
 
@@ -316,20 +316,32 @@ impl GaussianSplatNode3D {
                 let active = rt.active.clone();
                 let (tx, rx) = std::sync::mpsc::channel();
                 std::thread::spawn(move || {
-                    let slice = if let Some(payload) = payload {
-                        crate::chunking::gather_active(payload.as_slice(), table.as_ref(), &active)
+                    let raw = if let Some(payload) = payload {
+                        let slice = crate::chunking::gather_active(
+                            payload.as_slice(),
+                            table.as_ref(),
+                            &active,
+                        );
+                        pack_raw(&slice, scale_multiplier, table.stride, sh_degree)
                     } else if let (Some(pack), Some(cache)) = (pack, page_cache) {
-                        match gather_active_from_pack(pack.as_ref(), cache.as_ref(), &active) {
-                            Ok(slice) => slice,
+                        match gather_active_packed_from_pack(pack.as_ref(), cache.as_ref(), &active)
+                        {
+                            Ok(records) => pack_quantized_records(
+                                &records,
+                                pack.record_bytes,
+                                scale_multiplier,
+                                sh_degree,
+                                pack.as_ref(),
+                            ),
                             Err(err) => {
                                 godot_error!("[gsplat] {err}");
-                                Vec::new()
+                                None
                             }
                         }
                     } else {
-                        Vec::new()
+                        None
                     };
-                    if let Some(raw) = pack_raw(&slice, scale_multiplier, table.stride, sh_degree) {
+                    if let Some(raw) = raw {
                         let _ = tx.send(raw);
                     }
                 });
@@ -387,16 +399,16 @@ impl GaussianSplatNode3D {
     }
 }
 
-fn gather_active_from_pack(
+fn gather_active_packed_from_pack(
     pack: &crate::gsplat_pack::GsplatPackIndex,
     cache: &Mutex<PageCacheState>,
     active: &[(u32, u32)],
-) -> Result<Vec<f32>, String> {
-    let stride = pack.stride.max(crate::import_state::POINT_STRIDE_FLOATS);
+) -> Result<Vec<u8>, String> {
+    let record_bytes = pack.record_bytes;
     let mut total = 0usize;
     for &(ci, lod) in active {
         if let Some(chunk) = pack.chunks.get(ci as usize) {
-            total += lod.min(chunk.entry.count) as usize * stride;
+            total += lod.min(chunk.entry.count) as usize * record_bytes;
         }
     }
     let mut out = Vec::with_capacity(total);
@@ -413,11 +425,11 @@ fn gather_active_from_pack(
             let Some(page) = pack.pages.get(page_index as usize) else {
                 continue;
             };
-            let page_values = read_page_cached(pack, cache, page_index)?;
+            let page_bytes = read_page_bytes_cached(pack, cache, page_index)?;
             let take = remaining.min(page.count) as usize;
-            let end = take * stride;
-            if end <= page_values.len() {
-                out.extend_from_slice(&page_values[..end]);
+            let end = take * record_bytes;
+            if end <= page_bytes.len() {
+                out.extend_from_slice(&page_bytes[..end]);
             }
             remaining -= take as u32;
         }
@@ -425,11 +437,11 @@ fn gather_active_from_pack(
     Ok(out)
 }
 
-fn read_page_cached(
+fn read_page_bytes_cached(
     pack: &crate::gsplat_pack::GsplatPackIndex,
     cache: &Mutex<PageCacheState>,
     page_index: u32,
-) -> Result<Arc<Vec<f32>>, String> {
+) -> Result<Arc<Vec<u8>>, String> {
     let mut guard = cache
         .lock()
         .map_err(|_| "Pack page cache is poisoned.".to_string())?;
@@ -440,7 +452,7 @@ fn read_page_cached(
     }
     drop(guard);
 
-    let values = Arc::new(pack.read_page(page_index)?);
+    let values = Arc::new(pack.read_page_bytes(page_index)?);
     let mut guard = cache
         .lock()
         .map_err(|_| "Pack page cache is poisoned.".to_string())?;

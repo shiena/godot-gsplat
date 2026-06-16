@@ -40,6 +40,15 @@ uniform int sort_enabled;
 // washed-out white (Quest standalone and PC-VR alike).
 uniform int sort_per_eye;
 uniform int sh_degree;
+// 0 = legacy RGBAF texels, 1 = packed RGBA8 records from .gsplatpack v2.
+uniform int data_encoding;
+uniform int packed_record_bytes;
+uniform vec3 position_min;
+uniform vec3 position_max;
+uniform vec3 scale_min;
+uniform vec3 scale_max;
+uniform float sh_min;
+uniform float sh_max;
 // 0 = ray-vs-ellipsoid per-corner depth, 1 = splat-center depth.
 uniform int splat_depth_mode;
 
@@ -54,6 +63,35 @@ float sh_tex_float(int sh_base, int idx, int w) {
 vec3 sh_coeff(int sh_base, int c, int w) {
     int f = c * 3;
     return vec3(sh_tex_float(sh_base, f, w), sh_tex_float(sh_base, f + 1, w), sh_tex_float(sh_base, f + 2, w));
+}
+float packed_byte(int byte_index, int w) {
+    int texel = byte_index / 4;
+    vec4 v = texelFetch(data_tex, ivec2(texel % w, texel / w), 0);
+    int lane = byte_index - texel * 4;
+    float b = lane == 0 ? v.r : (lane == 1 ? v.g : (lane == 2 ? v.b : v.a));
+    return floor(b * 255.0 + 0.5);
+}
+float packed_u16(int byte_index, int w) {
+    return packed_byte(byte_index, w) + packed_byte(byte_index + 1, w) * 256.0;
+}
+float packed_i16_norm(int byte_index, int w) {
+    float u = packed_u16(byte_index, w);
+    float s = u >= 32768.0 ? u - 65536.0 : u;
+    return clamp(s / 32767.0, -1.0, 1.0);
+}
+float packed_unorm(float q, float mn, float mx, float denom) {
+    return mix(mn, mx, q / denom);
+}
+float packed_sh_float(int record_base, int idx, int w) {
+    return packed_unorm(packed_byte(record_base + 24 + idx, w), sh_min, sh_max, 255.0);
+}
+vec3 packed_sh_coeff(int record_base, int c, int w) {
+    int f = c * 3;
+    return vec3(
+        packed_sh_float(record_base, f, w),
+        packed_sh_float(record_base, f + 1, w),
+        packed_sh_float(record_base, f + 2, w)
+    );
 }
 // View-dependent color: the base color (COLOR_0 == SH degree 0) plus the degree 1-3
 // contributions for view direction `d`. Standard real-SH basis (INRIA 3DGS order).
@@ -77,6 +115,30 @@ vec3 eval_sh(vec3 base_color, int sh_base, int w, vec3 d, int degree) {
             c += -0.45704580 * x * (4.0 * zz - xx - yy) * sh_coeff(sh_base, 12, w);
             c += 1.44530572 * z * (xx - yy) * sh_coeff(sh_base, 13, w);
             c += -0.59004360 * x * (xx - 3.0 * yy) * sh_coeff(sh_base, 14, w);
+        }
+    }
+    return max(c, vec3(0.0));
+}
+vec3 eval_sh_packed(vec3 base_color, int record_base, int w, vec3 d, int degree) {
+    float x = d.x, y = d.y, z = d.z;
+    vec3 c = base_color;
+    c += 0.48860251 * (-y * packed_sh_coeff(record_base, 0, w) + z * packed_sh_coeff(record_base, 1, w) - x * packed_sh_coeff(record_base, 2, w));
+    if (degree >= 2) {
+        float xx = x * x, yy = y * y, zz = z * z;
+        float xy = x * y, yz = y * z, xz = x * z;
+        c += 1.09254843 * xy * packed_sh_coeff(record_base, 3, w);
+        c += -1.09254843 * yz * packed_sh_coeff(record_base, 4, w);
+        c += 0.31539157 * (2.0 * zz - xx - yy) * packed_sh_coeff(record_base, 5, w);
+        c += -1.09254843 * xz * packed_sh_coeff(record_base, 6, w);
+        c += 0.54627422 * (xx - yy) * packed_sh_coeff(record_base, 7, w);
+        if (degree >= 3) {
+            c += -0.59004360 * y * (3.0 * xx - yy) * packed_sh_coeff(record_base, 8, w);
+            c += 2.89061142 * xy * z * packed_sh_coeff(record_base, 9, w);
+            c += -0.45704580 * y * (4.0 * zz - xx - yy) * packed_sh_coeff(record_base, 10, w);
+            c += 0.37317633 * z * (2.0 * zz - 3.0 * xx - 3.0 * yy) * packed_sh_coeff(record_base, 11, w);
+            c += -0.45704580 * x * (4.0 * zz - xx - yy) * packed_sh_coeff(record_base, 12, w);
+            c += 1.44530572 * z * (xx - yy) * packed_sh_coeff(record_base, 13, w);
+            c += -0.59004360 * x * (xx - 3.0 * yy) * packed_sh_coeff(record_base, 14, w);
         }
     }
     return max(c, vec3(0.0));
@@ -110,29 +172,62 @@ void vertex() {
     }
     splat_id = clamp(splat_id, 0, splat_count - 1);
 
-    // Fetch the splat's data block (4 core texels, then SH texels) from data_tex.
+    // Fetch the splat's data block from data_tex.
     int w = textureSize(data_tex, 0).x;
     int sh_tex = sh_degree <= 0 ? 0 : (sh_degree == 1 ? 3 : (sh_degree == 2 ? 6 : 12));
     int base = splat_id * (4 + sh_tex);
-    vec4 t0 = texelFetch(data_tex, ivec2(base % w, base / w), 0);
-    vec4 t1 = texelFetch(data_tex, ivec2((base + 1) % w, (base + 1) / w), 0);
-    vec4 t2 = texelFetch(data_tex, ivec2((base + 2) % w, (base + 2) / w), 0);
-    vec4 t3 = texelFetch(data_tex, ivec2((base + 3) % w, (base + 3) / w), 0);
-
-    vec3 center = t0.xyz;
-    v_color = t3;
-    // View-dependent color from higher-degree SH (COLOR_0 is the degree-0 base).
-    if (sh_degree >= 1) {
-        vec3 center_world = (MODEL_MATRIX * vec4(center, 1.0)).xyz;
-        vec3 cam = INV_VIEW_MATRIX[3].xyz;
-        v_color.rgb = eval_sh(v_color.rgb, base + 4, w, normalize(center_world - cam), sh_degree);
+    vec3 center;
+    vec3 scale;
+    vec4 quat;
+    if (data_encoding == 1) {
+        int record_base = splat_id * packed_record_bytes;
+        center = vec3(
+            packed_unorm(packed_u16(record_base + 0, w), position_min.x, position_max.x, 65535.0),
+            packed_unorm(packed_u16(record_base + 2, w), position_min.y, position_max.y, 65535.0),
+            packed_unorm(packed_u16(record_base + 4, w), position_min.z, position_max.z, 65535.0)
+        );
+        scale = vec3(
+            packed_unorm(packed_u16(record_base + 6, w), scale_min.x, scale_max.x, 65535.0),
+            packed_unorm(packed_u16(record_base + 8, w), scale_min.y, scale_max.y, 65535.0),
+            packed_unorm(packed_u16(record_base + 10, w), scale_min.z, scale_max.z, 65535.0)
+        );
+        quat = normalize(vec4(
+            packed_i16_norm(record_base + 12, w),
+            packed_i16_norm(record_base + 14, w),
+            packed_i16_norm(record_base + 16, w),
+            packed_i16_norm(record_base + 18, w)
+        ));
+        v_color = vec4(
+            packed_byte(record_base + 20, w),
+            packed_byte(record_base + 21, w),
+            packed_byte(record_base + 22, w),
+            packed_byte(record_base + 23, w)
+        ) / 255.0;
+        if (sh_degree >= 1) {
+            vec3 center_world = (MODEL_MATRIX * vec4(center, 1.0)).xyz;
+            vec3 cam = INV_VIEW_MATRIX[3].xyz;
+            v_color.rgb = eval_sh_packed(v_color.rgb, record_base, w, normalize(center_world - cam), sh_degree);
+        }
+    } else {
+        vec4 t0 = texelFetch(data_tex, ivec2(base % w, base / w), 0);
+        vec4 t1 = texelFetch(data_tex, ivec2((base + 1) % w, (base + 1) / w), 0);
+        vec4 t2 = texelFetch(data_tex, ivec2((base + 2) % w, (base + 2) / w), 0);
+        vec4 t3 = texelFetch(data_tex, ivec2((base + 3) % w, (base + 3) / w), 0);
+        center = t0.xyz;
+        scale = vec3(t0.w, t1.x, t1.y);
+        quat = vec4(t1.z, t1.w, t2.x, t2.y);
+        v_color = t3;
+        if (sh_degree >= 1) {
+            vec3 center_world = (MODEL_MATRIX * vec4(center, 1.0)).xyz;
+            vec3 cam = INV_VIEW_MATRIX[3].xyz;
+            v_color.rgb = eval_sh(v_color.rgb, base + 4, w, normalize(center_world - cam), sh_degree);
+        }
     }
+    // View-dependent color from higher-degree SH (COLOR_0 is the degree-0 base).
     // --- Exact ellipsoid -> screen-ellipse projection (no affine/Jacobian
     // approximation). Project the center and the three rotated/scaled semi-axes to
     // clip space, build the projected quadric/conic, and recover the ellipse by
     // eigen-decomposition. Adapted from VRChatGaussianSplatting GSMath.cginc.
-    vec3 scale = vec3(t0.w, t1.x, t1.y);
-    vec4 quat = vec4(t1.z, t1.w, t2.x, t2.y);
     mat4 mvp = PROJECTION_MATRIX * VIEW_MATRIX * MODEL_MATRIX;
     vec4 center_clip = mvp * vec4(center, 1.0);
         vec3 ax0 = q_rotate(vec3(scale.x, 0.0, 0.0), quat);

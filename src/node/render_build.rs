@@ -33,6 +33,15 @@ pub(super) struct SplatRenderData {
     pub(super) data_bytes: PackedByteArray,
     pub(super) tex_width: i32,
     pub(super) tex_height: i32,
+    pub(super) image_format: ImageFormat,
+    pub(super) data_encoding: i32,
+    pub(super) packed_record_bytes: i32,
+    pub(super) position_min: [f32; 3],
+    pub(super) position_max: [f32; 3],
+    pub(super) scale_min: [f32; 3],
+    pub(super) scale_max: [f32; 3],
+    pub(super) sh_min: f32,
+    pub(super) sh_max: f32,
     // Local-space splat centers as vec4(x, y, z, 1) in slot order, used to seed
     // the GPU sort's positions storage buffer (Step 2).
     pub(super) positions_ssbo: PackedByteArray,
@@ -45,9 +54,18 @@ pub(super) struct SplatRenderData {
 // texture floats + sort positions + grown bounds. The main thread turns it into a
 // `SplatRenderData` (Godot types) via `raw_to_render`.
 pub(super) struct RawRenderData {
-    pub(super) data: Vec<f32>,
+    pub(super) data_bytes: Vec<u8>,
     pub(super) tex_width: i32,
     pub(super) tex_height: i32,
+    pub(super) image_format: ImageFormat,
+    pub(super) data_encoding: i32,
+    pub(super) packed_record_bytes: i32,
+    pub(super) position_min: [f32; 3],
+    pub(super) position_max: [f32; 3],
+    pub(super) scale_min: [f32; 3],
+    pub(super) scale_max: [f32; 3],
+    pub(super) sh_min: f32,
+    pub(super) sh_max: f32,
     pub(super) positions: Vec<f32>,
     pub(super) splat_count: i32,
     pub(super) aabb_pos: [f32; 3],
@@ -123,12 +141,13 @@ impl GaussianSplatNode3D {
         let cloud_settings = self.cloud_settings.clone();
         let depth_mode = self.splat_depth_mode_uniform();
 
-        // Per-splat data texture (four RGBA-float texels per splat).
+        // Per-splat data texture. Legacy data is RGBAF; .gsplatpack v2 streams
+        // quantized RGBA8 records and lets the shader decode them.
         let Some(image) = Image::create_from_data(
             render.tex_width,
             render.tex_height,
             false,
-            ImageFormat::RGBAF,
+            render.image_format,
             &render.data_bytes,
         ) else {
             self.clear_splat_multimesh();
@@ -210,6 +229,45 @@ impl GaussianSplatNode3D {
         material.set_shader_parameter("data_tex", &Variant::from(data_texture));
         material.set_shader_parameter("splat_count", &Variant::from(render.splat_count));
         material.set_shader_parameter("sh_degree", &Variant::from(render.sh_degree));
+        material.set_shader_parameter("data_encoding", &Variant::from(render.data_encoding));
+        material.set_shader_parameter(
+            "packed_record_bytes",
+            &Variant::from(render.packed_record_bytes),
+        );
+        material.set_shader_parameter(
+            "position_min",
+            &Variant::from(Vector3::new(
+                render.position_min[0],
+                render.position_min[1],
+                render.position_min[2],
+            )),
+        );
+        material.set_shader_parameter(
+            "position_max",
+            &Variant::from(Vector3::new(
+                render.position_max[0],
+                render.position_max[1],
+                render.position_max[2],
+            )),
+        );
+        material.set_shader_parameter(
+            "scale_min",
+            &Variant::from(Vector3::new(
+                render.scale_min[0],
+                render.scale_min[1],
+                render.scale_min[2],
+            )),
+        );
+        material.set_shader_parameter(
+            "scale_max",
+            &Variant::from(Vector3::new(
+                render.scale_max[0],
+                render.scale_max[1],
+                render.scale_max[2],
+            )),
+        );
+        material.set_shader_parameter("sh_min", &Variant::from(render.sh_min));
+        material.set_shader_parameter("sh_max", &Variant::from(render.sh_max));
         // Step 1 renders unsorted (slot == id); the compute sort (Step 2) flips this on.
         material.set_shader_parameter("sort_enabled", &Variant::from(0_i32));
         material.set_shader_parameter("sort_per_eye", &Variant::from(0_i32));
@@ -435,9 +493,97 @@ pub(super) fn pack_raw(
     let len = (size[0] * size[0] + size[1] * size[1] + size[2] * size[2]).sqrt();
     let g = len * 0.05 + 0.01;
     Some(RawRenderData {
-        data,
+        data_bytes: floats_to_bytes(&data),
         tex_width: tex_width as i32,
         tex_height: tex_height as i32,
+        image_format: ImageFormat::RGBAF,
+        data_encoding: 0,
+        packed_record_bytes: 0,
+        position_min: [0.0; 3],
+        position_max: [1.0; 3],
+        scale_min: [0.0; 3],
+        scale_max: [1.0; 3],
+        sh_min: -1.0,
+        sh_max: 1.0,
+        positions,
+        splat_count: point_count as i32,
+        aabb_pos: [min[0] - g, min[1] - g, min[2] - g],
+        aabb_size: [size[0] + 2.0 * g, size[1] + 2.0 * g, size[2] + 2.0 * g],
+        sh_degree,
+    })
+}
+
+pub(super) fn pack_quantized_records(
+    records: &[u8],
+    record_bytes: usize,
+    scale_multiplier: f32,
+    sh_degree: i32,
+    pack: &crate::gsplat_pack::GsplatPackIndex,
+) -> Option<RawRenderData> {
+    if record_bytes == 0 || !records.len().is_multiple_of(record_bytes) {
+        return None;
+    }
+    let mut point_count = records.len() / record_bytes;
+    let sh_degree = sh_degree.clamp(0, 3);
+    let texels_per_splat = record_bytes.div_ceil(4);
+    let max_points = max_packable_points(texels_per_splat);
+    if point_count > max_points {
+        godot_warn!(
+            "[gsplat] {point_count} packed splats exceed the RGBA8 data-texture \
+             capacity ({max_points} splats); rendering the first {max_points}."
+        );
+        point_count = max_points;
+    }
+    if point_count == 0 {
+        return None;
+    }
+    let tex_width = SPLAT_DATA_TEX_WIDTH as usize;
+    let tex_height = (point_count * texels_per_splat).div_ceil(tex_width).max(1);
+    let data_len = tex_width * tex_height * 4;
+    let mut data_bytes = vec![0_u8; data_len];
+    let copy_len = point_count * record_bytes;
+    data_bytes[..copy_len].copy_from_slice(&records[..copy_len]);
+
+    let mut positions = Vec::with_capacity(point_count * 4);
+    let mut min = [f32::INFINITY; 3];
+    let mut max = [f32::NEG_INFINITY; 3];
+    for slot in 0..point_count {
+        let rec = &records[slot * record_bytes..slot * record_bytes + record_bytes];
+        let center = [
+            dequantize_u16(read_u16(rec, 0), pack.position_min[0], pack.position_max[0]),
+            dequantize_u16(read_u16(rec, 2), pack.position_min[1], pack.position_max[1]),
+            dequantize_u16(read_u16(rec, 4), pack.position_min[2], pack.position_max[2]),
+        ];
+        for k in 0..3 {
+            min[k] = min[k].min(center[k]);
+            max[k] = max[k].max(center[k]);
+        }
+        positions.extend_from_slice(&[center[0], center[1], center[2], 1.0]);
+    }
+    let size = [max[0] - min[0], max[1] - min[1], max[2] - min[2]];
+    let len = (size[0] * size[0] + size[1] * size[1] + size[2] * size[2]).sqrt();
+    let g = len * 0.05 + 0.01;
+    Some(RawRenderData {
+        data_bytes,
+        tex_width: tex_width as i32,
+        tex_height: tex_height as i32,
+        image_format: ImageFormat::RGBA8,
+        data_encoding: 1,
+        packed_record_bytes: record_bytes as i32,
+        position_min: pack.position_min,
+        position_max: pack.position_max,
+        scale_min: [
+            pack.scale_min[0] * scale_multiplier,
+            pack.scale_min[1] * scale_multiplier,
+            pack.scale_min[2] * scale_multiplier,
+        ],
+        scale_max: [
+            pack.scale_max[0] * scale_multiplier,
+            pack.scale_max[1] * scale_multiplier,
+            pack.scale_max[2] * scale_multiplier,
+        ],
+        sh_min: pack.sh_min,
+        sh_max: pack.sh_max,
         positions,
         splat_count: point_count as i32,
         aabb_pos: [min[0] - g, min[1] - g, min[2] - g],
@@ -449,9 +595,18 @@ pub(super) fn pack_raw(
 // Convert worker output into a `SplatRenderData` on the main thread (Godot types).
 pub(super) fn raw_to_render(raw: RawRenderData) -> SplatRenderData {
     SplatRenderData {
-        data_bytes: PackedFloat32Array::from(raw.data).to_byte_array(),
+        data_bytes: PackedByteArray::from(raw.data_bytes),
         tex_width: raw.tex_width,
         tex_height: raw.tex_height,
+        image_format: raw.image_format,
+        data_encoding: raw.data_encoding,
+        packed_record_bytes: raw.packed_record_bytes,
+        position_min: raw.position_min,
+        position_max: raw.position_max,
+        scale_min: raw.scale_min,
+        scale_max: raw.scale_max,
+        sh_min: raw.sh_min,
+        sh_max: raw.sh_max,
         positions_ssbo: PackedFloat32Array::from(raw.positions).to_byte_array(),
         splat_count: raw.splat_count,
         aabb: Aabb::new(
@@ -460,6 +615,22 @@ pub(super) fn raw_to_render(raw: RawRenderData) -> SplatRenderData {
         ),
         sh_degree: raw.sh_degree,
     }
+}
+
+fn floats_to_bytes(values: &[f32]) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(values.len() * 4);
+    for value in values {
+        bytes.extend_from_slice(&value.to_le_bytes());
+    }
+    bytes
+}
+
+fn read_u16(bytes: &[u8], offset: usize) -> u16 {
+    u16::from_le_bytes([bytes[offset], bytes[offset + 1]])
+}
+
+fn dequantize_u16(value: u16, min: f32, max: f32) -> f32 {
+    min + (max - min) * (value as f32 / 65535.0)
 }
 
 #[cfg(test)]

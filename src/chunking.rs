@@ -95,9 +95,10 @@ pub fn partition_payload(payload: &[f32], chunk_size: f32, stride: usize) -> Par
         cells.entry(cell).or_default().push(i as u32);
     }
 
-    // Deterministic chunk order: sort cells by grid coordinates.
+    // Deterministic chunk order: Morton order keeps spatially adjacent cells close
+    // on disk while preserving the per-chunk importance prefix used for LOD.
     let mut keys: Vec<[i32; 3]> = cells.keys().copied().collect();
-    keys.sort_unstable();
+    keys.sort_unstable_by(|a, b| morton_key(*a).cmp(&morton_key(*b)).then(a.cmp(b)));
 
     let mut out = Vec::with_capacity(payload.len());
     let mut entries = Vec::with_capacity(keys.len());
@@ -169,6 +170,27 @@ fn splat_importance(s: &[f32]) -> f32 {
     let sz = s[SCALE_X + 2].abs();
     let footprint = (sx * sy * sz).max(0.0).cbrt();
     alpha * footprint
+}
+
+fn morton_key(grid: [i32; 3]) -> u64 {
+    let x = zigzag_i32(grid[0]).min(0x1f_ffff);
+    let y = zigzag_i32(grid[1]).min(0x1f_ffff);
+    let z = zigzag_i32(grid[2]).min(0x1f_ffff);
+    split_by_3(x) | (split_by_3(y) << 1) | (split_by_3(z) << 2)
+}
+
+fn zigzag_i32(value: i32) -> u64 {
+    ((value << 1) ^ (value >> 31)) as u32 as u64
+}
+
+fn split_by_3(mut value: u64) -> u64 {
+    value &= 0x1f_ffff;
+    value = (value | (value << 32)) & 0x001f_0000_0000_ffff;
+    value = (value | (value << 16)) & 0x001f_0000_ff00_00ff;
+    value = (value | (value << 8)) & 0x100f_00f0_0f00_f00f;
+    value = (value | (value << 4)) & 0x10c3_0c30_c30c_30c3;
+    value = (value | (value << 2)) & 0x1249_2492_4924_9249;
+    value
 }
 
 /// Euclidean distance from a point to an axis-aligned box (0 if inside).
