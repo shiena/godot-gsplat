@@ -79,25 +79,76 @@ impl GaussianSplatNode3D {
     }
 
     pub(super) fn clear_splat_draw(&mut self) {
-        let Some(draw) = self.backend.draw.take() else {
-            return;
-        };
-        let mut server = RenderingServer::singleton();
-        server.free_rid(draw.instance_rid);
-        server.free_rid(draw.mesh_rid);
+        if let Some(draw) = self.backend.draw.take() {
+            free_splat_draw(draw);
+        }
+        if let Some(draw) = self.backend.transition_draw.take() {
+            free_splat_draw(draw);
+        }
+        self.clear_transition_sort();
     }
 
-    pub(super) fn sync_splat_draw_instance(&mut self) {
+    pub(super) fn replace_splat_draw(&mut self, draw: LowLevelSplatDraw, keep_old_visible: bool) {
+        if keep_old_visible {
+            if let Some(old_draw) = self.backend.draw.replace(draw) {
+                if self.backend.transition_draw.is_none() {
+                    self.backend.transition_draw = Some(old_draw);
+                } else {
+                    free_splat_draw(old_draw);
+                }
+            }
+        } else {
+            if let Some(old_draw) = self.backend.draw.replace(draw) {
+                free_splat_draw(old_draw);
+            }
+            if let Some(old_draw) = self.backend.transition_draw.take() {
+                free_splat_draw(old_draw);
+            }
+        }
+    }
+
+    pub(super) fn finish_draw_transition(&mut self) {
         let Some(draw) = &self.backend.draw else {
             return;
         };
+        let splat_visible = self
+            .cloud_settings
+            .as_ref()
+            .map(|settings| settings.bind().is_splat_visible())
+            .unwrap_or(true);
+        let mut server = RenderingServer::singleton();
+        server.instance_set_visible(draw.instance_rid, splat_visible);
+        if let Some(old_draw) = self.backend.transition_draw.take() {
+            free_splat_draw(old_draw);
+        }
+        self.clear_transition_sort();
+    }
+}
+
+fn free_splat_draw(draw: LowLevelSplatDraw) {
+    let mut server = RenderingServer::singleton();
+    server.free_rid(draw.instance_rid);
+    server.free_rid(draw.mesh_rid);
+}
+
+impl GaussianSplatNode3D {
+    pub(super) fn sync_splat_draw_instance(&mut self) {
         if !self.base().is_inside_tree() {
             return;
         }
         let mut server = RenderingServer::singleton();
-        server.instance_set_transform(draw.instance_rid, self.base().get_global_transform());
-        if let Some(world) = self.base().get_world_3d() {
-            server.instance_set_scenario(draw.instance_rid, world.get_scenario());
+        let transform = self.base().get_global_transform();
+        if let Some(draw) = &self.backend.draw {
+            server.instance_set_transform(draw.instance_rid, transform);
+            if let Some(world) = self.base().get_world_3d() {
+                server.instance_set_scenario(draw.instance_rid, world.get_scenario());
+            }
+        }
+        if let Some(draw) = &self.backend.transition_draw {
+            server.instance_set_transform(draw.instance_rid, transform);
+            if let Some(world) = self.base().get_world_3d() {
+                server.instance_set_scenario(draw.instance_rid, world.get_scenario());
+            }
         }
     }
 
@@ -148,6 +199,12 @@ impl GaussianSplatNode3D {
     pub(super) fn apply_render_data(&mut self, render: SplatRenderData) {
         let cloud_settings = self.cloud_settings.clone();
         let depth_mode = self.splat_depth_mode_uniform();
+        let transition_to_sorted =
+            self.backend.draw.is_some() && !Engine::singleton().is_editor_hint();
+        let splat_visible = cloud_settings
+            .as_ref()
+            .map(|settings| settings.bind().is_splat_visible())
+            .unwrap_or(true);
 
         // Per-splat data texture. Legacy data is RGBAF; .gsplatpack v2 streams
         // quantized RGBA8 records and lets the shader decode them.
@@ -158,11 +215,13 @@ impl GaussianSplatNode3D {
             render.image_format,
             &render.data_bytes,
         ) else {
-            self.clear_splat_multimesh();
+            godot_error!("[gsplat] failed to create splat data image; keeping the previous draw.");
             return;
         };
         let Some(data_texture) = ImageTexture::create_from_image(&image) else {
-            self.clear_splat_multimesh();
+            godot_error!(
+                "[gsplat] failed to create splat data texture; keeping the previous draw."
+            );
             return;
         };
 
@@ -218,8 +277,6 @@ impl GaussianSplatNode3D {
         material.set_shader_parameter("sort_per_eye", &Variant::from(0_i32));
         material.set_shader_parameter("splat_depth_mode", &Variant::from(depth_mode));
 
-        self.clear_splat_draw();
-
         let mut server = RenderingServer::singleton();
         let mesh_rid = server.mesh_create();
         let instance_rid = server.instance_create();
@@ -250,25 +307,31 @@ impl GaussianSplatNode3D {
                 server.instance_set_scenario(instance_rid, world.get_scenario());
             }
         }
-        server.instance_set_visible(
-            instance_rid,
-            cloud_settings
-                .as_ref()
-                .map(|settings| settings.bind().is_splat_visible())
-                .unwrap_or(true),
-        );
+        server.instance_set_visible(instance_rid, splat_visible && !transition_to_sorted);
 
-        self.backend.draw = Some(LowLevelSplatDraw {
-            mesh_rid,
-            instance_rid,
-            material,
-            splat_count: render.splat_count,
-            local_aabb: render.aabb,
-        });
+        if transition_to_sorted {
+            if self.backend.transition_draw.is_none() {
+                self.preserve_sort_for_draw_transition();
+            } else {
+                self.teardown_sort();
+            }
+        } else {
+            self.teardown_sort();
+        }
+
+        self.replace_splat_draw(
+            LowLevelSplatDraw {
+                mesh_rid,
+                instance_rid,
+                material,
+                splat_count: render.splat_count,
+                local_aabb: render.aabb,
+            },
+            transition_to_sorted,
+        );
 
         // Stash GPU sort inputs (Step 2). A rebuild invalidates any prior sort
         // (the material above already starts with sort_enabled = 0).
-        self.teardown_sort();
         self.backend.sort.positions = render.positions_ssbo;
         self.backend.sort.splat_count = render.splat_count;
         self.backend.sort.local_aabb = render.aabb;

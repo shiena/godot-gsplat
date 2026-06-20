@@ -30,6 +30,8 @@ struct SplatRenderBackend {
     sort: SortGpu,
     chunks: Option<ChunkRuntime>,
     draw: Option<LowLevelSplatDraw>,
+    transition_draw: Option<LowLevelSplatDraw>,
+    transition_sort: Option<SortGpu>,
 }
 
 struct LowLevelSplatDraw {
@@ -253,6 +255,7 @@ impl INode3D for GaussianSplatNode3D {
             if self.backend.sort.dispatched_once {
                 self.set_material_sort(true);
                 self.backend.sort.enabled_in_shader = true;
+                self.finish_draw_transition();
             }
             self.backend.sort.dispatched_once = true;
         }

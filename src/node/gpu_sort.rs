@@ -499,36 +499,7 @@ impl GaussianSplatNode3D {
     }
 
     pub(super) fn teardown_sort(&mut self) {
-        let has_resources = self.backend.sort.pos_buf.is_valid()
-            || self.backend.sort.shaders[ST_COUNT].is_valid()
-            || self.backend.sort.sort_tex_rid.is_valid();
-        if has_resources {
-            let server = RenderingServer::singleton();
-            if let Some(mut device) = server.get_rendering_device() {
-                let buffers = [
-                    self.backend.sort.sort_tex_rid,
-                    self.backend.sort.sort_tex_rid_b,
-                    self.backend.sort.pos_buf,
-                    self.backend.sort.hist_buf,
-                    self.backend.sort.off_buf,
-                    self.backend.sort.blocks_buf,
-                ];
-                for rid in self
-                    .backend
-                    .sort
-                    .sets
-                    .into_iter()
-                    .chain([self.backend.sort.scatter_set_b])
-                    .chain(self.backend.sort.pipelines)
-                    .chain(self.backend.sort.shaders)
-                    .chain(buffers)
-                {
-                    if rid.is_valid() {
-                        device.free_rid(rid);
-                    }
-                }
-            }
-        }
+        free_sort_resources(&mut self.backend.sort);
 
         // Reset GPU state but keep the stashed inputs so a later tree re-entry can
         // rebuild the sort.
@@ -542,6 +513,17 @@ impl GaussianSplatNode3D {
 
         // Stop the shader from sampling a freed sort texture.
         self.set_material_sort(false);
+    }
+
+    pub(super) fn preserve_sort_for_draw_transition(&mut self) {
+        self.clear_transition_sort();
+        self.backend.transition_sort = Some(std::mem::take(&mut self.backend.sort));
+    }
+
+    pub(super) fn clear_transition_sort(&mut self) {
+        if let Some(mut sort) = self.backend.transition_sort.take() {
+            free_sort_resources(&mut sort);
+        }
     }
 
     pub(super) fn set_material_sort(&self, enabled: bool) {
@@ -577,6 +559,38 @@ impl GaussianSplatNode3D {
             material.set_shader_parameter("sort_per_eye", &Variant::from(0_i32));
             material.set_shader_parameter("sort_tex", &Variant::nil());
             material.set_shader_parameter("sort_tex_b", &Variant::nil());
+        }
+    }
+}
+
+fn free_sort_resources(sort: &mut SortGpu) {
+    let has_resources = sort.pos_buf.is_valid()
+        || sort.shaders[ST_COUNT].is_valid()
+        || sort.sort_tex_rid.is_valid();
+    if !has_resources {
+        return;
+    }
+    let server = RenderingServer::singleton();
+    if let Some(mut device) = server.get_rendering_device() {
+        let buffers = [
+            sort.sort_tex_rid,
+            sort.sort_tex_rid_b,
+            sort.pos_buf,
+            sort.hist_buf,
+            sort.off_buf,
+            sort.blocks_buf,
+        ];
+        for rid in sort
+            .sets
+            .into_iter()
+            .chain([sort.scatter_set_b])
+            .chain(sort.pipelines)
+            .chain(sort.shaders)
+            .chain(buffers)
+        {
+            if rid.is_valid() {
+                device.free_rid(rid);
+            }
         }
     }
 }
