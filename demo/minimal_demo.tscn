@@ -5,10 +5,11 @@
 
 [node name="MinimalDemo" type="Node3D" unique_id=383747317]
 script = ExtResource("1_0a2m0")
+sample_path = "res://demo/sample.gsplatpack"
 splat_render_profile = 3
 splat_depth_mode_override = "center"
 
 [node name="OrbitCamera" type="Camera3D" parent="." unique_id=718758821]
 script = ExtResource("2_orbit")
-orbit_speed = 10.0
-distance_ratio = 0.1
+height_ratio = 0.6
+distance_ratio = 0.5

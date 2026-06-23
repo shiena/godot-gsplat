@@ -10,29 +10,66 @@ const GltfRegistration := preload("res://addons/godot_gsplat/runtime/gltf_regist
 const NODE_CLASS_NAME := "GaussianSplatNode3D"
 
 ## The splat glTF or prebuilt *.gsplatpack to load from the inspector.
-## *_runtime.gltf files are `keep`-imported copies: the importer leaves them
-## alone and the exporter packs the raw bytes, so the live-decode path (and
-## with it the render_profile budget/SH) also works in exported builds.
-## scene_runtime.gltf is the 6.2M-splat large-scene stress sample; switch to
-## demo_runtime.gltf (271k) for the lightweight bonsai.
-@export_file("*.gltf", "*.glb", "*.gsplatpack") var sample_path: String = "res://demo/sample.gltf"
+## The large room sample uses a prebuilt pack so Android/Quest can stream pages
+## from user:// instead of holding the full decoded glTF payload in memory.
+## Switch to demo_runtime.gltf (271k) for the lightweight bonsai.
+@export_file("*.gltf", "*.glb", "*.gsplatpack") var sample_path: String = "res://samples/converted/scene.gsplatpack"
 
 ## Optional 3D loading indicator (e.g. a panel parented to the XR camera).
 ## Shown while the glTF loads and hidden once the splats actually render;
 ## a Label3D child named "Label3D" (if any) receives status messages.
 @export_node_path("Node3D") var loading_panel_path: NodePath
 
-## Chunk selection under a limited budget: "nearest" fills the budget closest to
-## the head (dense bubble, hard boundary); "coverage" spreads it across the whole
-## extent (each chunk keeps its most important splats) — better inside room-scale
-## captures where a nearest bubble cuts through ceiling/desk/floor.
-@export_enum("nearest", "coverage") var splat_chunk_selection: String = "coverage"
+## Chunk selection under a limited budget. "view_priority" keeps the initial view
+## cone and full-distance range represented, then lowers density on distant /
+## peripheral chunks if the target budget would otherwise be exceeded.
+@export_enum("nearest", "coverage", "view_priority") var splat_chunk_selection: String = "view_priority"
+
+@export_group("View Priority Streaming")
+
+## Wide initial cone around the HMD/camera forward vector. 200 degrees gives room
+## for immediate head rotation without loading the entire room at full density.
+@export_range(1.0, 360.0, 1.0) var view_priority_fov_degrees: float = 200.0
+
+## Chunks inside this local-space distance remain candidates; over-budget cases
+## reduce density instead of shrinking this distance.
+@export_range(0.1, 100.0, 0.1, "or_greater") var view_priority_full_distance: float = 5.0
+
+## Minimum prefix kept for a candidate chunk when the full candidate set exceeds
+## the target budget. Lower values preserve more chunks; higher values preserve
+## more local detail per represented chunk.
+@export_range(1, 16384, 1, "or_greater") var view_priority_min_lod_per_chunk: int = 256
 
 ## Requested XR display refresh rate (0 = leave the runtime default). The splat
 ## workload misses 90 Hz on Quest 3 (App ≈14 ms vs the 11.1 ms budget), so the
 ## compositor reprojects every other frame — which shimmers on translucent
 ## splats. 72 Hz gives a 13.9 ms budget the workload actually fits.
 @export var xr_refresh_rate: float = 72.0
+
+@export_group("Collisionless XR Locomotion")
+
+## Moves XROrigin3D directly for point-cloud viewing. This intentionally ignores
+## PlayerBody physics, gravity, and collisions.
+@export var collisionless_locomotion_enabled: bool = true
+
+@export_node_path("XROrigin3D") var locomotion_origin_path: NodePath = NodePath("XR/XROrigin3D")
+@export_node_path("XRCamera3D") var locomotion_camera_path: NodePath = NodePath("XR/XROrigin3D/XRCamera3D")
+@export_node_path("XRController3D") var locomotion_move_controller_path: NodePath = NodePath("XR/XROrigin3D/XRController3DL")
+@export_node_path("XRController3D") var locomotion_turn_controller_path: NodePath = NodePath("XR/XROrigin3D/XRController3DR")
+
+@export var locomotion_input_action: String = "primary"
+@export var locomotion_down_button_action: String = "ax_button"
+@export var locomotion_up_button_action: String = "by_button"
+@export_range(0.0, 20.0, 0.1, "or_greater") var locomotion_move_speed: float = 3.0
+@export_range(0.0, 20.0, 0.1, "or_greater") var locomotion_vertical_speed: float = 2.0
+@export_range(0.0, 1.0, 0.01) var locomotion_x_deadzone: float = 0.2
+@export_range(0.0, 1.0, 0.01) var locomotion_y_deadzone: float = 0.1
+@export var locomotion_strafe: bool = true
+
+@export var locomotion_snap_turn: bool = true
+@export_range(1.0, 90.0, 1.0) var locomotion_snap_turn_degrees: float = 20.0
+@export_range(0.0, 2.0, 0.01) var locomotion_snap_turn_delay: float = 0.2
+@export_range(0.0, 10.0, 0.1, "or_greater") var locomotion_smooth_turn_speed: float = 2.0
 
 ## Render profile applied to the splat node after loading. Budget/SH only take
 ## effect on the live-decode (raw glTF) path; on the imported-scene path the
@@ -52,16 +89,16 @@ const NODE_CLASS_NAME := "GaussianSplatNode3D"
 ## Backend platform target. "vr_safe" = spatial VR pipeline, "mobile" = mobile
 ## direct, "desktop" = desktop (clustered above the cluster threshold).
 ## "profile_default" keeps the profile's target.
-@export_enum("profile_default", "desktop", "mobile", "vr_safe") var splat_target_hint_override: String = "profile_default"
+@export_enum("profile_default", "desktop", "mobile", "vr_safe") var splat_target_hint_override: String = "vr_safe"
 
 ## Override the profile's splat budget (max rendered splats). When off, the
 ## profile's own budget is used (XR derives its from the asset extent) —
 ## budget is a free integer, so this toggle is how you select "profile default".
-@export var splat_budget_override_enabled: bool = false
+@export var splat_budget_override_enabled: bool = true
 
 ## Max rendered splats, used only when Splat Budget Override Enabled is on;
 ## clamped to the asset's point count.
-@export_range(1000, 8000000, 1000, "or_greater") var splat_budget: int = 500000
+@export_range(1000, 8000000, 1000, "or_greater") var splat_budget: int = 800000
 
 ## Spherical-harmonics degree: higher = more view-dependent color at more data
 ## texture / shader cost. -1 = use the profile's SH degree.
@@ -84,13 +121,26 @@ var _loaded_scene: Node
 var _load_thread: Thread
 var _status_label: Label
 var _loading_panel: Node3D
+var _locomotion_origin: XROrigin3D
+var _locomotion_camera: XRCamera3D
+var _locomotion_move_controller: XRController3D
+var _locomotion_turn_controller: XRController3D
+var _locomotion_turn_step: float = 0.0
 
 func _ready() -> void:
 	_loading_panel = get_node_or_null(loading_panel_path) as Node3D
+	_locomotion_origin = get_node_or_null(locomotion_origin_path) as XROrigin3D
+	_locomotion_camera = get_node_or_null(locomotion_camera_path) as XRCamera3D
+	_locomotion_move_controller = get_node_or_null(locomotion_move_controller_path) as XRController3D
+	_locomotion_turn_controller = get_node_or_null(locomotion_turn_controller_path) as XRController3D
 	_gltf_extension = GltfRegistration.register_gltf_extension()
 	_ensure_environment()
 	_apply_xr_refresh_rate()
 	_start_loading()
+
+func _physics_process(delta: float) -> void:
+	if collisionless_locomotion_enabled:
+		_update_collisionless_locomotion(delta)
 
 # Request the configured XR refresh rate once the XR session is up. A request
 # made before the session is running/focused is silently dropped by the
@@ -199,6 +249,91 @@ func _has_gsplat_pack_magic(file: FileAccess) -> bool:
 			and magic[6] == 49 \
 			and magic[7] == 0
 
+func _update_collisionless_locomotion(delta: float) -> void:
+	if _locomotion_origin == null or _locomotion_camera == null:
+		return
+	_apply_collisionless_move(delta)
+	_apply_collisionless_vertical_move(delta)
+	_apply_collisionless_turn(delta)
+
+func _apply_collisionless_move(delta: float) -> void:
+	if _locomotion_move_controller == null or not _locomotion_move_controller.get_is_active():
+		return
+	var input := _adjust_locomotion_vector(_locomotion_move_controller.get_vector2(locomotion_input_action))
+	if input.length_squared() <= 0.0:
+		return
+	var camera_basis := _locomotion_camera.global_transform.basis
+	var forward := -camera_basis.z
+	forward.y = 0.0
+	forward = forward.normalized() if forward.length_squared() > 0.0001 else Vector3.FORWARD
+	var right := camera_basis.x
+	right.y = 0.0
+	right = right.normalized() if right.length_squared() > 0.0001 else Vector3.RIGHT
+	var movement := forward * input.y
+	if locomotion_strafe:
+		movement += right * input.x
+	if movement.length_squared() <= 0.0:
+		return
+	_locomotion_origin.global_position += movement.normalized() * locomotion_move_speed * delta
+
+func _apply_collisionless_vertical_move(delta: float) -> void:
+	var up_pressed := _is_locomotion_button_pressed(locomotion_up_button_action)
+	var down_pressed := _is_locomotion_button_pressed(locomotion_down_button_action)
+	var direction := int(up_pressed) - int(down_pressed)
+	if direction == 0:
+		return
+	_locomotion_origin.global_position += Vector3.UP * float(direction) * locomotion_vertical_speed * delta
+
+func _is_locomotion_button_pressed(button_action: String) -> bool:
+	if button_action.is_empty():
+		return false
+	if _locomotion_move_controller != null \
+			and _locomotion_move_controller.get_is_active() \
+			and _locomotion_move_controller.is_button_pressed(button_action):
+		return true
+	return _locomotion_turn_controller != null \
+			and _locomotion_turn_controller.get_is_active() \
+			and _locomotion_turn_controller.is_button_pressed(button_action)
+
+func _apply_collisionless_turn(delta: float) -> void:
+	if _locomotion_turn_controller == null or not _locomotion_turn_controller.get_is_active():
+		return
+	var left_right := _adjust_locomotion_axis(_locomotion_turn_controller.get_vector2(locomotion_input_action).x, locomotion_x_deadzone)
+	if absf(left_right) <= 0.0:
+		_locomotion_turn_step = 0.0
+		return
+	if not locomotion_snap_turn:
+		_rotate_origin_around_camera(-left_right * locomotion_smooth_turn_speed * delta)
+		return
+	if locomotion_snap_turn_delay == 0.0 and _locomotion_turn_step < 0.0:
+		return
+	_locomotion_turn_step -= absf(left_right) * delta
+	if _locomotion_turn_step >= 0.0:
+		return
+	if locomotion_snap_turn_delay != 0.0:
+		_locomotion_turn_step = locomotion_snap_turn_delay
+	else:
+		_locomotion_turn_step = -1.0
+	_rotate_origin_around_camera(deg_to_rad(locomotion_snap_turn_degrees) * -signf(left_right))
+
+func _rotate_origin_around_camera(angle: float) -> void:
+	var pivot := _locomotion_camera.global_position
+	var offset := _locomotion_origin.global_position - pivot
+	var rotation := Basis(Vector3.UP, angle)
+	_locomotion_origin.global_position = pivot + rotation * offset
+	_locomotion_origin.global_basis = rotation * _locomotion_origin.global_basis
+
+func _adjust_locomotion_vector(input: Vector2) -> Vector2:
+	return Vector2(
+			_adjust_locomotion_axis(input.x, locomotion_x_deadzone),
+			_adjust_locomotion_axis(input.y, locomotion_y_deadzone))
+
+func _adjust_locomotion_axis(value: float, deadzone: float) -> float:
+	var magnitude := absf(value)
+	if magnitude <= deadzone:
+		return 0.0
+	return remap(magnitude, deadzone, 1.0, 0.0, 1.0) * signf(value)
+
 # Runs on the loader thread.
 func _load_scene_blocking(path: String) -> void:
 	# Parse the raw file when it exists (packed via a `keep`-imported copy);
@@ -219,6 +354,7 @@ func _load_scene_blocking(path: String) -> void:
 		# budget/SH apply on bind.
 		_apply_profile_with_override(splat_node)
 		splat_node.call("set_chunk_selection", splat_chunk_selection)
+		_apply_view_priority_settings(splat_node)
 		splat_node.set("source_gltf", path)
 		if not splat_node.call("has_asset"):
 			var message := _decode_failure_message(splat_node, path)
@@ -268,6 +404,8 @@ func _on_load_finished(generated: Node) -> void:
 	# backend settings match the selection plus any depth override.
 	if not splat_node.call("has_asset"):
 		_apply_profile_with_override(splat_node)
+		splat_node.call("set_chunk_selection", splat_chunk_selection)
+		_apply_view_priority_settings(splat_node)
 
 	# Keep the panel up until the splats actually render: large clouds build
 	# their first render set asynchronously after entering the tree.
@@ -319,6 +457,7 @@ func _apply_profile_with_override(splat_node: Object) -> void:
 		settings["target_hint"] = splat_target_hint_override
 	if splat_budget_override_enabled:
 		settings["budget"] = splat_budget
+		settings["xr_fixed_splat_budget"] = splat_budget
 	if splat_sh_degree_override >= 0:
 		settings["sh_degree"] = splat_sh_degree_override
 	if splat_vr_view_basis_override != "profile_default":
@@ -326,6 +465,19 @@ func _apply_profile_with_override(splat_node: Object) -> void:
 	if splat_depth_mode_override != "profile_default":
 		settings["splat_depth_mode"] = splat_depth_mode_override
 	splat_node.call("apply_profile_settings", settings)
+
+func _apply_view_priority_settings(splat_node: Object) -> void:
+	if splat_chunk_selection != "view_priority":
+		return
+	var settings: Object = splat_node.call("get_cloud_settings")
+	if settings == null:
+		return
+	settings.call("set_view_priority_fov_degrees", view_priority_fov_degrees)
+	settings.call("set_view_priority_full_distance", view_priority_full_distance)
+	settings.call("set_view_priority_target_budget", splat_budget)
+	settings.call("set_view_priority_min_lod_per_chunk", view_priority_min_lod_per_chunk)
+	settings.call("set_xr_fixed_budget_enabled", true)
+	settings.call("set_xr_fixed_splat_budget", splat_budget)
 
 # Push the depth mode straight onto the live material (0 = ray, 1 = center).
 # Used for the baked-scene path, whose material is never rebuilt at runtime.

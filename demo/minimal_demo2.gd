@@ -10,23 +10,35 @@ const GltfRegistration := preload("res://addons/godot_gsplat/runtime/gltf_regist
 const NODE_CLASS_NAME := "GaussianSplatNode3D"
 
 ## The splat glTF or prebuilt *.gsplatpack to load from the inspector.
-## *_runtime.gltf files are `keep`-imported copies: the importer leaves them
-## alone and the exporter packs the raw bytes, so the live-decode path (and
-## with it the render_profile budget/SH) also works in exported builds.
-## scene_runtime.gltf is the 6.2M-splat large-scene stress sample; switch to
-## demo_runtime.gltf (271k) for the lightweight bonsai.
-@export_file("*.gltf", "*.glb", "*.gsplatpack") var sample_path: String = "res://demo/sample.gltf"
+## The large room sample uses a prebuilt pack so Android/Quest can stream pages
+## from user:// instead of holding the full decoded glTF payload in memory.
+## Switch to demo_runtime.gltf (271k) for the lightweight bonsai.
+@export_file("*.gltf", "*.glb", "*.gsplatpack") var sample_path: String = "res://samples/converted/scene.gsplatpack"
 
 ## Optional 3D loading indicator (e.g. a panel parented to the XR camera).
 ## Shown while the glTF loads and hidden once the splats actually render;
 ## a Label3D child named "Label3D" (if any) receives status messages.
 @export_node_path("Node3D") var loading_panel_path: NodePath
 
-## Chunk selection under a limited budget: "nearest" fills the budget closest to
-## the head (dense bubble, hard boundary); "coverage" spreads it across the whole
-## extent (each chunk keeps its most important splats) — better inside room-scale
-## captures where a nearest bubble cuts through ceiling/desk/floor.
-@export_enum("nearest", "coverage") var splat_chunk_selection: String = "coverage"
+## Chunk selection under a limited budget. "view_priority" keeps the initial view
+## cone and full-distance range represented, then lowers density on distant /
+## peripheral chunks if the target budget would otherwise be exceeded.
+@export_enum("nearest", "coverage", "view_priority") var splat_chunk_selection: String = "view_priority"
+
+@export_group("View Priority Streaming")
+
+## Wide initial cone around the HMD/camera forward vector. 200 degrees gives room
+## for immediate head rotation without loading the entire room at full density.
+@export_range(1.0, 360.0, 1.0) var view_priority_fov_degrees: float = 200.0
+
+## Chunks inside this local-space distance remain candidates; over-budget cases
+## reduce density instead of shrinking this distance.
+@export_range(0.1, 100.0, 0.1, "or_greater") var view_priority_full_distance: float = 5.0
+
+## Minimum prefix kept for a candidate chunk when the full candidate set exceeds
+## the target budget. Lower values preserve more chunks; higher values preserve
+## more local detail per represented chunk.
+@export_range(1, 16384, 1, "or_greater") var view_priority_min_lod_per_chunk: int = 256
 
 ## Requested XR display refresh rate (0 = leave the runtime default). The splat
 ## workload misses 90 Hz on Quest 3 (App ≈14 ms vs the 11.1 ms budget), so the
@@ -52,16 +64,16 @@ const NODE_CLASS_NAME := "GaussianSplatNode3D"
 ## Backend platform target. "vr_safe" = spatial VR pipeline, "mobile" = mobile
 ## direct, "desktop" = desktop (clustered above the cluster threshold).
 ## "profile_default" keeps the profile's target.
-@export_enum("profile_default", "desktop", "mobile", "vr_safe") var splat_target_hint_override: String = "profile_default"
+@export_enum("profile_default", "desktop", "mobile", "vr_safe") var splat_target_hint_override: String = "vr_safe"
 
 ## Override the profile's splat budget (max rendered splats). When off, the
 ## profile's own budget is used (XR derives its from the asset extent) —
 ## budget is a free integer, so this toggle is how you select "profile default".
-@export var splat_budget_override_enabled: bool = false
+@export var splat_budget_override_enabled: bool = true
 
 ## Max rendered splats, used only when Splat Budget Override Enabled is on;
 ## clamped to the asset's point count.
-@export_range(1000, 8000000, 1000, "or_greater") var splat_budget: int = 500000
+@export_range(1000, 8000000, 1000, "or_greater") var splat_budget: int = 800000
 
 ## Spherical-harmonics degree: higher = more view-dependent color at more data
 ## texture / shader cost. -1 = use the profile's SH degree.
@@ -219,6 +231,7 @@ func _load_scene_blocking(path: String) -> void:
 		# budget/SH apply on bind.
 		_apply_profile_with_override(splat_node)
 		splat_node.call("set_chunk_selection", splat_chunk_selection)
+		_apply_view_priority_settings(splat_node)
 		splat_node.set("source_gltf", path)
 		if not splat_node.call("has_asset"):
 			var message := _decode_failure_message(splat_node, path)
@@ -268,6 +281,8 @@ func _on_load_finished(generated: Node) -> void:
 	# backend settings match the selection plus any depth override.
 	if not splat_node.call("has_asset"):
 		_apply_profile_with_override(splat_node)
+		splat_node.call("set_chunk_selection", splat_chunk_selection)
+		_apply_view_priority_settings(splat_node)
 
 	# Keep the panel up until the splats actually render: large clouds build
 	# their first render set asynchronously after entering the tree.
@@ -326,6 +341,17 @@ func _apply_profile_with_override(splat_node: Object) -> void:
 	if splat_depth_mode_override != "profile_default":
 		settings["splat_depth_mode"] = splat_depth_mode_override
 	splat_node.call("apply_profile_settings", settings)
+
+func _apply_view_priority_settings(splat_node: Object) -> void:
+	if splat_chunk_selection != "view_priority":
+		return
+	var settings: Object = splat_node.call("get_cloud_settings")
+	if settings == null:
+		return
+	settings.call("set_view_priority_fov_degrees", view_priority_fov_degrees)
+	settings.call("set_view_priority_full_distance", view_priority_full_distance)
+	settings.call("set_view_priority_target_budget", splat_budget)
+	settings.call("set_view_priority_min_lod_per_chunk", view_priority_min_lod_per_chunk)
 
 # Push the depth mode straight onto the live material (0 = ray, 1 = center).
 # Used for the baked-scene path, whose material is never rebuilt at runtime.
