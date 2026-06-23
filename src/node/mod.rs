@@ -123,6 +123,8 @@ const PROFILE_KEY_BUDGET: &str = "budget";
 const PROFILE_KEY_SH_DEGREE: &str = "sh_degree";
 const PROFILE_KEY_VR_VIEW_BASIS: &str = "vr_view_basis";
 const PROFILE_KEY_SPLAT_DEPTH_MODE: &str = "splat_depth_mode";
+const PROFILE_KEY_XR_FIXED_BUDGET_ENABLED: &str = "xr_fixed_budget_enabled";
+const PROFILE_KEY_XR_FIXED_SPLAT_BUDGET: &str = "xr_fixed_splat_budget";
 // Budget sentinel meaning "resolve from the bound asset's spatial extent"
 // (XR). Kept in the dictionary so the asset-adaptive budget is recomputed
 // when the asset binds rather than frozen to the no-asset floor.
@@ -326,7 +328,15 @@ impl GaussianSplatNode3D {
     // "read current, tweak, re-apply" round-trip works too.
     #[func]
     fn get_profile_settings(&self, profile: RenderProfile) -> VarDictionary {
-        let (target_hint, budget, sh_degree, vr_view_basis, splat_depth_mode) = match profile {
+        let (
+            target_hint,
+            budget,
+            sh_degree,
+            vr_view_basis,
+            splat_depth_mode,
+            xr_fixed_budget_enabled,
+            xr_fixed_splat_budget,
+        ) = match profile {
             RenderProfile::Custom => return self.current_effective_settings(),
             RenderProfile::Low => (
                 BACKEND_PROFILE_VR_SAFE,
@@ -334,6 +344,8 @@ impl GaussianSplatNode3D {
                 RENDER_PROFILE_LOW_SH_DEGREE,
                 VR_VIEW_BASIS_HEAD_CENTER,
                 SPLAT_DEPTH_MODE_RAY,
+                false,
+                RENDER_PROFILE_LOW_SPLATS as i64,
             ),
             RenderProfile::Middle => (
                 BACKEND_PROFILE_MOBILE,
@@ -341,6 +353,8 @@ impl GaussianSplatNode3D {
                 RENDER_PROFILE_MIDDLE_SH_DEGREE,
                 VR_VIEW_BASIS_HEAD_CENTER,
                 SPLAT_DEPTH_MODE_RAY,
+                false,
+                RENDER_PROFILE_MIDDLE_SPLATS as i64,
             ),
             // The budget is asset-adaptive; the sentinel defers it to apply time so
             // the bound asset's extent (in refresh_from_asset) drives it.
@@ -350,6 +364,8 @@ impl GaussianSplatNode3D {
                 RENDER_PROFILE_XR_SH_DEGREE,
                 VR_VIEW_BASIS_HEAD_CENTER,
                 SPLAT_DEPTH_MODE_CENTER,
+                true,
+                PROFILE_BUDGET_ADAPTIVE,
             ),
             RenderProfile::High => (
                 BACKEND_PROFILE_DESKTOP,
@@ -357,6 +373,8 @@ impl GaussianSplatNode3D {
                 RENDER_PROFILE_HIGH_SH_DEGREE,
                 VR_VIEW_BASIS_HEAD_CENTER,
                 SPLAT_DEPTH_MODE_RAY,
+                false,
+                RENDER_PROFILE_HIGH_SPLATS as i64,
             ),
         };
         profile_settings_dict(
@@ -365,6 +383,8 @@ impl GaussianSplatNode3D {
             sh_degree,
             vr_view_basis,
             splat_depth_mode,
+            xr_fixed_budget_enabled,
+            xr_fixed_splat_budget,
         )
     }
 
@@ -429,6 +449,20 @@ impl GaussianSplatNode3D {
         } else {
             budget as i32
         };
+        let xr_fixed_budget_enabled =
+            dict_bool(settings, PROFILE_KEY_XR_FIXED_BUDGET_ENABLED).unwrap_or(false);
+        let xr_fixed_budget =
+            dict_i64(settings, PROFILE_KEY_XR_FIXED_SPLAT_BUDGET).unwrap_or(budget as i64);
+        let xr_fixed_budget = if xr_fixed_budget < 0 {
+            budget
+        } else {
+            xr_fixed_budget as i32
+        };
+        if let Some(cloud_settings) = &mut self.cloud_settings {
+            let mut cloud_settings = cloud_settings.bind_mut();
+            cloud_settings.set_xr_fixed_budget_enabled(xr_fixed_budget_enabled);
+            cloud_settings.set_xr_fixed_splat_budget(xr_fixed_budget);
+        }
         // Guard so these preset-driven writes do not flip the profile to Custom.
         self.applying_profile = true;
         self.set_preview_max_splats(budget);
@@ -460,6 +494,8 @@ impl GaussianSplatNode3D {
             self.get_sh_degree(),
             &vr_view_basis,
             &splat_depth_mode,
+            self.is_xr_fixed_budget_enabled(),
+            self.get_xr_fixed_splat_budget() as i64,
         )
     }
 
@@ -695,6 +731,48 @@ impl GaussianSplatNode3D {
         }
         self.mark_backend_dirty("preview_max_splats");
         self.rebuild_splat_multimesh();
+    }
+
+    #[func]
+    pub fn is_xr_fixed_budget_enabled(&self) -> bool {
+        self.cloud_settings
+            .as_ref()
+            .map(|settings| settings.bind().is_xr_fixed_budget_enabled())
+            .unwrap_or(false)
+    }
+
+    #[func]
+    pub fn set_xr_fixed_budget_enabled(&mut self, enabled: bool) {
+        self.ensure_cloud_settings();
+        if let Some(settings) = &mut self.cloud_settings {
+            settings.bind_mut().set_xr_fixed_budget_enabled(enabled);
+        }
+        if let Some(rt) = self.backend.chunks.as_mut() {
+            rt.last_select_pos = None;
+            rt.last_select_forward = None;
+        }
+        self.mark_backend_dirty("xr_fixed_budget_enabled");
+    }
+
+    #[func]
+    pub fn get_xr_fixed_splat_budget(&self) -> i32 {
+        self.cloud_settings
+            .as_ref()
+            .map(|settings| settings.bind().get_xr_fixed_splat_budget())
+            .unwrap_or(crate::cloud_settings::DEFAULT_XR_FIXED_SPLAT_BUDGET)
+    }
+
+    #[func]
+    pub fn set_xr_fixed_splat_budget(&mut self, budget: i32) {
+        self.ensure_cloud_settings();
+        if let Some(settings) = &mut self.cloud_settings {
+            settings.bind_mut().set_xr_fixed_splat_budget(budget);
+        }
+        if let Some(rt) = self.backend.chunks.as_mut() {
+            rt.last_select_pos = None;
+            rt.last_select_forward = None;
+        }
+        self.mark_backend_dirty("xr_fixed_splat_budget");
     }
 
     #[func]
@@ -1095,6 +1173,8 @@ fn profile_settings_dict(
     sh_degree: i32,
     vr_view_basis: &str,
     splat_depth_mode: &str,
+    xr_fixed_budget_enabled: bool,
+    xr_fixed_splat_budget: i64,
 ) -> VarDictionary {
     let mut dict = VarDictionary::new();
     dict.set(
@@ -1111,6 +1191,8 @@ fn profile_settings_dict(
         PROFILE_KEY_SPLAT_DEPTH_MODE,
         &Variant::from(GString::from(splat_depth_mode)),
     );
+    dict.set(PROFILE_KEY_XR_FIXED_BUDGET_ENABLED, xr_fixed_budget_enabled);
+    dict.set(PROFILE_KEY_XR_FIXED_SPLAT_BUDGET, xr_fixed_splat_budget);
     dict
 }
 
@@ -1121,6 +1203,10 @@ fn dict_gstring(dict: &VarDictionary, key: &str) -> Option<GString> {
 
 fn dict_i64(dict: &VarDictionary, key: &str) -> Option<i64> {
     dict.get(key).and_then(|value| value.try_to::<i64>().ok())
+}
+
+fn dict_bool(dict: &VarDictionary, key: &str) -> Option<bool> {
+    dict.get(key).and_then(|value| value.try_to::<bool>().ok())
 }
 
 fn globalize_path(path: &str) -> String {

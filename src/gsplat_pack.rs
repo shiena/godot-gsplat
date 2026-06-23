@@ -3,6 +3,7 @@
 //! Packs store quantized RGBA8 splat records so the renderer can upload selected
 //! pages without expanding them back to RGBAF.
 
+use std::collections::HashSet;
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -11,12 +12,14 @@ use crate::chunking::{ChunkEntry, ChunkTable};
 use crate::import_state::POINT_STRIDE_FLOATS;
 
 const MAGIC: &[u8; 8] = b"GSPACK1\0";
-const VERSION: u32 = 2;
+const VERSION: u32 = 3;
 pub const DEFAULT_PAGE_SPLATS: u32 = 16_384;
 const HEADER_SIZE: u64 = 160;
 const CHUNK_RECORD_SIZE: u64 = 64;
 const PAGE_RECORD_SIZE: u64 = 32;
+const NODE_LOD_RECORD_SIZE: u64 = 32;
 const ENCODING_PACKED_RGBA8: u32 = 1;
+const DEFAULT_LOD_LEVELS: u32 = 4;
 
 #[derive(Clone, Debug)]
 pub struct PackChunk {
@@ -28,10 +31,20 @@ pub struct PackChunk {
 #[derive(Clone, Debug)]
 pub struct PackPage {
     pub chunk_index: u32,
-    pub start_in_chunk: u32,
+    pub lod_index: u32,
+    pub start_in_lod: u32,
     pub count: u32,
     pub byte_offset: u64,
     pub byte_len: u32,
+}
+
+#[derive(Clone, Debug)]
+pub struct PackNodeLod {
+    pub chunk_index: u32,
+    pub lod_level: u32,
+    pub count: u32,
+    pub first_page: u32,
+    pub page_count: u32,
 }
 
 #[derive(Clone, Debug)]
@@ -49,7 +62,9 @@ pub struct GsplatPackIndex {
     pub scale_max: [f32; 3],
     pub sh_min: f32,
     pub sh_max: f32,
+    pub lod_levels: u32,
     pub chunks: Vec<PackChunk>,
+    pub lods: Vec<PackNodeLod>,
     pub pages: Vec<PackPage>,
 }
 
@@ -67,8 +82,11 @@ struct PackHeader {
     sh_min: f32,
     sh_max: f32,
     chunk_count: u32,
+    node_lod_count: u32,
+    lod_levels: u32,
     page_count: u32,
     chunk_table_offset: u64,
+    node_lod_table_offset: u64,
     page_table_offset: u64,
     payload_offset: u64,
 }
@@ -101,6 +119,145 @@ impl GsplatPackIndex {
             .map_err(|err| format!("Failed to read pack page {page_index}: {err}"))?;
         Ok(bytes)
     }
+
+    pub fn best_lod_for_request(
+        &self,
+        chunk_index: u32,
+        requested_count: u32,
+    ) -> Option<&PackNodeLod> {
+        let mut smallest: Option<&PackNodeLod> = None;
+        let mut best_under_budget: Option<&PackNodeLod> = None;
+        for lod in self
+            .lods
+            .iter()
+            .filter(|lod| lod.chunk_index == chunk_index)
+        {
+            if smallest.is_none_or(|current| lod.count < current.count) {
+                smallest = Some(lod);
+            }
+            if lod.count <= requested_count
+                && best_under_budget.is_none_or(|current| lod.count > current.count)
+            {
+                best_under_budget = Some(lod);
+            }
+        }
+        best_under_budget.or(smallest)
+    }
+
+    pub fn select_lods_view_priority(
+        &self,
+        cam: [f32; 3],
+        forward: [f32; 3],
+        fov_degrees: f32,
+        full_distance: f32,
+        budget: u32,
+    ) -> Vec<(u32, u32)> {
+        if self.chunks.is_empty() || self.lods.is_empty() || budget == 0 || full_distance <= 0.0 {
+            return Vec::new();
+        }
+
+        let forward = normalize_or(forward, [0.0, 0.0, -1.0]);
+        let fov_degrees = fov_degrees.clamp(1.0, 360.0);
+        let cos_half_fov = (fov_degrees.to_radians() * 0.5).cos();
+        let include_all_angles = fov_degrees >= 359.999;
+
+        let mut candidates = Vec::new();
+        for (idx, chunk) in self.chunks.iter().enumerate() {
+            let distance = aabb_distance(cam, chunk.entry.aabb_min, chunk.entry.aabb_max);
+            if distance > full_distance {
+                continue;
+            }
+
+            let center = aabb_center(chunk.entry.aabb_min, chunk.entry.aabb_max);
+            let to_center = [center[0] - cam[0], center[1] - cam[1], center[2] - cam[2]];
+            let dir = normalize_or(to_center, forward);
+            let center_dot = dot3(forward, dir).clamp(-1.0, 1.0);
+            if !include_all_angles && center_dot < cos_half_fov {
+                continue;
+            }
+
+            let lods = self.chunk_lods(idx as u32);
+            let Some(min_lod) = lods.iter().min_by_key(|lod| lod.count).copied() else {
+                continue;
+            };
+            let distance_score = 1.0 / (1.0 + distance.max(0.0));
+            let angle_score = (center_dot + 1.0) * 0.5;
+            let count_score = (chunk.entry.count.max(1) as f32).ln() * 0.01;
+            let priority = distance_score * 2.0 + angle_score * 2.0 + count_score;
+            candidates.push(LodSelectionCandidate {
+                chunk_index: idx as u32,
+                priority,
+                selected_count: min_lod.count,
+                lod_counts: lods.into_iter().map(|lod| lod.count).collect(),
+            });
+        }
+
+        if candidates.is_empty() {
+            return Vec::new();
+        }
+
+        candidates.sort_by(high_lod_priority_first);
+        let mut total = 0_u64;
+        let mut selected = Vec::new();
+        for mut candidate in candidates {
+            if total + candidate.selected_count as u64 > budget as u64 {
+                continue;
+            }
+            total += candidate.selected_count as u64;
+            candidate.lod_counts.sort_unstable();
+            candidate.lod_counts.dedup();
+            selected.push(candidate);
+        }
+
+        for candidate in &mut selected {
+            for count in candidate.lod_counts.iter().copied().rev() {
+                if count <= candidate.selected_count {
+                    continue;
+                }
+                let extra = (count - candidate.selected_count) as u64;
+                if total + extra <= budget as u64 {
+                    total += extra;
+                    candidate.selected_count = count;
+                    break;
+                }
+            }
+        }
+
+        selected.sort_unstable_by_key(|candidate| candidate.chunk_index);
+        selected
+            .into_iter()
+            .map(|candidate| (candidate.chunk_index, candidate.selected_count))
+            .collect()
+    }
+
+    fn chunk_lods(&self, chunk_index: u32) -> Vec<&PackNodeLod> {
+        let Some(chunk) = self.chunks.get(chunk_index as usize) else {
+            return Vec::new();
+        };
+        self.lods
+            .iter()
+            .skip_while(|lod| lod.chunk_index < chunk_index)
+            .take_while(|lod| lod.chunk_index == chunk_index)
+            .filter(|lod| lod.count > 0 && lod.first_page >= chunk.first_page)
+            .collect()
+    }
+}
+
+struct LodSelectionCandidate {
+    chunk_index: u32,
+    priority: f32,
+    selected_count: u32,
+    lod_counts: Vec<u32>,
+}
+
+fn high_lod_priority_first(
+    a: &LodSelectionCandidate,
+    b: &LodSelectionCandidate,
+) -> std::cmp::Ordering {
+    b.priority
+        .partial_cmp(&a.priority)
+        .unwrap_or(std::cmp::Ordering::Equal)
+        .then(a.chunk_index.cmp(&b.chunk_index))
 }
 
 pub fn write_pack(
@@ -121,37 +278,66 @@ pub fn write_pack(
     let page_splats = page_splats.max(1);
     let point_count = (payload.len() / stride) as u32;
     let mut chunks = Vec::with_capacity(table.entries.len());
+    let mut lods = Vec::new();
     let mut pages = Vec::new();
 
     for (chunk_index, entry) in table.entries.iter().enumerate() {
-        let first_page = pages.len() as u32;
-        let mut start = 0_u32;
-        while start < entry.count {
-            let count = (entry.count - start).min(page_splats);
-            pages.push(PackPage {
+        let chunk_first_page = pages.len() as u32;
+        let lod_counts = lod_counts_for_chunk(entry.count, DEFAULT_LOD_LEVELS);
+        for (lod_level, &lod_count) in lod_counts.iter().enumerate() {
+            let lod_index = lods.len() as u32;
+            let first_page = pages.len() as u32;
+            let mut start = 0_u32;
+            while start < lod_count {
+                let count = (lod_count - start).min(page_splats);
+                pages.push(PackPage {
+                    chunk_index: chunk_index as u32,
+                    lod_index,
+                    start_in_lod: start,
+                    count,
+                    byte_offset: 0,
+                    byte_len: count
+                        .checked_mul(stride as u32)
+                        .and_then(|v| v.checked_mul(4))
+                        .ok_or_else(|| "Pack page byte length overflowed.".to_string())?,
+                });
+                start += count;
+            }
+            lods.push(PackNodeLod {
                 chunk_index: chunk_index as u32,
-                start_in_chunk: start,
-                count,
-                byte_offset: 0,
-                byte_len: count
-                    .checked_mul(stride as u32)
-                    .and_then(|v| v.checked_mul(4))
-                    .ok_or_else(|| "Pack page byte length overflowed.".to_string())?,
+                lod_level: lod_level as u32,
+                count: lod_count,
+                first_page,
+                page_count: pages.len() as u32 - first_page,
             });
-            start += count;
         }
         chunks.push(PackChunk {
             entry: entry.clone(),
-            first_page,
-            page_count: pages.len() as u32 - first_page,
+            first_page: chunk_first_page,
+            page_count: pages.len() as u32 - chunk_first_page,
         });
+    }
+
+    let mut lod_source_indices = Vec::with_capacity(lods.len());
+    for lod in &lods {
+        let entry = table
+            .entries
+            .get(lod.chunk_index as usize)
+            .ok_or_else(|| "Pack LOD references an invalid chunk.".to_string())?;
+        lod_source_indices.push(select_lod_source_indices(
+            payload,
+            stride,
+            entry,
+            lod.count as usize,
+        ));
     }
 
     let ranges = QuantizationRanges::from_payload(payload, stride, sh_degree_available);
     let record_bytes = packed_record_bytes(sh_degree_available);
 
     let chunk_table_offset = HEADER_SIZE;
-    let page_table_offset = chunk_table_offset + CHUNK_RECORD_SIZE * chunks.len() as u64;
+    let node_lod_table_offset = chunk_table_offset + CHUNK_RECORD_SIZE * chunks.len() as u64;
+    let page_table_offset = node_lod_table_offset + NODE_LOD_RECORD_SIZE * lods.len() as u64;
     let payload_offset = page_table_offset + PAGE_RECORD_SIZE * pages.len() as u64;
     let mut cursor = payload_offset;
     for page in &mut pages {
@@ -179,8 +365,11 @@ pub fn write_pack(
         sh_min: ranges.sh_min,
         sh_max: ranges.sh_max,
         chunk_count: chunks.len() as u32,
+        node_lod_count: lods.len() as u32,
+        lod_levels: DEFAULT_LOD_LEVELS,
         page_count: pages.len() as u32,
         chunk_table_offset,
+        node_lod_table_offset,
         page_table_offset,
         payload_offset,
     };
@@ -188,24 +377,26 @@ pub fn write_pack(
     for chunk in &chunks {
         write_chunk_record(&mut file, chunk)?;
     }
+    for lod in &lods {
+        write_node_lod_record(&mut file, lod)?;
+    }
     for page in &pages {
         write_page_record(&mut file, page)?;
     }
     for page in &pages {
-        let chunk = table
-            .entries
-            .get(page.chunk_index as usize)
-            .ok_or_else(|| "Pack page references an invalid chunk.".to_string())?;
-        let start = (chunk.offset + page.start_in_chunk) as usize * stride;
-        let end = start + page.count as usize * stride;
-        if end > payload.len() {
-            return Err("Pack page range exceeds payload length.".to_string());
-        }
-        write_packed_records(
+        let source_indices = lod_source_indices
+            .get(page.lod_index as usize)
+            .ok_or_else(|| "Pack page references an invalid LOD.".to_string())?;
+        let start = page.start_in_lod as usize;
+        let end = start + page.count as usize;
+        let page_indices = source_indices
+            .get(start..end)
+            .ok_or_else(|| "Pack page range exceeds LOD length.".to_string())?;
+        write_packed_records_by_index(
             &mut file,
-            &payload[start..end],
+            payload,
             stride,
-            page.count as usize,
+            page_indices,
             sh_degree_available,
             &ranges,
         )?;
@@ -241,6 +432,10 @@ pub fn read_pack_index(path: impl AsRef<Path>) -> Result<GsplatPackIndex, String
     let page_count = read_u32_at(&header, 44)? as usize;
     let chunk_table_offset = read_u64_at(&header, 48)?;
     let page_table_offset = read_u64_at(&header, 56)?;
+    let payload_offset = read_u64_at(&header, 64)?;
+    let node_lod_table_offset = read_u64_at(&header, 72)?;
+    let node_lod_count = read_u32_at(&header, 80)? as usize;
+    let lod_levels = read_u32_at(&header, 84)?;
     let encoding = read_u32_at(&header, 96)?;
     if encoding != ENCODING_PACKED_RGBA8 {
         return Err(format!("Unsupported gsplat pack encoding {encoding}."));
@@ -275,10 +470,13 @@ pub fn read_pack_index(path: impl AsRef<Path>) -> Result<GsplatPackIndex, String
         sh_min: read_f32_at(&header, 152)?,
         sh_max: read_f32_at(&header, 156)?,
         chunk_count: chunk_count as u32,
+        node_lod_count: node_lod_count as u32,
+        lod_levels,
         page_count: page_count as u32,
         chunk_table_offset,
+        node_lod_table_offset,
         page_table_offset,
-        payload_offset: read_u64_at(&header, 64)?,
+        payload_offset,
     };
 
     file.seek(SeekFrom::Start(parsed.chunk_table_offset))
@@ -286,6 +484,13 @@ pub fn read_pack_index(path: impl AsRef<Path>) -> Result<GsplatPackIndex, String
     let mut chunks = Vec::with_capacity(chunk_count);
     for _ in 0..chunk_count {
         chunks.push(read_chunk_record(&mut file)?);
+    }
+
+    file.seek(SeekFrom::Start(parsed.node_lod_table_offset))
+        .map_err(|err| format!("Failed to seek pack node LOD table: {err}"))?;
+    let mut lods = Vec::with_capacity(node_lod_count);
+    for _ in 0..node_lod_count {
+        lods.push(read_node_lod_record(&mut file)?);
     }
 
     file.seek(SeekFrom::Start(parsed.page_table_offset))
@@ -309,7 +514,9 @@ pub fn read_pack_index(path: impl AsRef<Path>) -> Result<GsplatPackIndex, String
         scale_max: parsed.scale_max,
         sh_min: parsed.sh_min,
         sh_max: parsed.sh_max,
+        lod_levels: parsed.lod_levels,
         chunks,
+        lods,
         pages,
     })
 }
@@ -330,7 +537,10 @@ fn write_header(file: &mut File, header: &PackHeader) -> Result<(), String> {
     write_u64(file, header.chunk_table_offset)?;
     write_u64(file, header.page_table_offset)?;
     write_u64(file, header.payload_offset)?;
-    write_padding(file, 24)?;
+    write_u64(file, header.node_lod_table_offset)?;
+    write_u32(file, header.node_lod_count)?;
+    write_u32(file, header.lod_levels)?;
+    write_padding(file, 8)?;
     write_u32(file, ENCODING_PACKED_RGBA8)?;
     write_u32(file, header.record_bytes)?;
     for v in header.position_min {
@@ -396,11 +606,33 @@ fn read_chunk_record(file: &mut File) -> Result<PackChunk, String> {
     })
 }
 
+fn write_node_lod_record(file: &mut File, lod: &PackNodeLod) -> Result<(), String> {
+    write_u32(file, lod.chunk_index)?;
+    write_u32(file, lod.lod_level)?;
+    write_u32(file, lod.count)?;
+    write_u32(file, lod.first_page)?;
+    write_u32(file, lod.page_count)?;
+    write_padding(file, 12)
+}
+
+fn read_node_lod_record(file: &mut File) -> Result<PackNodeLod, String> {
+    let mut bytes = [0_u8; NODE_LOD_RECORD_SIZE as usize];
+    file.read_exact(&mut bytes)
+        .map_err(|err| format!("Failed to read pack node LOD record: {err}"))?;
+    Ok(PackNodeLod {
+        chunk_index: read_u32_at(&bytes, 0)?,
+        lod_level: read_u32_at(&bytes, 4)?,
+        count: read_u32_at(&bytes, 8)?,
+        first_page: read_u32_at(&bytes, 12)?,
+        page_count: read_u32_at(&bytes, 16)?,
+    })
+}
+
 fn write_page_record(file: &mut File, page: &PackPage) -> Result<(), String> {
     write_u32(file, page.chunk_index)?;
-    write_u32(file, page.start_in_chunk)?;
+    write_u32(file, page.start_in_lod)?;
     write_u32(file, page.count)?;
-    write_u32(file, 0)?;
+    write_u32(file, page.lod_index)?;
     write_u64(file, page.byte_offset)?;
     write_u32(file, page.byte_len)?;
     write_u32(file, 0)
@@ -412,11 +644,140 @@ fn read_page_record(file: &mut File) -> Result<PackPage, String> {
         .map_err(|err| format!("Failed to read pack page record: {err}"))?;
     Ok(PackPage {
         chunk_index: read_u32_at(&bytes, 0)?,
-        start_in_chunk: read_u32_at(&bytes, 4)?,
+        start_in_lod: read_u32_at(&bytes, 4)?,
         count: read_u32_at(&bytes, 8)?,
+        lod_index: read_u32_at(&bytes, 12)?,
         byte_offset: read_u64_at(&bytes, 16)?,
         byte_len: read_u32_at(&bytes, 24)?,
     })
+}
+
+fn lod_counts_for_chunk(count: u32, max_levels: u32) -> Vec<u32> {
+    if count == 0 {
+        return Vec::new();
+    }
+    let mut counts = Vec::new();
+    let mut current = count;
+    for _ in 0..max_levels.max(1) {
+        if counts.last().copied() != Some(current) {
+            counts.push(current);
+        }
+        if current <= 1 {
+            break;
+        }
+        current = current.div_ceil(2);
+    }
+    counts
+}
+
+fn select_lod_source_indices(
+    payload: &[f32],
+    stride: usize,
+    entry: &ChunkEntry,
+    target_count: usize,
+) -> Vec<u32> {
+    let full_count = entry.count as usize;
+    let target_count = target_count.min(full_count);
+    if target_count == 0 {
+        return Vec::new();
+    }
+    if target_count >= full_count {
+        return (0..entry.count).map(|local| entry.offset + local).collect();
+    }
+
+    let dim = (target_count as f32).cbrt().ceil().max(1.0) as i32;
+    let (center_min, center_max) = chunk_center_bounds(payload, stride, entry);
+    let extent = [
+        (center_max[0] - center_min[0]).max(f32::EPSILON),
+        (center_max[1] - center_min[1]).max(f32::EPSILON),
+        (center_max[2] - center_min[2]).max(f32::EPSILON),
+    ];
+    let mut occupied = HashSet::new();
+    let mut selected_set = HashSet::new();
+    let mut selected = Vec::with_capacity(target_count);
+    for local in 0..entry.count {
+        let index = entry.offset + local;
+        let start = index as usize * stride;
+        let splat = &payload[start..start + stride];
+        let key = [
+            (((splat[0] - center_min[0]) / extent[0]) * dim as f32)
+                .floor()
+                .clamp(0.0, (dim - 1) as f32) as i32,
+            (((splat[1] - center_min[1]) / extent[1]) * dim as f32)
+                .floor()
+                .clamp(0.0, (dim - 1) as f32) as i32,
+            (((splat[2] - center_min[2]) / extent[2]) * dim as f32)
+                .floor()
+                .clamp(0.0, (dim - 1) as f32) as i32,
+        ];
+        if occupied.insert(key) {
+            selected_set.insert(index);
+            selected.push(index);
+            if selected.len() == target_count {
+                return selected;
+            }
+        }
+    }
+    for local in 0..entry.count {
+        let index = entry.offset + local;
+        if selected_set.insert(index) {
+            selected.push(index);
+            if selected.len() == target_count {
+                break;
+            }
+        }
+    }
+    selected
+}
+
+fn chunk_center_bounds(payload: &[f32], stride: usize, entry: &ChunkEntry) -> ([f32; 3], [f32; 3]) {
+    let mut min = [f32::INFINITY; 3];
+    let mut max = [f32::NEG_INFINITY; 3];
+    for local in 0..entry.count {
+        let index = entry.offset + local;
+        let start = index as usize * stride;
+        let Some(splat) = payload.get(start..start + 3) else {
+            continue;
+        };
+        for k in 0..3 {
+            min[k] = min[k].min(splat[k]);
+            max[k] = max[k].max(splat[k]);
+        }
+    }
+    if !min[0].is_finite() {
+        return (entry.aabb_min, entry.aabb_max);
+    }
+    (min, max)
+}
+
+fn aabb_distance(p: [f32; 3], min: [f32; 3], max: [f32; 3]) -> f32 {
+    let mut sum = 0.0_f32;
+    for k in 0..3 {
+        let d = (min[k] - p[k]).max(0.0).max(p[k] - max[k]);
+        sum += d * d;
+    }
+    sum.sqrt()
+}
+
+fn aabb_center(min: [f32; 3], max: [f32; 3]) -> [f32; 3] {
+    [
+        (min[0] + max[0]) * 0.5,
+        (min[1] + max[1]) * 0.5,
+        (min[2] + max[2]) * 0.5,
+    ]
+}
+
+fn normalize_or(v: [f32; 3], fallback: [f32; 3]) -> [f32; 3] {
+    let len_sq = dot3(v, v);
+    if len_sq <= 1.0e-12 {
+        return fallback;
+    }
+    let inv_len = len_sq.sqrt().recip();
+    [v[0] * inv_len, v[1] * inv_len, v[2] * inv_len]
+}
+
+fn dot3(a: [f32; 3], b: [f32; 3]) -> f32 {
+    a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
 }
 
 fn sh_floats(degree: i32) -> usize {
@@ -499,18 +860,22 @@ impl QuantizationRanges {
     }
 }
 
-fn write_packed_records(
+fn write_packed_records_by_index(
     file: &mut File,
     payload: &[f32],
     stride: usize,
-    count: usize,
+    indices: &[u32],
     sh_degree_available: i32,
     ranges: &QuantizationRanges,
 ) -> Result<(), String> {
     let record_bytes = packed_record_bytes(sh_degree_available);
     let sh_count = sh_floats(sh_degree_available);
     let mut record = vec![0_u8; record_bytes];
-    for splat in payload.chunks_exact(stride).take(count) {
+    for &index in indices {
+        let start = index as usize * stride;
+        let splat = payload
+            .get(start..start + stride)
+            .ok_or_else(|| "Pack source index exceeds payload length.".to_string())?;
         record.fill(0);
         for k in 0..3 {
             write_u16_bytes(
@@ -664,15 +1029,73 @@ mod tests {
         assert_eq!(pack.point_count, 5);
         assert_eq!(pack.record_bytes, packed_record_bytes(0));
         assert_eq!(pack.chunks.len(), 2);
-        assert_eq!(pack.pages.len(), 3);
-        assert_eq!(pack.chunks[0].page_count, 2);
-        assert_eq!(pack.chunks[1].page_count, 1);
+        assert_eq!(pack.lods.len(), 5);
+        assert_eq!(pack.pages.len(), 6);
+        assert_eq!(pack.chunks[0].page_count, 4);
+        assert_eq!(pack.chunks[1].page_count, 2);
+        assert_eq!(pack.best_lod_for_request(0, 2).unwrap().count, 2);
+        assert_eq!(pack.best_lod_for_request(1, 1).unwrap().count, 1);
 
         let first_page = pack.read_page_bytes(0).expect("read page");
         assert_eq!(first_page.len(), 2 * pack.record_bytes);
 
-        let second_chunk_page = pack.read_page_bytes(2).expect("read page");
+        let second_chunk_page = pack.read_page_bytes(4).expect("read page");
         assert_eq!(second_chunk_page.len(), 2 * pack.record_bytes);
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn view_priority_lod_selection_upgrades_high_priority_nodes_within_budget() {
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!(
+            "godot_gsplat_lod_select_test_{}.gsplatpack",
+            std::process::id()
+        ));
+        let stride = POINT_STRIDE_FLOATS;
+        let table = ChunkTable {
+            chunk_size: 2.0,
+            grid_origin: [0.0, 0.0, 0.0],
+            entries: vec![
+                ChunkEntry {
+                    grid: [0, 0, 0],
+                    aabb_min: [0.0, -0.5, -0.5],
+                    aabb_max: [1.0, 0.5, 0.5],
+                    offset: 0,
+                    count: 8,
+                },
+                ChunkEntry {
+                    grid: [1, 0, 0],
+                    aabb_min: [5.0, -0.5, -0.5],
+                    aabb_max: [6.0, 0.5, 0.5],
+                    offset: 8,
+                    count: 8,
+                },
+            ],
+            stride,
+        };
+        let mut payload = Vec::new();
+        for point in 0..16 {
+            let mut splat = [0.0_f32; POINT_STRIDE_FLOATS];
+            let local = (point % 8) as f32;
+            splat[0] = if point < 8 {
+                local * 0.1
+            } else {
+                5.0 + local * 0.1
+            };
+            splat[7] = 0.01;
+            splat[8] = 0.01;
+            splat[9] = 0.01;
+            splat[17] = 1.0;
+            payload.extend_from_slice(&splat);
+        }
+
+        let pack = write_pack(&path, &payload, &table, 0, 64).expect("write pack");
+        let selected =
+            pack.select_lods_view_priority([0.0, 0.0, 0.0], [1.0, 0.0, 0.0], 120.0, 10.0, 10);
+
+        assert_eq!(selected, vec![(0, 8), (1, 2)]);
+        assert!(selected.iter().map(|&(_, count)| count).sum::<u32>() <= 10);
 
         let _ = std::fs::remove_file(path);
     }

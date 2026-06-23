@@ -4,6 +4,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
 
+use godot::classes::Engine;
 use godot::prelude::*;
 
 use super::render_build::{pack_quantized_records, pack_raw, raw_to_render, RawRenderData};
@@ -25,6 +26,8 @@ impl PageCacheState {
 
 type PageCache = Arc<Mutex<PageCacheState>>;
 const PACK_PAGE_CACHE_LIMIT: usize = 64;
+const ACTIVE_SELECTION_MIN_CHANGED_SPLATS: u64 = 4096;
+const ACTIVE_SELECTION_MIN_CHANGED_DIVISOR: u64 = 50;
 
 // Runtime chunk-streaming state (Phase C2): the spatial chunk table plus the
 // currently selected (active) chunk indices and the selection-gating reference.
@@ -173,11 +176,25 @@ impl GaussianSplatNode3D {
             return;
         }
         let active = self.select_chunks(cam, budget);
-        let differs = self
+        let should_rebuild = self
             .backend
             .chunks
             .as_ref()
-            .map(|rt| rt.active != active)
+            .map(|rt| {
+                let differs = rt.active != active;
+                let force_rebuild = rt.active.is_empty()
+                    || budget != rt.last_budget
+                    || (view_priority
+                        && ((fov_degrees - rt.last_view_priority_fov_degrees).abs()
+                            > f32::EPSILON
+                            || (full_distance - rt.last_view_priority_full_distance).abs()
+                                > f32::EPSILON
+                            || min_lod != rt.last_view_priority_min_lod_per_chunk));
+                let should_rebuild = differs
+                    && (force_rebuild
+                        || active_selection_change_is_significant(&rt.active, &active));
+                should_rebuild
+            })
             .unwrap_or(false);
         if let Some(rt) = self.backend.chunks.as_mut() {
             rt.last_select_pos = Some(cam);
@@ -188,11 +205,11 @@ impl GaussianSplatNode3D {
             rt.last_view_priority_fov_degrees = fov_degrees;
             rt.last_view_priority_full_distance = full_distance;
             rt.last_view_priority_min_lod_per_chunk = min_lod;
-            if differs {
+            if should_rebuild {
                 rt.active = active;
             }
         }
-        if differs {
+        if should_rebuild {
             self.begin_chunk_rebuild();
         }
     }
@@ -202,19 +219,29 @@ impl GaussianSplatNode3D {
             return Vec::new();
         };
         let budget = if budget <= 0 { u32::MAX } else { budget as u32 };
-        if self.view_priority_selection_enabled() {
+        let selected = if self.view_priority_selection_enabled() {
             let forward = self
                 .camera_local_forward()
                 .unwrap_or_else(|| Vector3::new(0.0, 0.0, -1.0));
-            crate::chunking::select_chunks_view_priority(
-                rt.table.as_ref(),
-                [cam_local.x, cam_local.y, cam_local.z],
-                [forward.x, forward.y, forward.z],
-                self.view_priority_fov_degrees(),
-                self.view_priority_full_distance(),
-                budget.min(self.view_priority_target_budget()),
-                self.view_priority_min_lod_per_chunk() as u32,
-            )
+            if let Some(pack) = rt.pack.as_deref() {
+                pack.select_lods_view_priority(
+                    [cam_local.x, cam_local.y, cam_local.z],
+                    [forward.x, forward.y, forward.z],
+                    self.view_priority_fov_degrees(),
+                    self.view_priority_full_distance(),
+                    budget.min(self.view_priority_target_budget()),
+                )
+            } else {
+                crate::chunking::select_chunks_view_priority(
+                    rt.table.as_ref(),
+                    [cam_local.x, cam_local.y, cam_local.z],
+                    [forward.x, forward.y, forward.z],
+                    self.view_priority_fov_degrees(),
+                    self.view_priority_full_distance(),
+                    budget.min(self.view_priority_target_budget()),
+                    self.view_priority_min_lod_per_chunk() as u32,
+                )
+            }
         } else if self.coverage_selection_enabled() {
             crate::chunking::select_chunks_coverage(rt.table.as_ref(), budget)
         } else {
@@ -223,13 +250,27 @@ impl GaussianSplatNode3D {
                 [cam_local.x, cam_local.y, cam_local.z],
                 budget,
             )
-        }
+        };
+        snap_active_selection_to_pack_lods(rt.pack.as_deref(), selected)
     }
 
     pub(super) fn active_budget(&self) -> i32 {
+        let xr_viewport = !Engine::singleton().is_editor_hint()
+            && self
+                .base()
+                .get_viewport()
+                .map(|viewport| viewport.is_using_xr())
+                .unwrap_or(false);
         self.cloud_settings
             .as_ref()
-            .map(|settings| settings.bind().get_max_preview_splats().max(0))
+            .map(|settings| {
+                let settings = settings.bind();
+                if xr_viewport && settings.is_xr_fixed_budget_enabled() {
+                    settings.get_xr_fixed_splat_budget().max(0)
+                } else {
+                    settings.get_max_preview_splats().max(0)
+                }
+            })
             .unwrap_or(i32::MAX)
     }
 
@@ -399,6 +440,68 @@ impl GaussianSplatNode3D {
     }
 }
 
+fn active_selection_change_is_significant(current: &[(u32, u32)], next: &[(u32, u32)]) -> bool {
+    let changed = active_selection_changed_splats(current, next);
+    changed >= active_selection_change_threshold(current, next)
+}
+
+fn active_selection_change_threshold(current: &[(u32, u32)], next: &[(u32, u32)]) -> u64 {
+    let current_total = current.iter().map(|&(_, lod)| lod as u64).sum::<u64>();
+    let next_total = next.iter().map(|&(_, lod)| lod as u64).sum::<u64>();
+    let relative = current_total.max(next_total) / ACTIVE_SELECTION_MIN_CHANGED_DIVISOR;
+    ACTIVE_SELECTION_MIN_CHANGED_SPLATS.max(relative).max(1)
+}
+
+fn active_selection_changed_splats(current: &[(u32, u32)], next: &[(u32, u32)]) -> u64 {
+    let mut changed = 0_u64;
+    let mut a = 0;
+    let mut b = 0;
+    while a < current.len() || b < next.len() {
+        match (current.get(a), next.get(b)) {
+            (Some(&(ai, alod)), Some(&(bi, blod))) if ai == bi => {
+                changed += alod.abs_diff(blod) as u64;
+                a += 1;
+                b += 1;
+            }
+            (Some(&(ai, alod)), Some(&(bi, _))) if ai < bi => {
+                changed += alod as u64;
+                a += 1;
+            }
+            (Some(_), Some(&(_, blod))) => {
+                changed += blod as u64;
+                b += 1;
+            }
+            (Some(&(_, alod)), None) => {
+                changed += alod as u64;
+                a += 1;
+            }
+            (None, Some(&(_, blod))) => {
+                changed += blod as u64;
+                b += 1;
+            }
+            (None, None) => break,
+        }
+    }
+    changed
+}
+
+fn snap_active_selection_to_pack_lods(
+    pack: Option<&crate::gsplat_pack::GsplatPackIndex>,
+    active: Vec<(u32, u32)>,
+) -> Vec<(u32, u32)> {
+    let Some(pack) = pack else {
+        return active;
+    };
+    active
+        .into_iter()
+        .filter_map(|(chunk_index, requested_count)| {
+            pack.best_lod_for_request(chunk_index, requested_count)
+                .map(|lod| (chunk_index, lod.count.min(requested_count)))
+        })
+        .filter(|&(_, count)| count > 0)
+        .collect()
+}
+
 fn gather_active_packed_from_pack(
     pack: &crate::gsplat_pack::GsplatPackIndex,
     cache: &Mutex<PageCacheState>,
@@ -406,22 +509,22 @@ fn gather_active_packed_from_pack(
 ) -> Result<Vec<u8>, String> {
     let record_bytes = pack.record_bytes;
     let mut total = 0usize;
-    for &(ci, lod) in active {
-        if let Some(chunk) = pack.chunks.get(ci as usize) {
-            total += lod.min(chunk.entry.count) as usize * record_bytes;
+    for &(ci, requested_count) in active {
+        if let Some(lod) = pack.best_lod_for_request(ci, requested_count) {
+            total += lod.count.min(requested_count) as usize * record_bytes;
         }
     }
     let mut out = Vec::with_capacity(total);
-    for &(ci, lod) in active {
-        let Some(chunk) = pack.chunks.get(ci as usize) else {
+    for &(ci, requested_count) in active {
+        let Some(lod) = pack.best_lod_for_request(ci, requested_count) else {
             continue;
         };
-        let mut remaining = lod.min(chunk.entry.count);
-        for page_offset in 0..chunk.page_count {
+        let mut remaining = lod.count.min(requested_count);
+        for page_offset in 0..lod.page_count {
             if remaining == 0 {
                 break;
             }
-            let page_index = chunk.first_page + page_offset;
+            let page_index = lod.first_page + page_offset;
             let Some(page) = pack.pages.get(page_index as usize) else {
                 continue;
             };
@@ -467,4 +570,33 @@ fn read_page_bytes_cached(
         }
     }
     Ok(values)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn active_selection_delta_counts_lod_changes_and_membership_changes() {
+        let current = vec![(1, 100), (3, 200), (5, 300)];
+        let next = vec![(1, 120), (4, 50), (5, 250)];
+
+        assert_eq!(active_selection_changed_splats(&current, &next), 320);
+    }
+
+    #[test]
+    fn active_selection_significance_ignores_small_streaming_jitter() {
+        let current = vec![(1, 500_000), (2, 300_000)];
+        let next = vec![(1, 500_512), (2, 299_488)];
+
+        assert!(!active_selection_change_is_significant(&current, &next));
+    }
+
+    #[test]
+    fn active_selection_significance_keeps_large_changes() {
+        let current = vec![(1, 500_000), (2, 300_000)];
+        let next = vec![(1, 460_000), (3, 320_000)];
+
+        assert!(active_selection_change_is_significant(&current, &next));
+    }
 }

@@ -17,6 +17,7 @@ pub const DEFAULT_VIEW_PRIORITY_FOV_DEGREES: f32 = 200.0;
 pub const DEFAULT_VIEW_PRIORITY_FULL_DISTANCE: f32 = 5.0;
 pub const DEFAULT_VIEW_PRIORITY_TARGET_BUDGET: i32 = 800_000;
 pub const DEFAULT_VIEW_PRIORITY_MIN_LOD_PER_CHUNK: i32 = 256;
+pub const DEFAULT_XR_FIXED_SPLAT_BUDGET: i32 = 600_000;
 
 #[derive(GodotClass)]
 #[class(tool, base=Resource)]
@@ -37,6 +38,8 @@ pub struct GaussianSplatCloudSettings {
     view_priority_full_distance: f32,
     view_priority_target_budget: i32,
     view_priority_min_lod_per_chunk: i32,
+    xr_fixed_budget_enabled: bool,
+    xr_fixed_splat_budget: i32,
 }
 
 #[godot_api]
@@ -58,6 +61,8 @@ impl IResource for GaussianSplatCloudSettings {
             view_priority_full_distance: DEFAULT_VIEW_PRIORITY_FULL_DISTANCE,
             view_priority_target_budget: DEFAULT_VIEW_PRIORITY_TARGET_BUDGET,
             view_priority_min_lod_per_chunk: DEFAULT_VIEW_PRIORITY_MIN_LOD_PER_CHUNK,
+            xr_fixed_budget_enabled: false,
+            xr_fixed_splat_budget: DEFAULT_XR_FIXED_SPLAT_BUDGET,
         }
     }
 }
@@ -187,6 +192,28 @@ impl GaussianSplatCloudSettings {
     }
 
     #[func]
+    pub fn is_xr_fixed_budget_enabled(&self) -> bool {
+        self.xr_fixed_budget_enabled
+    }
+
+    #[func]
+    pub fn set_xr_fixed_budget_enabled(&mut self, enabled: bool) {
+        self.xr_fixed_budget_enabled = enabled;
+        self.base_mut().emit_changed();
+    }
+
+    #[func]
+    pub fn get_xr_fixed_splat_budget(&self) -> i32 {
+        self.xr_fixed_splat_budget
+    }
+
+    #[func]
+    pub fn set_xr_fixed_splat_budget(&mut self, budget: i32) {
+        self.xr_fixed_splat_budget = budget.max(0);
+        self.base_mut().emit_changed();
+    }
+
+    #[func]
     pub fn apply_defaults(&mut self) {
         self.splat_visible = true;
         self.render_enabled = true;
@@ -199,6 +226,8 @@ impl GaussianSplatCloudSettings {
         self.view_priority_full_distance = DEFAULT_VIEW_PRIORITY_FULL_DISTANCE;
         self.view_priority_target_budget = DEFAULT_VIEW_PRIORITY_TARGET_BUDGET;
         self.view_priority_min_lod_per_chunk = DEFAULT_VIEW_PRIORITY_MIN_LOD_PER_CHUNK;
+        self.xr_fixed_budget_enabled = false;
+        self.xr_fixed_splat_budget = DEFAULT_XR_FIXED_SPLAT_BUDGET;
         self.base_mut().emit_changed();
     }
 }
